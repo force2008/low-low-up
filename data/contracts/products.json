@@ -1,0 +1,23 @@
+[
+  {
+    "ProductID": "ag",
+    "ProductName": "ag",
+    "ExchangeID": "SHFE",
+    "ProductClass": "1",
+    "VolumeMultiple": 0,
+    "PriceTick": 0.0,
+    "MaxMarketOrderVolume": 0,
+    "MinMarketOrderVolume": 0,
+    "MaxLimitOrderVolume": 0,
+    "MinLimitOrderVolume": 0,
+    "PositionType": "",
+    "PositionDateType": "",
+    "CloseDealType": "",
+    "TradeCurrencyID": "",
+    "MortgageFundUseRange": "",
+    "UnderlyingMultiple": 0.0,
+    "ExchangeProductID": "ag",
+    "OpenLimitControlLevel": "",
+    "OrderFreqControlLevel": ""
+  }
+]
