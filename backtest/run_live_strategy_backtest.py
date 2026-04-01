@@ -31,8 +31,8 @@ from TrendReversalV7LiveStrategy import (
 
 class BacktestConfig:
     """回测配置"""
-    DB_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/kline_data.db"
-    CONTRACTS_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/main_contracts.json"
+    DB_PATH = "/home/ubuntu/low-low-up/data/db/kline_data.db"
+    CONTRACTS_PATH = "/home/ubuntu/low-low-up/data/contracts/main_contracts.json"
     
     DURATION_5M = 300
     DURATION_60M = 3600
