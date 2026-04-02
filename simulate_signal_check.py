@@ -446,7 +446,7 @@ if __name__ == '__main__':
 
     if args.all:
         # 模拟所有合约最近7天，确保有足够数据触发信号
-        simulate_all_contracts(db_path, contracts_path, days=2)
+        simulate_all_contracts(db_path, contracts_path, days=1)
     elif args.symbol:
         # 模拟指定合约
         simulate(

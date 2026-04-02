@@ -135,7 +135,7 @@ def close_tqsdk_api():
 class DatabaseManager:
     """ 数据库管理类 """
     
-    def __init__(self, db_path="kline_data.db"):
+    def __init__(self, db_path="/home/ubuntu/low-low-up/data/db/kline_data.db"):
         self.db_path = db_path
         self.conn = None
         self.cursor = None
@@ -661,7 +661,7 @@ if __name__ == '__main__':
         print_log("=" * 70)
         
         # 从 JSON 文件加载合约列表
-        json_file = args.json
+        json_file = '/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data/contracts/main_contracts.json'
         contracts = load_contracts_from_json(json_file)
         
         if not contracts:
