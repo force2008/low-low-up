@@ -21,8 +21,7 @@ from config.trading_time_config import (
     TRADING_DAYS_PER_YEAR,
     get_annual_factor
 )
-from utils.feishu_notifier import FeishuNotifier, send_feishu_signal, send_feishu_high_volatility_alert, send_feishu_strategy_signal, send_feishu_breakout_signal, send_feishu_test
-from signal.BreakoutSignalDetector import BreakoutSignalDetector
+from utils.feishu_notifier import FeishuNotifier, send_feishu_signal, send_feishu_high_volatility_alert, send_feishu_strategy_signal, send_feishu_test
 from backtest.strategy_engine import LiveStrategyEngine as StrategyEngine, Signal as StrategySignal, SignalType
 from backtest.strategy_utils import Config as StrategyConfig
 
@@ -639,7 +638,7 @@ class KlineAggregator:
         "day": (1440, 86400)  # 1 天 = 24*60 = 1440 分钟
     }
     
-    def __init__(self, db_manager, instruments, vol_calculator=None, signal_manager=None, breakout_detector=None, enable_strategy=True, strategy_signal_manager=None):
+    def __init__(self, db_manager, instruments, vol_calculator=None, signal_manager=None, enable_strategy=True, strategy_signal_manager=None):
         self.db_manager = db_manager
         self.instruments = instruments
         # 多周期 K 线数据 {period_name: {instrument_name: kline_data}}
@@ -654,11 +653,10 @@ class KlineAggregator:
             self.instrument_map[key] = inst
         self.vol_calculator = vol_calculator
         self.signal_manager = signal_manager
-        self.breakout_detector = breakout_detector
         self.strategy_signal_manager = strategy_signal_manager
         self.db_conn = db_manager.conn
         self.db_cursor = db_manager.cursor
-        
+
         # 策略引擎配置
         self.enable_strategy = enable_strategy
         self.strategy_engines = {}  # {symbol: StrategyEngine}
@@ -805,10 +803,9 @@ class KlineAggregator:
             source=2  # 2=合成而来
         )
         
-        # 只在 5 分钟 K 线保存后检查波动率切换、突破信号和策略信号
+        # 只在 5 分钟 K 线保存后检查策略信号
         if duration == 300:
             print_log(f"保存 K 线：{symbol} {date_time_str} O={kline['open']:.2f} H={kline['high']:.2f} L={kline['low']:.2f} C={kline['close']:.2f} V={kline['vol']} OI={kline['open_interest']}")
-            self.check_breakout_signal(symbol)
             self.check_strategy_signal(symbol)
         else:
             # 其他周期只记录日志
@@ -821,45 +818,7 @@ class KlineAggregator:
             if period_seconds == duration:
                 return period_name
         return f"{duration}s"
-    
-    def check_breakout_signal(self, symbol: str):
-        """检查突破信号
-        
-        使用 BreakoutSignalDetector 检测：
-        1. volatility_squeeze_breakout: 波动率挤压突破
-        2. candlestick_confirm: K 线形态确认
-        3. time_filter_breakout: 时间过滤器确认
-        """
-        if self.breakout_detector is None:
-            return
-        
-        # 获取 5 分钟 K 线历史
-        df = self.get_kline_history(symbol, limit=200, duration=300)
-        
-        if len(df) < 120:  # 最少需要 120 根 K 线
-            return
-        
-        # 执行突破信号检测
-        try:
-            result = self.breakout_detector.detect(df, symbol=symbol)
-            if result:
-                print_log(f"🚀 {symbol} 检测到突破信号！方向：{result['direction']}")
-                print_log(f"   布林带宽度：{result['squeeze']['bb_width']:.2f}%, 百分位：{result['squeeze']['bb_width_percentile']:.2%}")
-                print_log(f"   ATR 比率：{result['squeeze']['atr_ratio']:.2f}, 突破强度：{result['squeeze']['breakout_strength']:.2%}")
-                print_log(f"   K 线类型：{result['candlestick']['candle_type']}, 实体比例：{result['candlestick']['body_ratio']:.2%}")
-                print_log(f"   成交量比率：{result['candlestick']['volume_ratio']:.2f}, 交易时段：{result['time_filter']['trading_session']}")
 
-                # 发送飞书突破信号通知
-                try:
-                    if send_feishu_breakout_signal(symbol, result):
-                        print_log(f"✓ {symbol} 飞书突破信号已发送")
-                    else:
-                        print_log(f"⚠️ {symbol} 飞书突破信号未经发送（冷却期或失败）")
-                except Exception as notify_exc:
-                    print_log(f"✗ {symbol} 飞书突破信号发送失败：{notify_exc}")
-        except Exception as e:
-            print_log(f"✗ {symbol} 突破信号检测失败：{e}")
-    
     def check_strategy_signal(self, symbol: str):
         """检查趋势反转策略信号（MACD 多周期底背离策略 - strategy_0328.py）
 
@@ -1192,11 +1151,8 @@ if __name__ == '__main__':
     signal_manager = SignalManager(SIGNAL_FILE)
     strategy_signal_manager = StrategySignalManager(STRATEGY_SIGNAL_FILE)
 
-    # 初始化突破信号检测器
-    breakout_detector = BreakoutSignalDetector()
-
-    # 初始化 K 线合成器（传入波动率检测组件和突破信号检测器）
-    kline_aggregator = KlineAggregator(db_manager, instruments, vol_calculator, signal_manager, breakout_detector, strategy_signal_manager=strategy_signal_manager)
+    # 初始化 K 线合成器（传入波动率检测组件和策略信号管理器）
+    kline_aggregator = KlineAggregator(db_manager, instruments, vol_calculator, signal_manager, strategy_signal_manager=strategy_signal_manager)
 
     # 飞书启动通知
     print_log("发送飞书启动通知...")

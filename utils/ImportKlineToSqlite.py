@@ -134,9 +134,13 @@ def close_tqsdk_api():
 
 class DatabaseManager:
     """ 数据库管理类 """
-    
-    def __init__(self, db_path="/home/ubuntu/low-low-up/data/db/kline_data.db"):
-        self.db_path = db_path
+
+    # 获取项目根目录
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, "data", "db", "kline_data.db")
+
+    def __init__(self, db_path=None):
+        self.db_path = db_path or self.DEFAULT_DB_PATH
         self.conn = None
         self.cursor = None
         self.init_database()
