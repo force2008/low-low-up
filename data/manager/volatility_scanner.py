@@ -5,12 +5,15 @@
 数据源：本地 SQLite 数据库
 """
 
+import os
 import sqlite3
 import math
 from datetime import datetime
 from collections import defaultdict
 
-DB_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/kline_data.db"
+# 获取项目根目录
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "db", "kline_data.db")
 
 class VolatilityScanner:
     def __init__(self):

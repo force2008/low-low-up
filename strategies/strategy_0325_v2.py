@@ -20,6 +20,7 @@ MACD 多周期底背离策略（实盘版）
 创建日期：2026-03-24
 """
 
+import os
 import sqlite3
 import json
 import csv
@@ -315,9 +316,11 @@ class OrderStatus(Enum):
 
 class LiveConfig:
     """实盘配置"""
+    # 获取项目根目录
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # 数据库配置（默认值，可通过构造函数覆盖）
-    DB_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/kline_data.db"
-    CONTRACTS_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/main_contracts.json"
+    DB_PATH = os.path.join(PROJECT_ROOT, "data", "db", "kline_data.db")
+    CONTRACTS_PATH = os.path.join(PROJECT_ROOT, "data", "contracts", "main_contracts.json")
     
     # K 线配置
     DURATION_5M = 300   # 5 分钟

@@ -634,10 +634,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='K 线数据导入程序')
     parser.add_argument('--source', type=str, default='akshare', choices=['akshare', 'tqsdk'],
                         help='数据源类型 (akshare 或 tqsdk)')
-    parser.add_argument('--json', type=str, default='main_contracts.json',
-                        help='合约列表 JSON 文件路径')
-    
+
     args = parser.parse_args()
+
+    # 获取项目根目录
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    json_file = os.path.join(PROJECT_ROOT, "data", "contracts", "main_contracts.json")
     
     # 确定数据源
     source_name = args.source.lower()
@@ -659,9 +661,8 @@ if __name__ == '__main__':
         else:
             print_log("导入周期：5 分钟 -> 30 分钟 -> 60 分钟 -> 1 天")
         print_log("=" * 70)
-        
+
         # 从 JSON 文件加载合约列表
-        json_file = '/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data/contracts/main_contracts.json'
         contracts = load_contracts_from_json(json_file)
         
         if not contracts:
