@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'backtest'))
 from backtest.strategy_engine import LiveStrategyEngine
 from backtest.strategy_utils import Config
 from backtest.strategy_models import SignalType
+from backtest.strategy_indicators import MACDCalculator, StackIdentifier, ATRCalculator
 
 
 def load_5m_bars(db_path: str, symbol: str, limit: int = None):
@@ -48,6 +49,38 @@ def load_5m_bars(db_path: str, symbol: str, limit: int = None):
     return bars
 
 
+def load_60m_bars(db_path: str, symbol: str, limit: int = None):
+    """从数据库加载 60 分钟 K 线"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    if limit:
+        query = f"""SELECT datetime, open, high, low, close, volume
+                    FROM (
+                        SELECT datetime, open, high, low, close, volume
+                        FROM kline_data
+                        WHERE symbol = ? AND duration = 3600
+                        ORDER BY datetime DESC
+                        LIMIT {limit}
+                    ) sub
+                    ORDER BY datetime ASC"""
+    else:
+        query = """SELECT datetime, open, high, low, close, volume
+                   FROM kline_data
+                   WHERE symbol = ? AND duration = 3600
+                   ORDER BY datetime ASC"""
+
+    cursor.execute(query, [symbol])
+    rows = cursor.fetchall()
+    conn.close()
+
+    bars = []
+    for row in rows:
+        dt_str = row[0] if isinstance(row[0], str) else row[0].strftime('%Y-%m-%d %H:%M:%S')
+        bars.append((dt_str, float(row[1]), float(row[2]), float(row[3]), float(row[4]), int(row[5])))
+    return bars
+
+
 def simulate(symbol: str, db_path: str, contracts_path: str,
              start_time: str = None, end_time: str = None,
              limit: int = None):
@@ -63,6 +96,10 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
         return
 
     print(f"共加载 {len(all_5m)} 根 5 分钟 K 线（{all_5m[0][0]} ~ {all_5m[-1][0]}）")
+
+    # 加载 60 分钟数据
+    all_60m = load_60m_bars(db_path, symbol, limit=limit)
+    print(f"共加载 {len(all_60m)} 根 60 分钟 K 线（{all_60m[0][0]} ~ {all_60m[-1][0]}）")
 
     # 确定模拟区间
     sim_start_idx = 0
@@ -89,8 +126,14 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
     # 模拟数据 = start_time 到 end_time 之间的 K 线
     sim_5m = all_5m[sim_start_idx:sim_end_idx]
 
-    print(f"\n预热: {len(warmup_5m)} 根 5m K 线")
+    # 预热数据对应的 60m 数据（基于时间范围）
+    warmup_60m = [bar for bar in all_60m if bar[0] <= warmup_5m[-1][0]] if warmup_5m and all_60m else []
+    # 模拟期间的 60m 数据
+    sim_60m = [bar for bar in all_60m if sim_5m[0][0] <= bar[0] <= sim_5m[-1][0]] if sim_5m and all_60m else []
+
+    print(f"\n预热: {len(warmup_5m)} 根 5m K 线，{len(warmup_60m)} 根 60m K 线")
     print(f"模拟: {len(sim_5m)} 根 5m K 线（{sim_5m[0][0] if sim_5m else 'N/A'} ~ {sim_5m[-1][0] if sim_5m else 'N/A'}）")
+    print(f"      {len(sim_60m)} 根 60m K 线")
 
     if not sim_5m:
         return
@@ -102,18 +145,17 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
 
     engine = LiveStrategyEngine(symbol, config)
 
-    # 预填充预热数据
+    # 预填充预热数据（需要经过 MACD 和 ATR 计算）
     engine.df_5m = list(warmup_5m)
-    engine.df_5m_with_macd = list(warmup_5m)
-    engine.df_5m_with_atr = list(warmup_5m)
-    engine.green_stacks_5m = {}
-    engine.green_gaps_5m = {}
-    engine.df_60m = []
-    engine.df_60m_with_macd = []
-    engine.green_stacks_60m = {}
-    engine.green_gaps_60m = {}
-    engine._current_60m_bar = None
-    engine.last_60m_bar_time = None
+    engine.df_5m_with_macd, engine.green_stacks_5m, engine.green_gaps_5m = StackIdentifier.identify(
+        MACDCalculator.calculate(warmup_5m)
+    )
+    engine.df_5m_with_atr = ATRCalculator.calculate(warmup_5m, period=14)
+    engine.df_60m = list(warmup_60m)
+    engine.df_60m_with_macd, engine.green_stacks_60m, engine.green_gaps_60m = StackIdentifier.identify(
+        MACDCalculator.calculate(warmup_60m)
+    ) if warmup_60m else ([], {}, {})
+    engine.last_60m_bar_time = warmup_60m[-1][0] if warmup_60m else None
     engine.position = None
     engine.signals = []
     engine.last_entry_time = None
@@ -124,11 +166,23 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
     entry_signals = []
     exit_signals = []
 
+    # 构建 60m bar 索引（按时间排序），用于在模拟过程中触发
+    next_60m_idx = 0
+    pending_60m_bars = sorted(sim_60m, key=lambda x: x[0]) if sim_60m else []
+
     print("\n开始模拟...")
     print("-" * 70)
 
     # 遍历每根 5m bar，调用统一的 API（与 KlineCollector 一致）
     for bar in sim_5m:
+        bar_time = bar[0]
+
+        # 检查是否有 60m bar 需要在当前 5m bar 之前处理
+        while next_60m_idx < len(pending_60m_bars) and pending_60m_bars[next_60m_idx][0] <= bar_time:
+            bar_60m = pending_60m_bars[next_60m_idx]
+            engine.on_60m_bar(bar_60m)
+            next_60m_idx += 1
+
         # 调用与实盘一致的 API
         engine.on_5m_bar(bar)
 

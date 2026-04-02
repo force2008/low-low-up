@@ -330,6 +330,9 @@ class Strategy:
                     idx_60m = i
                     break
 
+            # 判断60分钟是否在拐头
+            dif_turn_60m, _ = self.check_60m_dif_turn_in_green(df_60m, idx_60m, green_stacks_60m)
+
             # 获取60分钟绿柱堆低点
             current_stack_id_60m = df_60m[idx_60m][11] if len(df_60m[idx_60m]) > 11 else 0
 
@@ -339,18 +342,24 @@ class Strategy:
                 if end_idx >= 0 and end_idx < idx_60m:
                     available_green_ids_60m.append(sid)
 
-            if len(available_green_ids_60m) >= 1:
+            # 60分钟拐头时用前一个绿柱堆，不拐头时用当前绿柱堆
+            if dif_turn_60m and len(available_green_ids_60m) >= 2:
                 available_green_ids_60m.sort()
-                prev_green_id_60m = available_green_ids_60m[-1]
+                prev_green_id_60m = available_green_ids_60m[-2]  # 前一个绿柱堆
+            elif len(available_green_ids_60m) >= 1:
+                available_green_ids_60m.sort()
+                prev_green_id_60m = available_green_ids_60m[-1]  # 当前绿柱堆
+            else:
+                prev_green_id_60m = None
 
-                if prev_green_id_60m in green_stacks_60m:
-                    stop_loss = green_stacks_60m[prev_green_id_60m]['low']
+            if prev_green_id_60m is not None and prev_green_id_60m in green_stacks_60m:
+                stop_loss = green_stacks_60m[prev_green_id_60m]['low']
 
-                    # 同样检查：止损价不能 >= 开仓价
-                    if stop_loss >= current_close:
-                        return None, f"60分钟绿柱堆低点({stop_loss:.2f}) >= 当前价({current_close:.2f})，下降趋势不开仓"
+                # 同样检查：止损价不能 >= 开仓价
+                if stop_loss >= current_close:
+                    return None, f"60分钟绿柱堆低点({stop_loss:.2f}) >= 当前价({current_close:.2f})，下降趋势不开仓"
 
-                    return stop_loss, f"60分钟绿柱堆 K 线低点({atr_percentile:.2%})，止损:{stop_loss:.2f}"
+                return stop_loss, f"60分钟{'前' if dif_turn_60m else '当'}绿柱堆 K 线低点({atr_percentile:.2%})，止损:{stop_loss:.2f}"
 
         # 方式2：使用5分钟前前绿柱堆低点作为止损（默认）
         available_green_ids = []

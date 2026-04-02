@@ -46,9 +46,6 @@ class LiveStrategyEngine:
 
         self.last_60m_bar_time: Optional[str] = None
 
-        # 正在合成的当前 60m bar：(datetime, open, high, low, close, volume)
-        self._current_60m_bar: Optional[tuple] = None
-
     def initialize(self):
         """初始化，加载历史数据"""
         self.df_5m = self.data_loader.load_kline_fast(
@@ -79,10 +76,12 @@ class LiveStrategyEngine:
 
     def on_5m_bar(self, bar: tuple):
         """处理新的 5 分钟 K 线（实盘入口）"""
+        # 追加 5m bar
         self.df_5m.append(bar)
         if len(self.df_5m) > self.config.MAX_5M_BARS:
             self.df_5m.pop(0)
 
+        # 更新 5m MACD
         self.df_5m_with_macd, self.green_stacks_5m, self.green_gaps_5m = StackIdentifier.identify(
             MACDCalculator.calculate(self.df_5m)
         )
@@ -90,180 +89,84 @@ class LiveStrategyEngine:
         # 更新 ATR 数据
         self.df_5m_with_atr = ATRCalculator.calculate(self.df_5m, period=14)
 
-        # 合成 60m bar：检查是否进入新的小时
-        bar_hour = bar[0][:13]  # 'YYYY-MM-DD HH'
-        new_60m_bar = None  # 新开始的 60m bar（小时变化时）
-        if self._current_60m_bar is None:
-            # 第一根 bar，创建新的 60m bar
-            self._current_60m_bar = (bar[0], bar[1], bar[2], bar[3], bar[4], bar[5])
-        elif self._current_60m_bar[0][:13] != bar_hour:
-            # 进入新的小时
-            prev_date = self._current_60m_bar[0][:10]
-            curr_date = bar[0][:10]
-            if prev_date == curr_date:
-                # 同一天：追加到 df_60m
-                self.df_60m.append(self._current_60m_bar)
-                if len(self.df_60m) > self.config.MAX_60M_BARS:
-                    self.df_60m.pop(0)
-                # 重新计算 60m MACD
-                self.df_60m_with_macd, self.green_stacks_60m, self.green_gaps_60m = StackIdentifier.identify(
-                    MACDCalculator.calculate(self.df_60m)
-                )
-
-                # 检测绿柱堆转红柱堆（hist 从负转正）
-                idx_60m = len(self.df_60m_with_macd) - 1
-                hist_60m = self.df_60m_with_macd[idx_60m][8]
-                hist_60m_prev = self.df_60m_with_macd[idx_60m-1][8] if idx_60m > 0 else 0
-                current_60m_time = self.df_60m_with_macd[idx_60m][0]
-                if hist_60m > 0 and hist_60m_prev < 0:
-                    diver_ok, diver_reason, current_green_low, prev_prev_green_low = \
-                        self.strategy.check_60m_divergence(self.df_60m_with_macd, idx_60m)
-                    if diver_ok:
-                        existing_signal = next((s for s in self.precheck_signals_green
-                                              if s['created_time'] == current_60m_time), None)
-                        if not existing_signal:
-                            self.precheck_signals_green.append({
-                                'type': 'green',
-                                'created_time': current_60m_time,
-                                'expiry_time': bar[0],
-                                'current_green_low': current_green_low,
-                                'prev_prev_green_low': prev_prev_green_low
-                            })
-            # 开始新的 60m bar
-            self._current_60m_bar = (bar[0], bar[1], bar[2], bar[3], bar[4], bar[5])
-            new_60m_bar = self._current_60m_bar
-        else:
-            # 继续当前 60m bar：更新 high/low/close
-            self._current_60m_bar = (
-                self._current_60m_bar[0],
-                self._current_60m_bar[1],
-                max(self._current_60m_bar[2], bar[2]),
-                min(self._current_60m_bar[3], bar[3]),
-                bar[4],
-                self._current_60m_bar[5] + bar[5]
-            )
-            # 非小时切换时，追加当前 _current_60m_bar 到 df_60m 末尾，重新计算 MACD
-            # 这样可以检测小时内发生的绿柱堆转红柱堆
-            if len(self.df_60m) > 0:
-                df_60m_temp = self.df_60m[:-1] + [self._current_60m_bar]
-                df_60m_with_macd_temp, _, _ = StackIdentifier.identify(
-                    MACDCalculator.calculate(df_60m_temp)
-                )
-                if len(df_60m_with_macd_temp) > 0:
-                    idx_60m = len(df_60m_with_macd_temp) - 1
-                    hist_60m = df_60m_with_macd_temp[idx_60m][8]
-                    hist_60m_prev = df_60m_with_macd_temp[idx_60m-1][8] if idx_60m > 0 else 0
-                    current_60m_time = df_60m_with_macd_temp[idx_60m][0]
-                    if hist_60m > 0 and hist_60m_prev < 0:
-                        diver_ok, diver_reason, current_green_low, prev_prev_green_low = \
-                            self.strategy.check_60m_divergence(df_60m_with_macd_temp, idx_60m)
-                        if diver_ok:
-                            existing_signal = next((s for s in self.precheck_signals_green
-                                                  if s['created_time'] == current_60m_time), None)
-                            if not existing_signal:
-                                self.precheck_signals_green.append({
-                                    'type': 'green',
-                                    'created_time': current_60m_time,
-                                    'expiry_time': bar[0],
-                                    'current_green_low': current_green_low,
-                                    'prev_prev_green_low': prev_prev_green_low
-                                })
-
-        current_time = bar[0]
-        idx_60m = self._find_60m_index(current_time)
-
-        # 每根 5m bar 都检查 60m 策略条件（与回测一致）
-        # 用 last_60m_bar_time 确保每个 60m bar 只添加一次预检信号
-        if idx_60m >= 0 and len(self.df_60m_with_macd) > 0:
-            current_60m_time = self.df_60m_with_macd[idx_60m][0] if idx_60m < len(self.df_60m_with_macd) else None
-
-            if current_60m_time != self.last_60m_bar_time:
-                self.last_60m_bar_time = current_60m_time
-
-        self._check_strategy_on_60m_complete(bar, new_60m_bar=new_60m_bar)
+        # 每根 5m bar 都检查 5m 入场条件和止损
         self._check_5m_entry()
         self._check_stop_loss()
 
-    def _find_60m_index(self, time_5m: str) -> int:
-        # 当正在合成 60m bar 时（_current_60m_bar 已有内容），
-        # 已完成的 df_60m 的最后一项就是当前 60m bar 之前的那根
-        if self._current_60m_bar is not None:
-            return len(self.df_60m) - 1 if self.df_60m else -1
-        # 没有正在合成的 bar（初始化前），在 df_60m 中查找
-        if not self.df_60m:
-            return -1
-        for i in range(len(self.df_60m) - 1, -1, -1):
-            if self.df_60m[i][0] <= time_5m:
-                return i
-        return 0
+    def on_60m_bar(self, bar: tuple):
+        """处理新的 60 分钟 K 线（实盘入口）"""
+        # 追加 60m bar
+        self.df_60m.append(bar)
+        if len(self.df_60m) > self.config.MAX_60M_BARS:
+            self.df_60m.pop(0)
 
-    def _check_strategy_on_60m_complete(self, bar, new_60m_bar=None):
-        """60 分钟 K 线完成后检查策略条件"""
+        # 重新计算 60m MACD
+        self.df_60m_with_macd, self.green_stacks_60m, self.green_gaps_60m = StackIdentifier.identify(
+            MACDCalculator.calculate(self.df_60m)
+        )
+
+        # 检查是否产生预检测信号
+        self._check_new_60m_signal()
+
+    def _check_new_60m_signal(self):
+        """检查新完成的 60m bar 是否产生预检测信号"""
         if len(self.df_60m_with_macd) < 5:
             return
 
         idx_60m = len(self.df_60m_with_macd) - 1
         hist_60m = self.df_60m_with_macd[idx_60m][8]
-        hist_60m_prev = self.df_60m_with_macd[idx_60m-1][8] if idx_60m > 0 else 0
+        hist_60m_prev = self.df_60m_with_macd[idx_60m - 1][8]
         current_60m_time = self.df_60m_with_macd[idx_60m][0]
 
         # 绿柱堆内 DIF 拐头
         if hist_60m < 0:
-            dif_turn, turn_reason = self.strategy.check_60m_dif_turn_in_green(
+            dif_turn, _ = self.strategy.check_60m_dif_turn_in_green(
                 self.df_60m_with_macd, idx_60m, self.green_stacks_60m
             )
-
             if dif_turn:
                 diver_ok, diver_reason, current_green_low, prev_prev_green_low = \
                     self.strategy.check_60m_divergence(self.df_60m_with_macd, idx_60m)
-
                 if diver_ok:
-                    existing_signal = next((s for s in self.precheck_signals_green
-                                          if s['created_time'] == current_60m_time), None)
-                    if not existing_signal:
+                    existing = next((s for s in self.precheck_signals_green
+                                   if s['created_time'] == current_60m_time), None)
+                    if not existing:
                         self.precheck_signals_green.append({
                             'type': 'green',
                             'created_time': current_60m_time,
-                            'expiry_time': bar[0],
-                            'current_green_low': current_green_low,
-                            'prev_prev_green_low': prev_prev_green_low
+                            'expiry_time': current_60m_time,
                         })
 
         # 绿柱堆转红柱堆（hist 从负转正）
-        # 仅在非小时切换时检查（小时切换时在 on_5m_bar 中已处理）
-        # 条件：new_60m_bar is None（不是小时切换）且 hist 从负转正
-        elif new_60m_bar is None and hist_60m > 0 and hist_60m_prev < 0:
+        elif hist_60m > 0 and hist_60m_prev < 0:
             diver_ok, diver_reason, current_green_low, prev_prev_green_low = \
                 self.strategy.check_60m_divergence(self.df_60m_with_macd, idx_60m)
-
             if diver_ok:
-                existing_signal = next((s for s in self.precheck_signals_green
-                                      if s['created_time'] == current_60m_time), None)
-                if not existing_signal:
+                existing = next((s for s in self.precheck_signals_green
+                               if s['created_time'] == current_60m_time), None)
+                if not existing:
                     self.precheck_signals_green.append({
                         'type': 'green',
                         'created_time': current_60m_time,
-                        'expiry_time': bar[0],
-                        'current_green_low': current_green_low,
-                        'prev_prev_green_low': prev_prev_green_low
+                        'expiry_time': current_60m_time,
                     })
 
         # 红柱堆内 DIF 拐头
         elif hist_60m > 0 and hist_60m_prev > 0:
-            dif_turn_red, reason = self.strategy.check_60m_dif_turn_in_red(
+            dif_turn_red, _ = self.strategy.check_60m_dif_turn_in_red(
                 self.df_60m_with_macd, idx_60m
             )
             if dif_turn_red:
-                existing_signal = next((s for s in self.precheck_signals_red
-                                      if s['created_time'] == current_60m_time), None)
-                if not existing_signal:
-                    self.precheck_signals_red.append({
-                        'type': 'red',
-                        'created_time': current_60m_time,
-                        'expiry_time': bar[0],
-                        'current_green_low': None,
-                        'prev_prev_green_low': None
-                    })
+                diver_ok, diver_reason, curr_low_60m, prev_prev_low_60m = \
+                    self.strategy.check_60m_bottom_rise_in_red(self.df_60m_with_macd, idx_60m)
+                if diver_ok:
+                    existing = next((s for s in self.precheck_signals_red
+                                   if s['created_time'] == current_60m_time), None)
+                    if not existing:
+                        self.precheck_signals_red.append({
+                            'type': 'red',
+                            'created_time': current_60m_time,
+                            'expiry_time': current_60m_time,
+                        })
 
     def _check_5m_entry(self):
         """检查 5 分钟入场条件"""

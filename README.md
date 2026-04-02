@@ -58,7 +58,14 @@ pip install numpy pandas matplotlib
 openctp-channels switch tts
 
 # 运行K线采集
-python KlineCollector.py
+python KlineCollector.py online
+
+回测信号
+python .\backtest\strategy_backtest.py
+
+所有的合约，昨天的信号回测
+
+python simulate_signal_check_v2.py --all --days 1
 ```
 
 ## 文档
