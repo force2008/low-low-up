@@ -84,7 +84,9 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
         # 默认从中间开始模拟
         sim_start_idx = len(all_5m) // 2
 
-    warmup_5m = all_5m[:sim_start_idx]
+    # 预热数据 = 模拟开始位置之前的 K 线（最多 1000 根）
+    warmup_5m = all_5m[max(0, sim_start_idx - 1000):sim_start_idx]
+    # 模拟数据 = start_time 到 end_time 之间的 K 线
     sim_5m = all_5m[sim_start_idx:sim_end_idx]
 
     print(f"\n预热: {len(warmup_5m)} 根 5m K 线")
@@ -136,6 +138,7 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
         for signal in signals:
             if signal.signal_type == SignalType.ENTRY_LONG:
                 entry_signals.append({
+                    'symbol': symbol,
                     'time': signal.time,
                     'price': signal.price,
                     'stop_loss': signal.stop_loss,
@@ -145,6 +148,7 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
 
             elif signal.signal_type == SignalType.EXIT_LONG:
                 exit_signals.append({
+                    'symbol': symbol,
                     'time': signal.time,
                     'price': signal.price,
                     'reason': signal.reason
@@ -170,8 +174,9 @@ def simulate(symbol: str, db_path: str, contracts_path: str,
 
 
 def simulate_all_contracts(db_path: str, contracts_path: str, days: int = 1):
-    """模拟所有合约"""
+    """模拟所有合约最近 N 天的数据"""
     import json
+    from datetime import datetime, timedelta
 
     with open(contracts_path, 'r', encoding='utf-8') as f:
         contracts = json.load(f)
@@ -179,20 +184,30 @@ def simulate_all_contracts(db_path: str, contracts_path: str, days: int = 1):
     # 过滤可交易的合约
     trading_contracts = [c for c in contracts if c.get('IsTrading', 0) == 1]
 
-    print(f"开始模拟 {len(trading_contracts)} 个合约...")
+    # 计算结束时间（今天）和开始时间（今天 - days 天）
+    end_time = datetime.now().strftime('%Y-%m-%d')
+    start_time = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    print(f"开始模拟 {len(trading_contracts)} 个合约（最近 {days} 天：{start_time} ~ {end_time}）...")
 
     all_entry_signals = []
     all_exit_signals = []
 
-    for contract in trading_contracts[:10]:  # 限制数量
+    for contract in trading_contracts:
         product_id = contract['ProductID']
         exchange_id = contract['ExchangeID']
         main_contract = contract['MainContractID']
 
         symbol = f"{exchange_id}.{main_contract}"
 
+        # 加载足够的预热数据（用于计算 MACD 指标）
+        # 每天约 288 根 5 分钟 K 线，预热需要至少 500 根以上才能有足够的 MACD 数据
+        limit = 2000  # 固定加载 2000 根用于预热
+
         try:
-            entry, exit_ = simulate(symbol, db_path, contracts_path, limit=5000)
+            entry, exit_ = simulate(symbol, db_path, contracts_path,
+                                    start_time=start_time, end_time=end_time,
+                                    limit=limit)
             if entry:
                 all_entry_signals.extend(entry)
             if exit_:
@@ -201,9 +216,15 @@ def simulate_all_contracts(db_path: str, contracts_path: str, days: int = 1):
             print(f"模拟失败 {symbol}: {e}")
 
     print("\n" + "=" * 70)
-    print("全部合约模拟完成")
+    print(f"全部合约模拟完成（最近 {days} 天）")
     print(f"总入场信号：{len(all_entry_signals)} 个")
     print(f"总平仓信号：{len(all_exit_signals)} 个")
+
+    if all_entry_signals:
+        print(f"\n入场信号汇总（按时间排序）：")
+        sorted_entries = sorted(all_entry_signals, key=lambda x: x['time'])
+        for s in sorted_entries[:20]:  # 只显示前20个
+            print(f"  [{s['time']}] {s.get('symbol', 'N/A')} 价格:{s['price']} 止损:{s['stop_loss']} {s['reason']}")
 
 
 if __name__ == '__main__':
@@ -216,7 +237,8 @@ if __name__ == '__main__':
     parser.add_argument('--limit', '-l', type=int, default=10000, help='最多加载的5分钟K线数量，默认10000')
     parser.add_argument('--db', '-d', type=str, default=None, help='数据库路径')
     parser.add_argument('--contracts', '-c', type=str, default=None, help='合约配置文件路径')
-    parser.add_argument('--all', '-a', action='store_true', help='模拟所有合约')
+    parser.add_argument('--all', '-a', action='store_true', help='模拟所有合约最近 N 天')
+    parser.add_argument('--days', type=int, default=7, help='--all 时模拟最近天数，默认 7 天')
 
     args = parser.parse_args()
 
@@ -225,7 +247,7 @@ if __name__ == '__main__':
     contracts_path = args.contracts or config.CONTRACTS_PATH
 
     if args.all:
-        simulate_all_contracts(db_path, contracts_path)
+        simulate_all_contracts(db_path, contracts_path, days=args.days)
     elif args.symbol:
         simulate(args.symbol, db_path, contracts_path,
                 start_time=args.start_time, end_time=args.end_time,
