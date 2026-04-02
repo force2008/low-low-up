@@ -316,7 +316,6 @@ class Strategy:
                     # 使用60分钟绿柱堆低点作为止损
                     if atr_percentile < 0.3:
                         use_60m_stop = True
-                        print(f"    [ATR] 当前ATR={current_atr:.2f}, 百分位={atr_percentile:.2%}，使用60分钟绿柱堆止损")
 
         # ========== 根据条件选择止损方式 ==========
         if use_60m_stop and df_60m is not None and green_stacks_60m is not None:

@@ -5,15 +5,19 @@
 
 import sqlite3
 import json
+import os
 from typing import Dict, List, Optional
 from datetime import datetime
+
+# 获取 backtest/ 目录的父目录（即 low-low-up/）
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ============== 配置 ==============
 
 class Config:
-    DB_PATH = "/home/ubuntu/low-low-up/data/db/kline_data.db"
-    CONTRACTS_PATH = "/home/ubuntu/low-low-up/data/contracts/main_contracts.json"
+    DB_PATH = os.path.join(_BASE_DIR, "data", "db", "kline_data.db")
+    CONTRACTS_PATH = os.path.join(_BASE_DIR, "data", "contracts", "main_contracts.json")
 
     DURATION_5M = 300
     DURATION_60M = 3600
@@ -36,7 +40,7 @@ class DataLoader:
         if self._contracts_cache is not None:
             return self._contracts_cache
 
-        with open(self.contracts_path, 'r') as f:
+        with open(self.contracts_path, 'r', encoding='utf-8') as f:
             contracts = json.load(f)
         self._contracts_cache = {c['ProductID']: c for c in contracts if c.get('IsTrading', 0) == 1}
         return self._contracts_cache

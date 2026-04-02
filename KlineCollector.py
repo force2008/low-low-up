@@ -23,7 +23,8 @@ from config.trading_time_config import (
 )
 from utils.feishu_notifier import FeishuNotifier, send_feishu_signal, send_feishu_high_volatility_alert, send_feishu_strategy_signal, send_feishu_breakout_signal, send_feishu_test
 from signal.BreakoutSignalDetector import BreakoutSignalDetector
-from strategies.strategy_0328 import LiveStrategyEngine as Strategy0328Engine, Signal as StrategySignal, SignalType, Config as StrategyConfig
+from backtest.strategy_engine import LiveStrategyEngine as StrategyEngine, Signal as StrategySignal, SignalType
+from backtest.strategy_utils import Config as StrategyConfig
 
 
 # 配置日志
@@ -497,35 +498,28 @@ atexit.register(cleanup)
 
 class DatabaseManager:
     """ 数据库管理类 """
-    
+
     _lock = threading.Lock()  # 类级别的锁，所有实例共享
-    
+
     # 数据库路径配置
-    ONLINE_DB_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/kline_data.db"
-    TEST_DB_PATH = "/home/ubuntu/quant/ctp.examples/openctp-ctp2tts/data-manager/kline_data.db"
-    
+    ONLINE_DB_PATH = "./data/db/kline_data.db"  # 线上数据库路径
+    TEST_DB_PATH = "./data/db/kline_data_test.db"  # 测试数据库路径
+
     def __init__(self, db_path=None, use_online=False):
         """
         初始化数据库
-        
+
         Args:
             db_path: 自定义数据库路径（优先级最高）
             use_online: 是否使用线上数据库，True 使用线上库，False 使用测试库
         """
-        # 确定数据库路径
         if db_path is not None:
-            # 如果传入了具体的路径参数，检查是否包含"online"
-            if "online" in db_path.lower():
-                self.db_path = self.ONLINE_DB_PATH
-            else:
-                self.db_path = db_path
+            self.db_path = db_path
         elif use_online:
-            # 如果 use_online 为 True，使用线上数据库
             self.db_path = self.ONLINE_DB_PATH
         else:
-            # 默认使用测试数据库
             self.db_path = self.TEST_DB_PATH
-        
+
         self.conn = None
         self.cursor = None
         self.init_database()
@@ -667,7 +661,7 @@ class KlineAggregator:
         
         # 策略引擎配置
         self.enable_strategy = enable_strategy
-        self.strategy_engines = {}  # {symbol: Strategy0328Engine}
+        self.strategy_engines = {}  # {symbol: StrategyEngine}
         self.strategy_engine_cache = {}  # {symbol: bool} 记录是否已初始化
         self.strategy_signal_file = STRATEGY_SIGNAL_FILE
         
@@ -677,7 +671,7 @@ class KlineAggregator:
         
         # 获取数据库路径和合约配置路径（使用 KlineCollector 的配置）
         self.db_path = db_manager.db_path
-        self.contracts_path = "main_contracts.json"  # 使用当前目录的 main_contracts.json
+        self.contracts_path = "./data/contracts/main_contracts.json"  # 使用当前目录的 main_contracts.json
         
         # 延迟加载策略引擎：只在需要时初始化
         if enable_strategy:
@@ -881,7 +875,9 @@ class KlineAggregator:
                 try:
                     # 使用 strategy_0328.py 的 Config 和 LiveStrategyEngine
                     config = StrategyConfig()
-                    engine = Strategy0328Engine(symbol, config)
+                    config.DB_PATH = self.db_path
+                    config.CONTRACTS_PATH = self.contracts_path
+                    engine = StrategyEngine(symbol, config)
                     engine.initialize()
                     self.strategy_engines[symbol] = engine
                     self.strategy_engine_cache[symbol] = True
@@ -1115,7 +1111,7 @@ def is_excluded_product(instrument_id: str) -> bool:
     return product.upper() in EXCLUDED_PRODUCTS
 
 
-def load_main_contracts(json_file="main_contracts.json"):
+def load_main_contracts(json_file="./data/contracts/main_contracts.json"):
     """从 main_contracts.json 加载主力合约"""
     if not os.path.exists(json_file):
         print_log(f"错误：文件不存在 {json_file}")
@@ -1161,7 +1157,7 @@ if __name__ == '__main__':
     import sys
     db_path_arg = None
     use_online = False
-    
+
     for arg in sys.argv[1:]:
         if arg == "online":
             use_online = True
@@ -1174,7 +1170,7 @@ if __name__ == '__main__':
             print_log(f"使用自定义数据库路径：{arg}")
     
     # 从 main_contracts.json 加载合约列表
-    json_file = "main_contracts.json"
+    json_file = "./data/contracts/main_contracts.json"
     instruments = load_main_contracts(json_file)
     
     if not instruments:
