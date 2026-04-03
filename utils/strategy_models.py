@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-信号类型和信号数据结构
+策略信号和交易数据结构
+
+- SignalType: 信号类型枚举
+- Signal: 交易信号数据类
+- Trade: 交易记录数据类
+- Position: 持仓信息数据类
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +15,7 @@ from typing import Optional
 
 
 class SignalType(Enum):
+    """信号类型枚举"""
     ENTRY_LONG = "ENTRY_LONG"      # 做多入场
     EXIT_LONG = "EXIT_LONG"        # 平多出场
 
@@ -28,19 +34,6 @@ class Signal:
 
 
 @dataclass
-class Position:
-    """持仓信息"""
-    symbol: str
-    direction: str  # "long" or "short"
-    entry_time: str
-    entry_price: float
-    position_size: int
-    initial_stop: float  # 初始止损价
-    current_stop: float  # 当前止损价
-    stop_reason: str = ""
-
-
-@dataclass
 class Trade:
     """交易记录"""
     entry_time: str
@@ -54,3 +47,16 @@ class Trade:
     initial_stop: float = 0.0
     stop_update_count: int = 0
     entry_conditions: str = ""
+
+
+@dataclass
+class Position:
+    """持仓信息"""
+    symbol: str
+    direction: str  # "long" or "short"
+    entry_time: str
+    entry_price: float
+    position_size: int
+    initial_stop: float  # 初始止损价
+    current_stop: float  # 当前止损价
+    stop_reason: str = ""

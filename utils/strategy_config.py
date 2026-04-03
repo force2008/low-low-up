@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-策略工具类 - 包含配置和数据加载
+策略配置和数据加载工具
+
+- Config: 策略配置类
+- DataLoader: K线数据加载器
 """
 
 import sqlite3
@@ -9,13 +12,14 @@ import os
 from typing import Dict, List, Optional
 from datetime import datetime
 
-# 获取 backtest/ 目录的父目录（即 low-low-up/）
+# 获取项目根目录
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ============== 配置 ==============
 
 class Config:
+    """策略配置"""
     DB_PATH = os.path.join(_BASE_DIR, "data", "db", "kline_data.db")
     CONTRACTS_PATH = os.path.join(_BASE_DIR, "data", "contracts", "main_contracts.json")
 
@@ -31,12 +35,15 @@ class Config:
 # ============== 数据加载 ==============
 
 class DataLoader:
+    """K线数据加载器"""
+
     def __init__(self, db_path: str, contracts_path: str):
         self.db_path = db_path
         self.contracts_path = contracts_path
         self._contracts_cache = None
 
     def load_main_contracts(self) -> Dict[str, dict]:
+        """加载主力合约列表"""
         if self._contracts_cache is not None:
             return self._contracts_cache
 
@@ -51,7 +58,6 @@ class DataLoader:
         cursor = conn.cursor()
 
         if limit:
-            # 先获取最近的 limit 条记录，再按时间正序返回
             query = f"""SELECT datetime, open, high, low, close, volume
                        FROM kline_data
                        WHERE symbol = ? AND duration = ?
@@ -72,6 +78,7 @@ class DataLoader:
         return result
 
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
+        """获取合约信息"""
         contracts = self.load_main_contracts()
         symbol_short = symbol.split('.')[-1] if '.' in symbol else symbol
 
