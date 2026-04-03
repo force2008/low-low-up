@@ -8,18 +8,20 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# 添加项目根目录和 backtest 目录到路径
-root_dir = os.path.dirname(os.path.dirname(__file__))
-sys.path.insert(0, root_dir)
-sys.path.insert(0, os.path.join(root_dir, 'backtest'))
+# 添加当前目录到路径
+sys.path.insert(0, os.path.dirname(__file__))
+# 添加项目根目录到路径，以便从 strategy 模块导入
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# 导入公共模块（与 KlineCollector_v2 共用）
-from strategy import MACDCalculator, StackIdentifier, Strategy
-from strategy.macd import ATRCalculator
-
-# 导入工具模块
+# 优先使用 backtest 目录中的本地文件
 from utils.strategy_config import Config, DataLoader
-from utils.strategy_models import Trade, SignalType
+# from strategy_models import Trade, SignalType
+from utils.strategy_models import Signal, Position, Trade, SignalType
+# from strategy_indicators import MACDCalculator, StackIdentifier, IndexMapper, ATRCalculator
+from strategy.index_map import IndexMapper
+from strategy.macd import MACDCalculator, ATRCalculator
+from strategy.stack import StackIdentifier
+from strategy_logic import Strategy
 
 
 # ============== 回测某一天信号功能 ==============
