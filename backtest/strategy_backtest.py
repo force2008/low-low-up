@@ -21,7 +21,7 @@ from utils.strategy_models import Signal, Position, Trade, SignalType
 from strategy.index_map import IndexMapper
 from strategy.macd import MACDCalculator, ATRCalculator
 from strategy.stack import StackIdentifier
-from strategy_logic import Strategy
+from strategy.logic import Strategy
 
 
 # ============== 回测某一天信号功能 ==============

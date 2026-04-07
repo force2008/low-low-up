@@ -26,6 +26,7 @@ from utils.feishu_notifier import FeishuNotifier, send_feishu_strategy_signal, s
 # 从拆分后的模块导入（公共类）
 from strategy import MACDCalculator, ATRCalculator, StackIdentifier, Strategy
 from strategy.signal_manager import StrategySignalManager
+from strategy.index_map import IndexMapper
 from database import DatabaseManager
 
 
@@ -65,7 +66,7 @@ MACD_SIGNAL = 9
 
 # K 线数据量配置（从数据库读取的历史数据量）
 MAX_5M_BARS = 500  # 5 分钟 K 线
-MAX_60M_BARS = 200  # 60 分钟 K 线
+MAX_60M_BARS = 1000  # 60 分钟 K 线（增加数据量以覆盖节假日期间的数据跨度）
 
 
 def check_log_size():
@@ -102,137 +103,6 @@ def print_log(*args, **kwargs):
 
 
 # ==================== Kline 聚合器 ====================
-
-
-# ==================== 策略逻辑 ====================
-
-class Strategy:
-    """策略逻辑"""
-
-    def __init__(self, symbol_info: dict = None):
-        self.symbol_info = symbol_info or {}
-        self.product_id = self.symbol_info.get('ProductID', '')
-
-    def check_60m_dif_turn_in_green(self, data_with_macd: list, idx_60m: int, green_stacks: dict) -> tuple:
-        """检查 60 分钟绿柱堆内 DIF 是否拐头（宽松版：有下跌+有反弹）"""
-        if idx_60m < 2:
-            return False, ""
-
-        # 找到当前绿柱堆
-        current_green = None
-        for stack_idx, stack in green_stacks.items():
-            if stack['start_idx'] <= idx_60m <= stack['end_idx']:
-                current_green = stack
-                break
-
-        if not current_green:
-            return False, "不在绿柱堆内"
-
-        # 检查绿柱堆内 DIF 是否有下跌+反弹（宽松逻辑）
-        if idx_60m >= 4:
-            dif_4 = data_with_macd[idx_60m - 4][6]
-            dif_3 = data_with_macd[idx_60m - 3][6]
-            dif_2 = data_with_macd[idx_60m - 2][6]
-            dif_1 = data_with_macd[idx_60m - 1][6]
-            dif_0 = data_with_macd[idx_60m][6]
-
-            # 条件1：之前有下跌（dif_3 > dif_2 或 dif_3 > dif_1）
-            # 条件2：当前在反弹（dif_0 > dif_2 或 dif_0 > dif_1）
-            has_drop = (dif_3 > dif_2) or (dif_3 > dif_1)
-            has_rise = (dif_0 > dif_2) or (dif_0 > dif_1)
-
-            if has_drop and has_rise:
-                return True, "绿柱堆内DIF拐头"
-
-        return False, "DIF未拐头"
-
-    def check_60m_dif_turn_in_red(self, data_with_macd: list, idx_60m: int) -> tuple:
-        """检查 60 分钟红柱堆内 DIF 是否拐头向下"""
-        if idx_60m < 2:
-            return False, ""
-
-        # 检查最近3个DIF是否下降
-        dif_values = [data_with_macd[i][6] for i in range(idx_60m - 2, idx_60m + 1)]
-
-        if len(dif_values) < 3:
-            return False, "数据不足"
-
-        if dif_values[-1] < dif_values[-2] < dif_values[-3]:
-            return True, "红柱堆内DIF拐头向下"
-
-        return False, "DIF未拐头向下"
-
-    def check_60m_divergence(self, data_with_macd: list, idx_60m: int) -> tuple:
-        """检查 60 分钟底背离
-
-        与 strategy_0328.py 的逻辑一致：
-        - 如果当前绿柱低点 >= 前一个绿柱低点（未创新低或持平），则底背离确认
-        - 逻辑：下跌未创新低，说明空头力量衰减
-        """
-        if idx_60m < 5:
-            return False, "数据不足", 0, 0
-
-        # 获取当前绿柱堆的最低点（从绿柱堆数据中获取，而非当前 bar）
-        current_stack_id = None
-        for stack_id, stack in StackIdentifier.identify(data_with_macd)[1].items():
-            if stack['start_idx'] <= idx_60m <= stack['end_idx'] and data_with_macd[idx_60m][8] < 0:
-                current_stack_id = stack_id
-                break
-
-        if current_stack_id is None:
-            return False, "不在绿柱堆", 0, 0
-
-        green_stacks = StackIdentifier.identify(data_with_macd)[1]
-        current_low = green_stacks.get(current_stack_id, {}).get('lowest_low', data_with_macd[idx_60m][3])
-
-        # 找前一个绿柱堆
-        stack_ids = sorted(green_stacks.keys())
-        current_idx_in_list = stack_ids.index(current_stack_id)
-
-        if current_idx_in_list == 0:
-            return False, "无前序绿柱堆", current_low, 0
-
-        prev_stack_id = stack_ids[current_idx_in_list - 1]
-        prev_low = green_stacks.get(prev_stack_id, {}).get('lowest_low', float('inf'))
-
-        if prev_low == float('inf'):
-            return False, "无前序绿柱堆", current_low, 0
-
-        # 检查底背离：当前绿柱堆最低点 >= 前一个（未创新低或持平）= 底背离确认
-        # 这是与原逻辑相反的：原逻辑要求创新低，这里要求未创新低
-        if current_low >= prev_low:
-            return True, f"底背离确认: 当前低={current_low:.2f}, 前低={prev_low:.2f}", current_low, prev_low
-
-        return False, f"绿柱低点创新低 (当前:{current_low:.2f} < 前低:{prev_low:.2f})", current_low, prev_low
-
-    def check_60m_bottom_rise_in_red(self, data_with_macd: list, idx_60m: int) -> tuple:
-        """检查 60 分钟红柱堆内的底抬升"""
-        if idx_60m < 5:
-            return False, "数据不足", 0, 0
-
-        # 获取当前红柱堆的最低点
-        current_low = data_with_macd[idx_60m][3]
-
-        # 找前一个红柱堆
-        prev_red_start = None
-        for i in range(idx_60m - 1, -1, -1):
-            if data_with_macd[i][8] > 0:
-                if prev_red_start is None:
-                    prev_red_start = i
-            elif prev_red_start is not None:
-                break
-
-        if prev_red_start is None or idx_60m - prev_red_start > 50:
-            return False, "无前序红柱堆", 0, 0
-
-        # 获取前一个红柱堆的最低点
-        prev_low = min(data_with_macd[i][3] for i in range(prev_red_start, idx_60m))
-
-        # 检查底抬升：当前最低点高于前低
-        if current_low > prev_low:
-            return True, f"底抬升: 当前低={current_low:.2f}, 前低={prev_low:.2f}", current_low, prev_low
-
-        return False, "未底抬升", current_low, prev_low
 
 
 # ==================== 策略信号管理器 ====================
@@ -469,6 +339,9 @@ class KlineAggregator:
         # 记录上次处理的 60m bar 时间（避免重复处理）
         self.last_60m_bar_times = {}
 
+        # 60分钟索引映射（5m索引 -> 60m索引）
+        self.index_map_60m = {}  # {symbol: [idx_60m, ...]}
+
         print_log(f"策略引擎已启用（每次从数据库读取模式）")
         print_log(f"  数据库路径：{self.db_path}")
         print_log(f"  监控合约数：{len(self.instrument_map)}")
@@ -589,11 +462,28 @@ class KlineAggregator:
             _, green_stacks_60m, _ = StackIdentifier.identify(data_60m_with_macd)
 
             idx_60m = len(data_60m_with_macd) - 1
-            hist_60m = data_60m_with_macd[idx_60m][8]
-            hist_60m_prev = data_60m_with_macd[idx_60m - 1][8] if idx_60m > 0 else 0
             current_60m_time = data_60m_with_macd[idx_60m][0]
 
-            strategy = Strategy()
+            # ========== 关键修复：验证数据实际存在的时间 ==========
+            # 如果传入了 end_time 但数据库没有这个时间点的数据，则不产生预检测信号
+            # 例如：end_time=20:00:00 但数据库最后一根是 11:00，说明没有新数据
+            if end_time:
+                # 解析 end_time 和实际数据时间
+                try:
+                    end_dt = datetime.strptime(end_time[:19], '%Y-%m-%d %H:%M:%S')
+                    actual_dt = datetime.strptime(current_60m_time[:19], '%Y-%m-%d %H:%M:%S')
+                    time_diff = (end_dt - actual_dt).total_seconds() / 60
+                    # 如果实际数据比 end_time 晚超过10分钟，说明 end_time 时间点没有新数据
+                    if time_diff > 10:
+                        # 没有新60m数据，跳过
+                        return
+                except:
+                    pass
+
+            hist_60m = data_60m_with_macd[idx_60m][8]
+            hist_60m_prev = data_60m_with_macd[idx_60m - 1][8] if idx_60m > 0 else 0
+
+            strategy = Strategy({})
 
             # 检查是否已处理过这个 60m bar
             last_time = self.last_60m_bar_times.get(symbol)
@@ -614,11 +504,12 @@ class KlineAggregator:
                         if not existing:
                             self.precheck_signals_green[symbol].append({
                                 'type': 'green',
+                                'sub_type': 'dif_turn',  # 绿柱堆内DIF拐头
                                 'created_time': current_60m_time,
                             })
                             print_log(f"📊 {symbol} 60分钟绿柱堆内DIF拐头+底背离，预检测信号")
 
-            # 绿柱堆转红柱堆
+            # 绿柱堆转红柱堆（不需要检查绿柱堆限制）
             elif hist_60m > 0 and hist_60m_prev < 0:
                 diver_ok, diver_reason, _, _ = strategy.check_60m_divergence(data_60m_with_macd, idx_60m)
                 if diver_ok:
@@ -628,6 +519,7 @@ class KlineAggregator:
                     if not existing:
                         self.precheck_signals_green[symbol].append({
                             'type': 'green',
+                            'sub_type': 'green_to_red',  # 绿柱堆转红柱堆
                             'created_time': current_60m_time,
                         })
                         print_log(f"📊 {symbol} 60分钟绿柱堆转红柱堆+底背离，预检测信号")
@@ -707,23 +599,35 @@ class KlineAggregator:
             if len(data_5m) < 20 or len(data_60m) < 20:
                 return
 
-            # 计算 MACD
+            # 计算 MACD 和 ATR
             data_5m_with_macd = MACDCalculator.calculate(data_5m)
             data_60m_with_macd = MACDCalculator.calculate(data_60m)
+            data_5m_with_atr = ATRCalculator.calculate(data_5m_with_macd, 14)
 
-            if len(data_5m_with_macd) < 5 or len(data_60m_with_macd) < 5:
+            if len(data_5m_with_atr) < 5 or len(data_60m_with_macd) < 5:
                 return
+
+            # 构建60分钟索引映射（与回测逻辑一致）
+            if symbol not in self.index_map_60m or len(self.index_map_60m.get(symbol, [])) != len(data_5m_with_macd):
+                self.index_map_60m[symbol] = IndexMapper.precompute_60m_index(data_5m_with_macd, data_60m_with_macd)
+            index_map = self.index_map_60m[symbol]
 
             # 识别绿柱堆
             _, green_stacks_5m, _ = StackIdentifier.identify(data_5m_with_macd)
+            _, green_stacks_60m, _ = StackIdentifier.identify(data_60m_with_macd)
 
-            strategy = Strategy()
+            strategy = Strategy({})
 
             # 检查 5 分钟入场条件
             idx_5m = len(data_5m_with_macd) - 1
             current_5m_time = data_5m_with_macd[idx_5m][0][:19]
             current_5m_price = data_5m_with_macd[idx_5m][4]
             current_5m_low = data_5m_with_macd[idx_5m][3]
+
+            # 使用index_map获取正确的60m索引
+            idx_60m = index_map[idx_5m] if idx_5m < len(index_map) else len(data_60m_with_macd) - 1
+            hist_60m = data_60m_with_macd[idx_60m][8]
+            hist_60m_prev = data_60m_with_macd[idx_60m - 1][8] if idx_60m > 0 else 0
 
             # 如果有持仓，检查止损
             if position:
@@ -735,22 +639,29 @@ class KlineAggregator:
                 sig_type = sig['type']
 
                 if sig_type == 'green':
-                    # 检查 5 分钟绿柱堆内 DIF 金叉
-                    diver_ok, diver_reason, current_green_low, _ = strategy.check_60m_divergence(data_60m_with_macd, len(data_60m_with_macd) - 1)
+                    # 获取信号的子类型
+                    sub_type = sig.get('sub_type', 'dif_turn')
+
+                    # 检查底背离（两种绿信号都需要）
+                    diver_ok, diver_reason, current_green_low, _ = strategy.check_60m_divergence(data_60m_with_macd, idx_60m)
                     if not diver_ok:
                         continue
 
-                    # 检查 5 分钟绿柱堆内价格创新低
-                    in_green = False
-                    green_start = None
-                    for idx, stack in green_stacks_5m.items():
-                        if stack['start_idx'] <= idx_5m <= stack['end_idx']:
-                            in_green = True
-                            green_start = stack['start_idx']
-                            break
+                    # 绿柱堆内DIF拐头：需要检查当前5分钟是否在绿柱堆中
+                    if sub_type == 'dif_turn':
+                        in_green = False
+                        green_start = None
+                        for idx, stack in green_stacks_5m.items():
+                            if stack['start_idx'] <= idx_5m <= stack['end_idx']:
+                                in_green = True
+                                green_start = stack['start_idx']
+                                break
 
-                    if not in_green:
-                        continue
+                        if not in_green:
+                            continue
+                    else:
+                        # 绿柱堆转红柱堆：不需要检查绿柱堆限制
+                        green_start = None
 
                     # 入场条件：5分钟阳柱（收盘价 > 开盘价）
                     current_open = data_5m_with_macd[idx_5m][1]
@@ -758,11 +669,77 @@ class KlineAggregator:
                     if current_close <= current_open:
                         continue
 
-                    # 入场：价格突破绿柱堆最高点
-                    green_high = max(data_5m_with_macd[i][2] for i in range(green_start, idx_5m + 1))
+                    # 入场价格：突破绿柱堆最高点（绿柱堆内DIF拐头）或当前价格（绿柱堆转红柱堆）
+                    if sub_type == 'green_to_red':
+                        # 绿柱堆转红柱堆：使用当前价格作为入场价
+                        entry_price = current_close
+                        # 获取当前绿柱堆的最低价用于计算止损
+                        _, green_stacks_60m_temp, _ = StackIdentifier.identify(data_60m_with_macd)
+                        if green_stacks_60m_temp:
+                            last_green = max(green_stacks_60m_temp.keys())
+                            current_green_low = green_stacks_60m_temp[last_green].get('lowest_low', current_close - 50)
+                        else:
+                            current_green_low = current_close - 50
+                    else:
+                        # 绿柱堆内DIF拐头：使用当前K线开盘价作为入场价
+                        entry_price = current_open
+
+                    # ========== 止损计算 ==========
+                    # 如果当前ATR处于70分位以下，使用60分钟前一个绿柱堆最低价
+                    # 否则使用5分钟前前绿柱堆低点
+                    use_60m_stop = False
+                    atr_percentile = 0.0
+                    stop_loss_reason = ""
+
+                    # 检查ATR百分位 (ATR在第7列，索引6)
+                    if len(data_5m_with_atr) > idx_5m and len(data_5m_with_atr[idx_5m]) > 6:
+                        current_atr = data_5m_with_atr[idx_5m][6]
+                        if current_atr > 0:
+                            # 计算ATR百分位
+                            lookback = min(200, idx_5m)
+                            atr_values = [data_5m_with_atr[i][6] for i in range(max(0, idx_5m - lookback), idx_5m + 1)
+                                        if len(data_5m_with_atr[i]) > 6 and data_5m_with_atr[i][6] > 0]
+                            if len(atr_values) >= 20:
+                                count_below = sum(1 for v in atr_values if v < current_atr)
+                                atr_percentile = count_below / len(atr_values)
+                                # 如果ATR百分位 < 0.3 (70分位以下)
+                                if atr_percentile < 0.3:
+                                    use_60m_stop = True
+                                    stop_loss_reason = f"(ATR{atr_percentile:.0%}低，使用60分钟绿柱堆)"
+
+                    if use_60m_stop and green_stacks_60m:
+                        # 使用60分钟前一个绿柱堆最低价
+                        available_60m_ids = [sid for sid, info in green_stacks_60m.items()
+                                            if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_60m]
+                        if len(available_60m_ids) >= 2:
+                            available_60m_ids.sort()
+                            prev_60m_green_id = available_60m_ids[-2]
+                            stop_loss = green_stacks_60m[prev_60m_green_id]['low']
+                        elif len(available_60m_ids) >= 1:
+                            available_60m_ids.sort()
+                            stop_loss = green_stacks_60m[available_60m_ids[-1]]['low']
+                        else:
+                            stop_loss = current_green_low
+                    else:
+                        # 使用5分钟前前绿柱堆的低点
+                        available_green_ids = [sid for sid, info in green_stacks_5m.items()
+                                              if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_5m]
+                        if len(available_green_ids) >= 2:
+                            available_green_ids.sort()
+                            prev_prev_green_id = available_green_ids[-2]
+                            stop_loss = green_stacks_5m[prev_prev_green_id]['low']
+                        else:
+                            # 备用：如果没有前前绿柱堆，使用当前绿柱堆低点
+                            stop_loss = current_green_low
+
+                    # ========== 检查止损价是否 >= 入场价 ==========
+                    # 如果止损价 >= 入场价，说明是下降趋势，不应该开仓
+                    if stop_loss >= entry_price:
+                        logger.info(f"[{symbol}] 止损价({stop_loss:.2f}) >= 入场价({entry_price:.2f})，下降趋势不开仓")
+                        continue
 
                     # 检查是否已处理过这个信号时间
-                    sig_time_key = f"{sig['created_time']}_{green_start}"
+                    sig_time_key = f"{sig['created_time']}_{green_start if green_start else 'red'}"
                     if not hasattr(self, '_processed_signals'):
                         self._processed_signals = {}
                     if self._processed_signals.get(symbol) == sig_time_key:
@@ -770,10 +747,8 @@ class KlineAggregator:
                     self._processed_signals[symbol] = sig_time_key
 
                     # 入场
-                    stop_loss = green_high - (green_high - current_green_low) * 0.5
-
                     self.positions[symbol] = {
-                        'entry_price': green_high,
+                        'entry_price': entry_price,
                         'stop_loss': stop_loss,
                         'entry_time': current_time
                     }
@@ -781,10 +756,10 @@ class KlineAggregator:
 
                     signal_data = {
                         'signal_type': 'ENTRY_LONG',
-                        'price': green_high,
+                        'price': entry_price,
                         'stop_loss': stop_loss,
                         'position_size': 1,
-                        'reason': f"5分钟绿柱堆阳柱+60分钟底背离，入场价{green_high:.2f}，止损{stop_loss:.2f}",
+                        'reason': f"5分钟绿柱堆阳柱+60分钟底背离，入场价{entry_price:.2f}，止损{stop_loss:.2f} {stop_loss_reason}",
                         'time': current_5m_time
                     }
 
@@ -825,8 +800,62 @@ class KlineAggregator:
                     if current_close <= current_open:
                         continue
 
-                    # 入场：价格突破绿柱堆最高点
-                    green_high = max(data_5m_with_macd[i][2] for i in range(green_start, idx_5m + 1))
+                    # 入场：使用当前K线开盘价作为入场价
+                    entry_price = current_open
+
+                    # ========== 止损计算 ==========
+                    # 如果当前ATR处于70分位以下，使用60分钟前一个绿柱堆最低价
+                    # 否则使用5分钟前前绿柱堆低点
+                    use_60m_stop = False
+                    atr_percentile = 0.0
+                    stop_loss_reason = ""
+
+                    # 检查ATR百分位 (ATR在第7列，索引6)
+                    if len(data_5m_with_atr) > idx_5m and len(data_5m_with_atr[idx_5m]) > 6:
+                        current_atr = data_5m_with_atr[idx_5m][6]
+                        if current_atr > 0:
+                            # 计算ATR百分位
+                            lookback = min(200, idx_5m)
+                            atr_values = [data_5m_with_atr[i][6] for i in range(max(0, idx_5m - lookback), idx_5m + 1)
+                                        if len(data_5m_with_atr[i]) > 6 and data_5m_with_atr[i][6] > 0]
+                            if len(atr_values) >= 20:
+                                count_below = sum(1 for v in atr_values if v < current_atr)
+                                atr_percentile = count_below / len(atr_values)
+                                # 如果ATR百分位 < 0.3 (70分位以下)
+                                if atr_percentile < 0.3:
+                                    use_60m_stop = True
+                                    stop_loss_reason = f"(ATR{atr_percentile:.0%}低，使用60分钟绿柱堆)"
+
+                    if use_60m_stop and green_stacks_60m:
+                        # 使用60分钟前一个绿柱堆最低价
+                        available_60m_ids = [sid for sid, info in green_stacks_60m.items()
+                                            if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_60m]
+                        if len(available_60m_ids) >= 2:
+                            available_60m_ids.sort()
+                            prev_60m_green_id = available_60m_ids[-2]
+                            stop_loss = green_stacks_60m[prev_60m_green_id]['low']
+                        elif len(available_60m_ids) >= 1:
+                            available_60m_ids.sort()
+                            stop_loss = green_stacks_60m[available_60m_ids[-1]]['low']
+                        else:
+                            stop_loss = current_green_low
+                    else:
+                        # 使用5分钟前前绿柱堆的低点
+                        available_green_ids = [sid for sid, info in green_stacks_5m.items()
+                                              if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_5m]
+                        if len(available_green_ids) >= 2:
+                            available_green_ids.sort()
+                            prev_prev_green_id = available_green_ids[-2]
+                            stop_loss = green_stacks_5m[prev_prev_green_id]['low']
+                        else:
+                            # 备用：如果没有前前绿柱堆，使用当前绿柱堆低点
+                            stop_loss = current_green_low
+
+                    # ========== 检查止损价是否 >= 入场价 ==========
+                    # 如果止损价 >= 入场价，说明是下降趋势，不应该开仓
+                    if stop_loss >= entry_price:
+                        logger.info(f"[{symbol}] 止损价({stop_loss:.2f}) >= 入场价({entry_price:.2f})，下降趋势不开仓")
+                        continue
 
                     # 检查是否已处理过这个信号时间
                     sig_time_key = f"{sig['created_time']}_{green_start}_red"
@@ -837,10 +866,8 @@ class KlineAggregator:
                     self._processed_signals[symbol] = sig_time_key
 
                     # 入场
-                    stop_loss = green_high - (green_high - current_green_low) * 0.5
-
                     self.positions[symbol] = {
-                        'entry_price': green_high,
+                        'entry_price': entry_price,
                         'stop_loss': stop_loss,
                         'entry_time': current_time
                     }
@@ -848,10 +875,10 @@ class KlineAggregator:
 
                     signal_data = {
                         'signal_type': 'ENTRY_LONG',
-                        'price': green_high,
+                        'price': entry_price,
                         'stop_loss': stop_loss,
                         'position_size': 1,
-                        'reason': f"5分钟绿柱堆阳柱+60分钟红柱堆底抬升，入场价{green_high:.2f}，止损{stop_loss:.2f}",
+                        'reason': f"5分钟绿柱堆阳柱+60分钟红柱堆底抬升，入场价{entry_price:.2f}，止损{stop_loss:.2f} {stop_loss_reason}",
                         'time': current_5m_time
                     }
 
