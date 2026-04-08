@@ -12,7 +12,6 @@
 
 from .macd import MACDCalculator, ATRCalculator
 from .stack import StackIdentifier
-from .logic import Strategy
 from .signal_manager import StrategySignalManager
 from .index_map import IndexMapper
 
