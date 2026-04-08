@@ -55,6 +55,11 @@ def backtest_date_signals(date_str: str = None, db_path: str = None, contracts_p
         symbol = f"{exchange}.{contract['MainContractID']}"
         symbol_info = contract
 
+        # 从配置中读取要屏蔽的产品列表
+        if product_id.lower() in config.EXCLUDED_PRODUCTS:
+            print(f"  跳过 {symbol} (已屏蔽)")
+            continue
+
         # 加载数据
         df_5m_raw = loader.load_kline_fast(symbol, 300, config.MAX_5M_BARS)
         df_60m_raw = loader.load_kline_fast(symbol, 3600, config.MAX_60M_BARS)
@@ -113,12 +118,23 @@ def backtest_date_signals(date_str: str = None, db_path: str = None, contracts_p
                         # 5分钟阳柱确认即可入场
                         cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
                         if cond_5m:
+                            # ========== 检查过滤条件 ==========
+                            # 1. 检查连续一字板
+                            if strategy.check_60m_all_limits(df_60m, idx_60m):
+                                continue
+
+                            # 2. 检查大幅下跌 (使用收盘价计算跌幅)
+                            should_filter, filter_reason = strategy.is_large_60m_drop(df_60m, row_5m[4], df_5m)
+                            if should_filter:
+                                continue
+                            # ====================================
+
                             initial_stop, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m, df_60m, green_stacks_60m)
                             if initial_stop:
                                 day_signals.append({
                                     'time': time_str,
                                     'type': '绿柱堆信号',
-                                    'price': row_5m[4],
+                                    'price': row_5m[4],  # 使用收盘价
                                     'stop_loss': initial_stop,
                                     'reason': f"{diver_reason} + {reason_5m}",
                                     'source': '绿柱堆内 DIF 拐头'
@@ -131,6 +147,11 @@ def backtest_date_signals(date_str: str = None, db_path: str = None, contracts_p
                     # 5分钟阳柱确认即可入场
                     cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
                     if cond_5m:
+                        # ========== 检查过滤条件 ==========
+                        should_filter, filter_reason = strategy.is_large_60m_drop(df_60m, row_5m[4], df_5m)
+                        if should_filter:
+                            break
+                        # ====================================
                         initial_stop, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m, df_60m, green_stacks_60m)
                         if initial_stop:
                             day_signals.append({
@@ -153,6 +174,11 @@ def backtest_date_signals(date_str: str = None, db_path: str = None, contracts_p
                         cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
                         if cond_5m:
                             cond_filter, reason_filter = strategy.check_5m_green_stack_filter(df_5m, i, green_stacks_5m)
+                            # ========== 检查大幅下跌 (使用收盘价) - 无论绿柱堆过滤是否通过都检查 ==========
+                            should_filter, filter_reason = strategy.is_large_60m_drop(df_60m, row_5m[4], df_5m)
+                            if should_filter:
+                                break
+                            # ===============================================
                             if cond_filter:
                                 initial_stop, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m, df_60m, green_stacks_60m)
                                 if initial_stop:
@@ -204,6 +230,10 @@ def main():
         for product_id, contract in contracts.items():
             exchange = contract.get('ExchangeID', '')
             symbol = f"{exchange}.{contract['MainContractID']}"
+            # 跳过屏蔽的产品（使用配置中的排除列表）
+            if product_id.lower() in config.EXCLUDED_PRODUCTS:
+                print(f"  跳过 {symbol} (已屏蔽)")
+                continue
             symbols_to_test.append(symbol)
 
     all_results = []
@@ -329,6 +359,14 @@ def main():
                             signal_source = "绿柱堆内 DIF 拐头"
                         else:
                             signal_source = "红柱堆内 DIF 拐头"
+
+                        # 检查60分钟K线是否连续一字板
+                        if strategy.check_60m_all_limits(df_60m, idx_60m):
+                            if signal in precheck_signals_green:
+                                precheck_signals_green.remove(signal)
+                            if signal in precheck_signals_red:
+                                precheck_signals_red.remove(signal)
+                            continue
 
                         cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
 

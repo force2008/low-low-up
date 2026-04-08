@@ -4,6 +4,7 @@ StrategyLowLowUp: 包含所有 60 分钟和 5 分钟的信号判断逻辑
 """
 
 from typing import Dict, List, Optional, Tuple
+import pandas as pd
 
 
 class StrategyLowLowUp:
@@ -343,13 +344,14 @@ class StrategyLowLowUp:
                 if end_idx >= 0 and end_idx < idx_60m:
                     available_green_ids_60m.append(sid)
 
-            # 60分钟拐头时用前一个绿柱堆，不拐头时用当前绿柱堆
-            if dif_turn_60m and len(available_green_ids_60m) >= 2:
+            # 波动率低时用60分钟绿柱堆低点作为止损
+            # 始终使用前一个绿柱堆（不是前前绿柱堆）
+            if len(available_green_ids_60m) >= 2:
                 available_green_ids_60m.sort()
-                prev_green_id_60m = available_green_ids_60m[-2]  # 前一个绿柱堆
+                prev_green_id_60m = available_green_ids_60m[-1]  # 前一个绿柱堆
             elif len(available_green_ids_60m) >= 1:
                 available_green_ids_60m.sort()
-                prev_green_id_60m = available_green_ids_60m[-1]  # 当前绿柱堆
+                prev_green_id_60m = available_green_ids_60m[-1]  # 只有一个时用它
             else:
                 prev_green_id_60m = None
 
@@ -360,9 +362,10 @@ class StrategyLowLowUp:
                 if stop_loss >= current_close:
                     return None, f"60分钟绿柱堆低点({stop_loss:.2f}) >= 当前价({current_close:.2f})，下降趋势不开仓"
 
-                return stop_loss, f"60分钟{'前' if dif_turn_60m else '当'}绿柱堆 K 线低点({atr_percentile:.2%})，止损:{stop_loss:.2f}"
+                return stop_loss, f"60分钟前绿柱堆 K 线低点({atr_percentile:.2%})，止损:{stop_loss:.2f}"
 
         # 方式2：使用5分钟前前绿柱堆低点作为止损（默认）
+        # 但如果前一个绿柱堆的最低价比前前绿柱堆的最低价更低，则用前一个绿柱堆的最低价
         available_green_ids = []
         for sid, info in green_stacks_5m.items():
             end_idx = info.get('end_idx', -1)
@@ -371,24 +374,42 @@ class StrategyLowLowUp:
 
         if len(available_green_ids) >= 2:
             available_green_ids.sort()
-            prev_prev_green_id = available_green_ids[-2]
+            prev_green_id = available_green_ids[-1]      # 前一个绿柱堆
+            prev_prev_green_id = available_green_ids[-2]  # 前前绿柱堆
 
             if prev_prev_green_id in green_stacks_5m:
-                stop_loss = green_stacks_5m[prev_prev_green_id]['low']
+                prev_prev_low = green_stacks_5m[prev_prev_green_id]['low']
 
-                # 如果前前绿柱堆最低价 >= 当前收盘价，说明当前是下降趋势
+                # 获取前一个绿柱堆的最低价
+                prev_low = green_stacks_5m[prev_green_id]['low']
+
+                # 取较低的那个作为止损价（更保守）
+                stop_loss = min(prev_prev_low, prev_low)
+
+                # 如果止损价 >= 当前收盘价，说明当前是下降趋势
                 # 此时止损价会高于开仓价，刚开仓就会触发止损，不应该开仓
                 if stop_loss >= current_close:
-                    return None, f"5分钟前前绿柱堆低点({stop_loss:.2f}) >= 当前价({current_close:.2f})，下降趋势不开仓"
+                    return None, f"5分钟绿柱堆低点({stop_loss:.2f}) >= 当前价({current_close:.2f})，下降趋势不开仓"
 
-                return stop_loss, f"5分钟前前绿柱堆 K 线低点:{stop_loss:.2f}"
+                # 记录使用的止损来源
+                if stop_loss < prev_prev_low:
+                    stop_reason = f"前一个绿柱堆低点:{stop_loss:.2f} (低于前前:{prev_prev_low:.2f})"
+                else:
+                    stop_reason = f"前前绿柱堆 K 线低点:{stop_loss:.2f}"
+
+                return stop_loss, stop_reason
 
         return None, "绿柱堆数据不足"
 
     def get_mobile_stop(self, df_5m: List[tuple], current_idx: int,
                         green_stacks_5m: Dict[int, dict],
                         green_gaps_5m: Dict[int, dict]) -> Tuple[Optional[float], str]:
-        """获取移动止损：前前绿柱堆的K线低点"""
+        """
+        获取移动止损：前前绿柱堆的K线低点
+
+        优化：如果前一个绿柱堆的最低价比前前绿柱堆的最低价更低，则用前一个绿柱堆的最低价
+        这样可以让价格更顺利地移动起来，避免轻易触发止损
+        """
         available_green_ids = []
         for sid, info in green_stacks_5m.items():
             end_idx = info.get('end_idx', -1)
@@ -397,9 +418,131 @@ class StrategyLowLowUp:
 
         if len(available_green_ids) >= 2:
             available_green_ids.sort()
-            prev_prev_green_id = available_green_ids[-2]
-            if prev_prev_green_id in green_stacks_5m:
-                stop_price = green_stacks_5m[prev_prev_green_id]['low']
-                return stop_price, f"移动止损 (前前绿柱堆 K 线低点:{stop_price:.2f})"
+            prev_green_id = available_green_ids[-1]      # 前一个绿柱堆
+            prev_prev_green_id = available_green_ids[-2]  # 前前绿柱堆
+
+            if prev_prev_green_id in green_stacks_5m and prev_green_id in green_stacks_5m:
+                prev_prev_low = green_stacks_5m[prev_prev_green_id]['low']
+                prev_low = green_stacks_5m[prev_green_id]['low']
+
+                # 取较低的那个作为移动止损价（更保守）
+                stop_price = min(prev_prev_low, prev_low)
+
+                if stop_price < prev_prev_low:
+                    return stop_price, f"移动止损 (前一个绿柱堆低点:{stop_price:.2f} 低于前前:{prev_prev_low:.2f})"
+                else:
+                    return stop_price, f"移动止损 (前前绿柱堆 K 线低点:{stop_price:.2f})"
+
+    # ========== 过滤方法 ==========
+
+    def check_60m_all_limits(self, df_60m: list, idx_60m: int) -> bool:
+        """检查60分钟K线是否都是一字板（涨跌停）
+
+        Args:
+            df_60m: 60分钟K线数据
+            idx_60m: 当前60分钟索引
+
+        Returns:
+            True 表示都是一字板（应该过滤信号），False 表示正常
+        """
+        if idx_60m < 1:
+            return False
+
+        def is_limit_kline(kline):
+            # 如果开高低收都相同，说明价格没有波动，可能是涨跌停
+            open_price = kline[1]
+            close_price = kline[4]
+            high_price = kline[2]
+            low_price = kline[3]
+            return (abs(open_price - close_price) < 0.01 and
+                    abs(open_price - high_price) < 0.01 and
+                    abs(open_price - low_price) < 0.01)
+
+        current_kline = df_60m[idx_60m]
+        prev_kline = df_60m[idx_60m - 1]
+
+        current_is_limit = is_limit_kline(current_kline)
+        prev_is_limit = is_limit_kline(prev_kline)
+
+        if current_is_limit and prev_is_limit:
+            return True
+
+        return False
+
+    def is_large_60m_drop(self, df_60m: list, current_price: float, data_5m: list = None, lookback: int = 40) -> Tuple[bool, str]:
+        """判断当前60分钟跌幅是否较大（超过过去40根K线跌幅的80分位值）
+
+        Args:
+            df_60m: 60分钟K线数据（带MACD）
+            current_price: 当前价格（5分钟开盘价）
+            data_5m: 5分钟K线数据（用于获取60分钟周期的开盘价）
+            lookback: 回看K线数量
+
+        Returns:
+            (是否过滤, 原因)
+
+        说明：
+            只用跌幅数据（负数）来计算80分位值
+            如果当前跌幅比80分位值更负，说明跌幅较大
+        """
+        try:
+            if len(df_60m) < lookback or current_price <= 0:
+                return False, ""
+
+            # 计算过去每根K线相对于前一根K线的跌幅
+            drops = []
+            for i in range(1, min(lookback + 1, len(df_60m))):
+                prev_close = df_60m[i - 1][4]
+                curr_close = df_60m[i][4]
+                if prev_close > 0:
+                    drop = (curr_close - prev_close) / prev_close
+                    drops.append(drop)
+
+            if len(drops) < 20:
+                return False, ""
+
+            # 只保留跌幅（负数），去掉涨幅（正数）
+            drops_negative = [d for d in drops if d < 0]
+            if len(drops_negative) < 10:
+                return False, "跌幅数据不足"
+
+            # 计算跌幅的80分位值
+            drops_negative_series = pd.Series(drops_negative)
+            percentile_80 = drops_negative_series.quantile(0.8)
+
+            # 获取当前5分钟所属的60分钟周期的第一个5分钟K线开盘价
+            if data_5m is None or len(data_5m) < 1:
+                return False, ""
+
+            from datetime import datetime
+            current_5m_time_str = data_5m[-1][0][:19]
+            current_dt = datetime.strptime(current_5m_time_str, '%Y-%m-%d %H:%M:%S')
+            period_minute = (current_dt.minute // 60) * 60
+            period_start = current_dt.replace(minute=period_minute, second=0, microsecond=0)
+            period_start_str = period_start.strftime('%Y-%m-%d %H:%M:%S')
+
+            first_5m_in_period = None
+            for row in data_5m:
+                if row[0][:19] == period_start_str:
+                    first_5m_in_period = row
+                    break
+
+            if first_5m_in_period is None:
+                return False, ""
+
+            open_60m = first_5m_in_period[1]
+            if open_60m <= 0:
+                return False, ""
+
+            # 计算从60分钟周期开盘到当前的跌幅
+            current_drop = (current_price - open_60m) / open_60m
+
+            # 如果当前跌幅比80分位值更负（跌得更多），说明跌幅较大
+            if current_drop < percentile_80:
+                return True, f"跌幅过大({current_drop:.2%}) < 80分位值({percentile_80:.2%})"
+
+            return False, ""
+        except Exception as e:
+            return False, f"计算失败: {e}"
 
         return None, "绿柱堆数据不足"

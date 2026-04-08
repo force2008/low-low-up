@@ -348,6 +348,78 @@ class KlineAggregator:
         # 策略名称
         self.strategy_name = Strategy({}).name
 
+        # 近期大幅下跌阈值（跌幅超过此比例时跳过开仓）
+        self.large_drop_threshold = 0.05  # 5%
+
+    def check_60m_all_limits(self, symbol: str, data_60m: list, idx_60m: int) -> bool:
+        """检查60分钟K线是否都是一字板（涨跌停）- 委托给Strategy处理"""
+        strategy = Strategy({})
+        return strategy.check_60m_all_limits(data_60m, idx_60m)
+
+    def is_large_60m_drop(self, symbol: str, data_60m: list, current_price: float, data_5m: list = None, lookback: int = 40) -> bool:
+        """判断当前60分钟跌幅是否较大（超过过去40根K线跌幅的80分位值）- 委托给Strategy处理"""
+        strategy = Strategy({})
+        should_filter, reason = strategy.is_large_60m_drop(data_60m, current_price, data_5m, lookback)
+        if should_filter:
+            logger.info(f"[{symbol}] {reason}")
+        return should_filter
+
+    def check_recent_drop(self, symbol: str, precheck_time: str, current_time: str) -> float:
+        """检查从预检测信号产生到当前时间的跌幅（统计过去20根K线的最大跌幅）
+
+        Args:
+            symbol: 合约代码
+            precheck_time: 预检测信号产生的时间（60分钟K线时间）
+            current_time: 当前时间
+
+        Returns:
+            最大跌幅比例（负值表示涨幅），如果无法计算返回 0
+        """
+        try:
+            # 获取 precheck_time 时刻的 5分钟K线数据（从precheck_time开始到current_time）
+            data_5m = self.db_manager.get_kline_data(symbol, 500, 300, current_time)
+
+            if len(data_5m) < 5:
+                return 0
+
+            # 找到 precheck_time 对应的K线索引
+            start_idx = -1
+            for i, row in enumerate(data_5m):
+                if row[0] >= precheck_time:
+                    start_idx = i
+                    break
+
+            if start_idx < 0:
+                start_idx = 0
+
+            # 从 precheck_time 开始，统计后面20根K线的最大跌幅
+            window_size = 20
+            if len(data_5m) - start_idx < window_size:
+                window_size = len(data_5m) - start_idx
+
+            if window_size < 5:
+                return 0
+
+            # 获取 precheck_time 时的收盘价作为基准
+            start_price = data_5m[start_idx][4]
+
+            if start_price <= 0:
+                return 0
+
+            # 计算从 precheck_time 到现在，每一根K线相对于 start_price 的跌幅
+            # 取最大跌幅（最负的值）
+            max_drop = 0
+            for i in range(start_idx, start_idx + window_size):
+                kline_close = data_5m[i][4]
+                drop = (kline_close - start_price) / start_price
+                if drop < max_drop:
+                    max_drop = drop
+
+            return max_drop
+        except Exception as e:
+            logger.warning(f"[{symbol}] 计算近期跌幅失败：{e}")
+            return 0
+
         print_log(f"策略引擎已启用（每次从数据库读取模式）")
         print_log(f"  数据库路径：{self.db_path}")
         print_log(f"  监控合约数：{len(self.instrument_map)}")
@@ -488,6 +560,11 @@ class KlineAggregator:
 
             hist_60m = data_60m_with_macd[idx_60m][8]
             hist_60m_prev = data_60m_with_macd[idx_60m - 1][8] if idx_60m > 0 else 0
+
+            # ========== 检查连续一字板K线（涨跌停）==========
+            # 如果当前K线和前一根K线都是一字板，跳过预检测信号
+            if self.check_60m_all_limits(symbol, data_60m_with_macd, idx_60m):
+                return
 
             strategy = Strategy({})
 
@@ -671,28 +748,28 @@ class KlineAggregator:
 
                     # 入场条件：5分钟阳柱（收盘价 > 开盘价）
                     current_open = data_5m_with_macd[idx_5m][1]
-                    current_close = data_5m_with_macd[idx_5m][4]
-                    if current_close <= current_open:
+                    current_price = data_5m_with_macd[idx_5m][4]
+                    if current_price <= current_open:
                         continue
 
                     # 入场价格：突破绿柱堆最高点（绿柱堆内DIF拐头）或当前价格（绿柱堆转红柱堆）
                     if sub_type == 'green_to_red':
                         # 绿柱堆转红柱堆：使用当前价格作为入场价
-                        entry_price = current_close
+                        entry_price = current_price
                         # 获取当前绿柱堆的最低价用于计算止损
                         _, green_stacks_60m_temp, _ = StackIdentifier.identify(data_60m_with_macd)
                         if green_stacks_60m_temp:
                             last_green = max(green_stacks_60m_temp.keys())
-                            current_green_low = green_stacks_60m_temp[last_green].get('lowest_low', current_close - 50)
+                            current_green_low = green_stacks_60m_temp[last_green].get('lowest_low', current_price - 50)
                         else:
-                            current_green_low = current_close - 50
+                            current_green_low = current_price - 50
                     else:
                         # 绿柱堆内DIF拐头：使用当前K线开盘价作为入场价
                         entry_price = current_open
 
                     # ========== 止损计算 ==========
                     # 如果当前ATR处于70分位以下，使用60分钟前一个绿柱堆最低价
-                    # 否则使用5分钟前前绿柱堆低点
+                    # 否则使用5分钟绿柱堆低点（取前一个和前前中较低的）
                     use_60m_stop = False
                     atr_percentile = 0.0
                     stop_loss_reason = ""
@@ -714,28 +791,32 @@ class KlineAggregator:
                                     stop_loss_reason = f"(ATR{atr_percentile:.0%}低，使用60分钟绿柱堆)"
 
                     if use_60m_stop and green_stacks_60m:
-                        # 使用60分钟前一个绿柱堆最低价
+                        # 波动率低时使用60分钟前一个绿柱堆最低价（不是前前绿柱堆）
                         available_60m_ids = [sid for sid, info in green_stacks_60m.items()
                                             if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_60m]
-                        if len(available_60m_ids) >= 2:
+                        if len(available_60m_ids) >= 1:
                             available_60m_ids.sort()
-                            prev_60m_green_id = available_60m_ids[-2]
+                            prev_60m_green_id = available_60m_ids[-1]  # 前一个绿柱堆
                             stop_loss = green_stacks_60m[prev_60m_green_id]['low']
-                        elif len(available_60m_ids) >= 1:
-                            available_60m_ids.sort()
-                            stop_loss = green_stacks_60m[available_60m_ids[-1]]['low']
                         else:
                             stop_loss = current_green_low
                     else:
-                        # 使用5分钟前前绿柱堆的低点
+                        # 使用5分钟前一个绿柱堆的低点（不是前前绿柱堆）
+                        # 如果前一个绿柱堆的最低价比前前绿柱堆更低，则用前一个
                         available_green_ids = [sid for sid, info in green_stacks_5m.items()
                                               if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_5m]
                         if len(available_green_ids) >= 2:
                             available_green_ids.sort()
-                            prev_prev_green_id = available_green_ids[-2]
-                            stop_loss = green_stacks_5m[prev_prev_green_id]['low']
+                            prev_green_id = available_green_ids[-1]      # 前一个绿柱堆
+                            prev_prev_green_id = available_green_ids[-2]  # 前前绿柱堆
+                            prev_low = green_stacks_5m[prev_green_id]['low']
+                            prev_prev_low = green_stacks_5m[prev_prev_green_id]['low']
+                            stop_loss = min(prev_low, prev_prev_low)  # 取较低的
+                        elif len(available_green_ids) >= 1:
+                            available_green_ids.sort()
+                            stop_loss = green_stacks_5m[available_green_ids[-1]]['low']
                         else:
-                            # 备用：如果没有前前绿柱堆，使用当前绿柱堆低点
+                            # 备用：如果没有绿柱堆，使用当前绿柱堆低点
                             stop_loss = current_green_low
 
                     # ========== 检查止损价是否 >= 入场价 ==========
@@ -803,16 +884,23 @@ class KlineAggregator:
 
                     # 入场条件：5分钟阳柱（收盘价 > 开盘价）
                     current_open = data_5m_with_macd[idx_5m][1]
-                    current_close = data_5m_with_macd[idx_5m][4]
-                    if current_close <= current_open:
+                    current_price = data_5m_with_macd[idx_5m][4]
+                    if current_price <= current_open:
                         continue
+                        logger.info(f"[{symbol}] 近期跌幅超过80分位值，跳过开仓，清空预检测信号")
+                        # 清空该品种的所有预检测信号
+                        if symbol in self.precheck_signals_green:
+                            self.precheck_signals_green[symbol] = []
+                        if symbol in self.precheck_signals_red:
+                            self.precheck_signals_red[symbol] = []
+                        return
 
                     # 入场：使用当前K线开盘价作为入场价
                     entry_price = current_open
 
                     # ========== 止损计算 ==========
                     # 如果当前ATR处于70分位以下，使用60分钟前一个绿柱堆最低价
-                    # 否则使用5分钟前前绿柱堆低点
+                    # 否则使用5分钟绿柱堆低点（取前一个和前前中较低的）
                     use_60m_stop = False
                     atr_percentile = 0.0
                     stop_loss_reason = ""
@@ -834,28 +922,32 @@ class KlineAggregator:
                                     stop_loss_reason = f"(ATR{atr_percentile:.0%}低，使用60分钟绿柱堆)"
 
                     if use_60m_stop and green_stacks_60m:
-                        # 使用60分钟前一个绿柱堆最低价
+                        # 波动率低时使用60分钟前一个绿柱堆最低价（不是前前绿柱堆）
                         available_60m_ids = [sid for sid, info in green_stacks_60m.items()
                                             if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_60m]
-                        if len(available_60m_ids) >= 2:
+                        if len(available_60m_ids) >= 1:
                             available_60m_ids.sort()
-                            prev_60m_green_id = available_60m_ids[-2]
+                            prev_60m_green_id = available_60m_ids[-1]  # 前一个绿柱堆
                             stop_loss = green_stacks_60m[prev_60m_green_id]['low']
-                        elif len(available_60m_ids) >= 1:
-                            available_60m_ids.sort()
-                            stop_loss = green_stacks_60m[available_60m_ids[-1]]['low']
                         else:
                             stop_loss = current_green_low
                     else:
-                        # 使用5分钟前前绿柱堆的低点
+                        # 使用5分钟前一个绿柱堆的低点（不是前前绿柱堆）
+                        # 如果前一个绿柱堆的最低价比前前绿柱堆更低，则用前一个
                         available_green_ids = [sid for sid, info in green_stacks_5m.items()
                                               if info.get('end_idx', -1) >= 0 and info['end_idx'] < idx_5m]
                         if len(available_green_ids) >= 2:
                             available_green_ids.sort()
-                            prev_prev_green_id = available_green_ids[-2]
-                            stop_loss = green_stacks_5m[prev_prev_green_id]['low']
+                            prev_green_id = available_green_ids[-1]      # 前一个绿柱堆
+                            prev_prev_green_id = available_green_ids[-2]  # 前前绿柱堆
+                            prev_low = green_stacks_5m[prev_green_id]['low']
+                            prev_prev_low = green_stacks_5m[prev_prev_green_id]['low']
+                            stop_loss = min(prev_low, prev_prev_low)  # 取较低的
+                        elif len(available_green_ids) >= 1:
+                            available_green_ids.sort()
+                            stop_loss = green_stacks_5m[available_green_ids[-1]]['low']
                         else:
-                            # 备用：如果没有前前绿柱堆，使用当前绿柱堆低点
+                            # 备用：如果没有绿柱堆，使用当前绿柱堆低点
                             stop_loss = current_green_low
 
                     # ========== 检查止损价是否 >= 入场价 ==========
@@ -1052,7 +1144,13 @@ def load_instruments_from_json(json_file):
         return []
 
 
-EXCLUDED_PRODUCTS = ["FB", "BB", "RS", "wr", "rr"]
+# 从配置中导入排除的产品列表
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.strategy_config import Config
+
+# 使用配置中的排除列表
+EXCLUDED_PRODUCTS = [p.upper() for p in Config.EXCLUDED_PRODUCTS]
 
 
 def is_excluded_product(instrument_id: str) -> bool:

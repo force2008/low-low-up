@@ -31,6 +31,9 @@ class Config:
     TARGET_NOTIONAL = 200000  # 20 万货值
     COOLDOWN_HOURS = 4  # 冷却期 4 小时
 
+    # 屏蔽胜率过低的品种（回测和实盘都不交易）- 按产品ID屏蔽
+    EXCLUDED_PRODUCTS = ['rr', 'wr', 'pk']
+
 
 # ============== 数据加载 ==============
 
