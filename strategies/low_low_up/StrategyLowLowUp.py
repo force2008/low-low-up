@@ -546,3 +546,190 @@ class StrategyLowLowUp:
             return False, f"计算失败: {e}"
 
         return None, "绿柱堆数据不足"
+
+    # ========== 统一信号检查方法 ==========
+
+    def check_60m_precheck(self, df_60m: List[tuple], idx_60m: int,
+                          green_stacks_60m: Dict[int, dict]) -> Tuple[Optional[dict], str]:
+        """
+        检查60分钟是否产生预检测信号
+
+        Args:
+            df_60m: 60分钟K线数据（带MACD）
+            idx_60m: 当前60分钟索引
+            green_stacks_60m: 60分钟绿柱堆信息
+
+        Returns:
+            (预检测信号dict, 原因) 或 (None, 原因)
+            信号dict: {'type': 'green'/'red', 'sub_type': 'dif_turn'/'green_to_red', 'created_time': ...}
+        """
+        if idx_60m < 4 or len(df_60m) < 5:
+            return None, "60分钟数据不足"
+
+        # 检查连续一字板
+        if self.check_60m_all_limits(df_60m, idx_60m):
+            return None, "连续一字板，跳过"
+
+        hist_60m = df_60m[idx_60m][8]
+        hist_60m_prev = df_60m[idx_60m - 1][8] if idx_60m > 0 else 0
+        current_60m_time = df_60m[idx_60m][0]
+
+        # 绿柱堆内 DIF 拐头 + 底背离
+        if hist_60m < 0:
+            dif_turn, _ = self.check_60m_dif_turn_in_green(df_60m, idx_60m, green_stacks_60m)
+            if dif_turn:
+                diver_ok, diver_reason, _, _ = self.check_60m_divergence(df_60m, idx_60m)
+                if diver_ok:
+                    return {
+                        'type': 'green',
+                        'sub_type': 'dif_turn',
+                        'created_time': current_60m_time,
+                    }, f"60分钟绿柱堆内DIF拐头+底背离"
+
+        # 绿柱堆转红柱堆 + 底背离
+        elif hist_60m > 0 and hist_60m_prev < 0:
+            diver_ok, diver_reason, _, _ = self.check_60m_divergence(df_60m, idx_60m)
+            if diver_ok:
+                return {
+                    'type': 'green',
+                    'sub_type': 'green_to_red',
+                    'created_time': current_60m_time,
+                }, f"60分钟绿柱堆转红柱堆+底背离"
+
+        # 红柱堆内 DIF 拐头 + 底部抬升
+        elif hist_60m > 0:
+            dif_turn_red, _ = self.check_60m_dif_turn_in_red(df_60m, idx_60m)
+            if dif_turn_red:
+                diver_ok, diver_reason, curr_low, prev_low = self.check_60m_bottom_rise_in_red(df_60m, idx_60m)
+                if diver_ok:
+                    return {
+                        'type': 'red',
+                        'sub_type': 'dif_turn',
+                        'created_time': current_60m_time,
+                    }, f"60分钟红柱堆内DIF拐头+底部抬升"
+
+        return None, "未满足60分钟预检测条件"
+
+    def check_5m_entry_signal(self, df_5m: List[tuple], idx_5m: int,
+                             df_60m: List[tuple], idx_60m: int,
+                             green_stacks_5m: Dict[int, dict],
+                             green_stacks_60m: Dict[int, dict],
+                             precheck_signals: List[dict],
+                             position_info: dict = None,
+                             last_entry_time: str = None,
+                             cooldown_hours: int = 4) -> Tuple[Optional[dict], Optional[float], str]:
+        """
+        检查5分钟是否满足入场信号
+
+        Args:
+            df_5m: 5分钟K线数据（带MACD）
+            idx_5m: 当前5分钟索引
+            df_60m: 60分钟K线数据（带MACD）
+            idx_60m: 当前60分钟索引
+            green_stacks_5m: 5分钟绿柱堆信息
+            green_stacks_60m: 60分钟绿柱堆信息
+            precheck_signals: 有效的预检测信号列表
+            position_info: 当前持仓信息（如果有）
+            last_entry_time: 上次入场时间
+            cooldown_hours: 冷却时间（小时）
+
+        Returns:
+            (入场信号dict, 止损价, 原因) 或 (None, None, 原因)
+            入场信号: {'entry_price': float, 'entry_time': str, 'stop_loss': float, 'reason': str}
+        """
+        from datetime import datetime, timedelta
+
+        current_time = df_5m[idx_5m][0][:19]
+        current_dt = datetime.strptime(current_time, '%Y-%m-%d %H:%M:%S.%f') if '.' in current_time else datetime.strptime(current_time, '%Y-%m-%d %H:%M:%S')
+
+        # 检查冷却时间
+        if position_info is None and last_entry_time:
+            try:
+                entry_dt = datetime.strptime(last_entry_time[:19], '%Y-%m-%d %H:%M:%S')
+                hours_passed = (current_dt - entry_dt).total_seconds() / 3600
+                if hours_passed < cooldown_hours:
+                    return None, None, f"冷却期内({hours_passed:.1f}小时)"
+            except:
+                pass
+
+        # 过滤过期预检测信号（超过8小时）
+        valid_precheck = []
+        for sig in precheck_signals:
+            try:
+                sig_time = datetime.strptime(sig['created_time'][:19], '%Y-%m-%d %H:%M:%S')
+                hours_old = (current_dt - sig_time).total_seconds() / 3600
+                if hours_old < 8:
+                    valid_precheck.append(sig)
+            except:
+                pass
+
+        if not valid_precheck:
+            return None, None, "无有效预检测信号"
+
+        current_price = df_5m[idx_5m][4]  # 收盘价
+        current_open = df_5m[idx_5m][1]
+        current_low = df_5m[idx_5m][3]
+
+        # 检查入场条件：阳柱（收盘价 > 开盘价）
+        if current_price <= current_open:
+            return None, None, "5分钟非阳柱"
+
+        # 遍历有效预检测信号
+        for sig in valid_precheck:
+            sig_type = sig.get('type', 'unknown')
+            sub_type = sig.get('sub_type', 'dif_turn')
+
+            # 绿柱堆信号：检查底背离
+            if sig_type == 'green':
+                diver_ok, diver_reason, current_green_low, _ = self.check_60m_divergence(df_60m, idx_60m)
+                if not diver_ok:
+                    continue
+
+                # 绿柱堆内DIF拐头：需要检查当前5分钟是否在绿柱堆中
+                if sub_type == 'dif_turn':
+                    in_green = False
+                    for stack_id, stack in green_stacks_5m.items():
+                        if stack['start_idx'] <= idx_5m <= stack['end_idx']:
+                            in_green = True
+                            break
+                    if not in_green:
+                        continue
+                # 绿柱堆转红柱堆：不需要检查绿柱堆限制
+
+            # 红柱堆信号：检查底部抬升
+            elif sig_type == 'red':
+                diver_ok, diver_reason, _, _ = self.check_60m_bottom_rise_in_red(df_60m, idx_60m)
+                if not diver_ok:
+                    continue
+
+            # 计算止损价
+            stop_loss, stop_reason = self.get_initial_stop_loss(
+                df_5m, idx_5m,
+                green_stacks_5m, {},
+                df_60m, green_stacks_60m
+            )
+
+            if stop_loss is None:
+                continue
+
+            # 检查止损价是否 >= 入场价
+            if stop_loss >= current_price:
+                continue
+
+            # 计算入场价（突破绿柱堆高点或当前价）
+            if sig_type == 'green' and sub_type == 'dif_turn':
+                # 获取当前绿柱堆的高点作为突破价
+                entry_price = current_price  # 简化：直接用当前价
+            else:
+                entry_price = current_price
+
+            entry_signal = {
+                'entry_price': entry_price,
+                'entry_time': current_time,
+                'stop_loss': stop_loss,
+                'reason': f"{diver_reason} + 5分钟阳柱确认"
+            }
+
+            return entry_signal, stop_loss, f"入场信号: {entry_signal['reason']}"
+
+        return None, None, "未满足5分钟入场条件"

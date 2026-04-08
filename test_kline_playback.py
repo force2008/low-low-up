@@ -10,7 +10,7 @@ K线时间回放测试 - 模拟 KlineCollector_v2 的 save_kline 信号检测逻
 │   check_strategy_signal_v2(symbol)   │   check_strategy_signal_v2(symbol)  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ duration=3600 时:                   │ 60分钟K线时间点(分钟=0)时:           │
-│   check_60m_signal_v2(              │   check_60m_signal_v2(              │
+│   check_60m_precheck(              │   check_60m_precheck(              │
 │       symbol,                        │       symbol,                       │
 │       end_time=date_time_str)         │       end_time=prev_60m_time)         │
 │   (使用当前K线时间作为截止时间)         │   (使用前一小时作为截止时间)           │
@@ -69,7 +69,7 @@ def load_60m_upto(db_path: str, symbol: str, end_time: str, limit: int = 500):
     """
     加载指定截止时间之前的60分钟K线数据（用于回放时验证数据）
 
-    注意：回放时不调用此函数，check_60m_signal_v2 直接从数据库读取
+    注意：回放时不调用此函数，check_60m_precheck 直接从数据库读取
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -111,7 +111,7 @@ def get_previous_60m_time(bar_time: str) -> str:
 
     对应 save_kline 中：
     - 当 duration=3600 时，date_time_str 是当前完成的60m时间
-    - 但 check_60m_signal_v2 需要的是"前一小时"的数据
+    - 但 check_60m_precheck 需要的是"前一小时"的数据
     """
     dt = datetime.strptime(bar_time[:19], '%Y-%m-%d %H:%M:%S')
     prev = dt - timedelta(hours=1)
@@ -130,7 +130,7 @@ def test_playback(symbol: str, playback_time: str):
     │ if duration == 300:                                                   │
     │     check_strategy_signal_v2(symbol)  # 每5分钟检查一次5分钟信号      │
     │ else:  # duration == 3600                                            │
-    │     check_60m_signal_v2(symbol, end_time=date_time_str)  # 每小时检查│
+    │     check_60m_precheck(symbol, end_time=date_time_str)  # 每小时检查│
     └─────────────────────────────────────────────────────────────────────────┘
     """
     db_path = './data/db/kline_data.db'
@@ -261,7 +261,7 @@ def test_playback(symbol: str, playback_time: str):
 
             # 调用60分钟信号检查，传入当前整点时间作为截止时间
             # 这样可以计算包含当前整点60m K线在内的 MACD 指标
-            aggregator.check_60m_signal_v2(symbol, end_time=current_60m_time_full)
+            aggregator.check_60m_precheck(symbol, end_time=current_60m_time_full)
             precheck = aggregator.precheck_signals_green.get(symbol, [])
             print(f"  预检测信号: {len(precheck)} 个")
 
