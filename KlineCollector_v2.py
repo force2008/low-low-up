@@ -24,10 +24,13 @@ from config.trading_time_config import (
 from utils.feishu_notifier import FeishuNotifier, send_feishu_strategy_signal, send_feishu_test
 
 # 从拆分后的模块导入（公共类）
-from strategy import MACDCalculator, ATRCalculator, StackIdentifier, Strategy
+from strategy import MACDCalculator, ATRCalculator, StackIdentifier
 from strategy.signal_manager import StrategySignalManager
 from strategy.index_map import IndexMapper
 from database import DatabaseManager
+
+# 导入低-low-up 策略
+from strategies.low_low_up.StrategyLowLowUp import StrategyLowLowUp as Strategy
 
 
 # 配置日志
@@ -341,6 +344,9 @@ class KlineAggregator:
 
         # 60分钟索引映射（5m索引 -> 60m索引）
         self.index_map_60m = {}  # {symbol: [idx_60m, ...]}
+
+        # 策略名称
+        self.strategy_name = Strategy({}).name
 
         print_log(f"策略引擎已启用（每次从数据库读取模式）")
         print_log(f"  数据库路径：{self.db_path}")
@@ -759,6 +765,7 @@ class KlineAggregator:
                         'price': entry_price,
                         'stop_loss': stop_loss,
                         'position_size': 1,
+                        'strategy_name': strategy.name,
                         'reason': f"5分钟绿柱堆阳柱+60分钟底背离，入场价{entry_price:.2f}，止损{stop_loss:.2f} {stop_loss_reason}",
                         'time': current_5m_time
                     }
@@ -913,6 +920,7 @@ class KlineAggregator:
                     'price': stop_loss,
                     'stop_loss': stop_loss,
                     'position_size': 0,
+                    'strategy_name': self.strategy_name,
                     'reason': f"5分钟价格跌破止损价{stop_loss:.2f}，触发止损",
                     'time': current_time
                 }

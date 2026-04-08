@@ -48,6 +48,13 @@ openctp-ctp2tts/
 ## 快速开始
 
 ### 安装依赖
+- python用conda的安装一个3.10的版本，做到该python环境和其他的独立使用
+- openctp-ctp
+openctp-ctp是上期所的定义发布的接口协议，不同的期货公司有不同的ctp版本，所以要和期货公司的交易接口连上需要找到对应版本的库文件，这个工程用到的线上的是6.7.2的融航柜台的接口，里面的config里有融航可真实交易的账号和信息，现在暂不进行程序化交易，只把信号输出到飞书的通知里，待回测和优化成熟后，可接入自动化交易。工程里在libs下有对应的库文件，当安装完openctp-ctp-channels并切换完渠道后，可把libs文件放到 openctp-ctp-channels的lib目录这样就可以完成与融航柜台的联通了。
+这个是库文件所以目录，安装完openctp-ctp后lib文件要替换成libs目录下的两个文件，如果文件名不同，要把文件名改动openctp_ctp.libs的相同的文件名
+/home/ubuntu/miniconda3/envs/python310/lib/python3.10/site-packages/openctp_ctp.libs
+
+
 
 ```bash
 pip install openctp-ctp==6.7.2.*
@@ -58,18 +65,21 @@ pip install numpy pandas matplotlib
 ### 常用命令
 
 ```bash
-# 切换到TTS通道
+- 切换到TTS通道
 openctp-channels switch tts
 
-# 运行K线采集
+- 运行K线采集
 python KlineCollector.py online
 
-回测信号
+- 回测信号
 python .\backtest\strategy_backtest.py
 
-所有的合约，昨天的信号回测
+- 回放命令，把04-07的k线进行一条一条的检查是否满足信号，并推送到飞书消息
+python test_kline_playback.py --date 2026-04-07
 
-python simulate_signal_check_v2.py --all --days 1
+
+# 代码规范
+- 共用的代码在strateg里
 ```
 
 ## 文档
