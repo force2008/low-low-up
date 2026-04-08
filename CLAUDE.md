@@ -47,6 +47,7 @@ openctp-ctp2tts/
 
 ## 快速开始
 
+
 ### 安装依赖
 - python用conda的安装一个3.10的版本，做到该python环境和其他的独立使用
 - openctp-ctp
@@ -62,6 +63,13 @@ pip install openctp-ctp-channels
 pip install numpy pandas matplotlib
 ```
 
+### 数据获取
+从tqsdk导数据到data/db/kline_data.db
+python utils/ImportKlineToSqlite.py --source tqsdk
+
+### 更新主力合约
+该功能还不够键全，主力合约需要从交易所拿到所有合约数据，再从合约里找出成交量最大的合约才能找到主力合约，现在单单下面的功能，可能还不行
+python utils/GetMainContractWithVolume.py
 ### 常用命令
 
 ```bash
