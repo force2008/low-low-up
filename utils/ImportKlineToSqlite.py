@@ -71,8 +71,8 @@ PERIOD_CONFIG = {
 TQSDK_DATA_LENGTH = {
     "5": 5000,     # 5 分钟 - 5000 条
     "30": 1000,    # 30 分钟 - 1000 条
-    "60": 500,     # 60 分钟 - 500 条
-    "day": 100     # 1 天 - 100 条
+    "60": 1000,     # 60 分钟 - 500 条
+    "day": 200     # 1 天 - 100 条
 }
 
 # tqsdk 周期转换为秒
@@ -636,7 +636,7 @@ def import_all_periods(contracts, source, source_name, db_manager, use_sleep=Tru
 if __name__ == '__main__':
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='K 线数据导入程序')
-    parser.add_argument('--source', type=str, default='akshare', choices=['akshare', 'tqsdk'],
+    parser.add_argument('--source', type=str, default='tqsdk', choices=['akshare', 'tqsdk'],
                         help='数据源类型 (akshare 或 tqsdk)')
 
     args = parser.parse_args()
