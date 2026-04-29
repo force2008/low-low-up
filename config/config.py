@@ -38,9 +38,10 @@ envs = {
     # 仿真
     "simu": {
         "td": "tcp://trading.openctp.cn:30002",
-        "md": "",
-        "user_id": "",
-        "password": "",
+        "md": "tcp://101.226.249.90:33213",
+        #"user_id": "17872",
+        "user_id":"17882",
+        "password": "123456",
         "broker_id": "9999",
         "authcode": "",
         "appid": "",

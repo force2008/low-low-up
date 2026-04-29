@@ -48,3 +48,11 @@ kline_data/
 # Temp
 --help
 temp_*
+
+order-check/coordinates.txt
+
+order-check/local_config.py
+order-check/local_config.py
+order-check/export/*
+order-check/logs
+.hold_notify_date
