@@ -2,6 +2,7 @@ import os
 import glob
 import csv
 import json
+import re
 import sys
 import datetime
 
@@ -20,6 +21,60 @@ PREFIX = f"{ACCOUNT} 所有委托"
 FEISHU_WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/6afaaa96-9685-4de8-8136-4de3b7eb4b42"
 # 示例: FEISHU_WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
 # ==================================================
+
+# 已见过的报单编号持久化文件（防止 CSV 被清理后重复识别同一笔委托）
+# 格式: {trading_day: [id1, id2, ...]}，按交易日隔离，避免跨天 OrderSysID 复用导致漏单
+_SEEN_IDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.seen_order_ids.json')
+_SEEN_IDS_MAX_SIZE_PER_DAY = 2000
+_SEEN_IDS_RETENTION_DAYS = 7
+
+
+def _extract_trading_day_from_filename(filename):
+    """从 CSV 文件名提取交易日，如 'jm0310 所有委托 2026-5-8 11-22-49.csv' -> '2026-05-08'"""
+    m = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', os.path.basename(filename))
+    if m:
+        year, month, day = m.group(1), int(m.group(2)), int(m.group(3))
+        return f"{year}-{month:02d}-{day:02d}"
+    return datetime.date.today().isoformat()
+
+
+def _load_seen_ids():
+    """加载已见过的报单编号，按交易日分组返回 dict
+    兼容旧格式（纯 list）自动迁移
+    """
+    if os.path.exists(_SEEN_IDS_FILE):
+        try:
+            with open(_SEEN_IDS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+                if isinstance(data, list):
+                    # 旧格式迁移：按当前日期归入 dict
+                    return {datetime.date.today().isoformat(): data}
+        except Exception:
+            pass
+    return {}
+
+
+def _save_seen_ids(seen_data):
+    """保存已见过的报单编号，限制单天大小并清理过期数据"""
+    if not isinstance(seen_data, dict):
+        seen_data = {datetime.date.today().isoformat(): seen_data if isinstance(seen_data, list) else []}
+
+    # 清理超过保留天数的旧数据
+    cutoff = (datetime.date.today() - datetime.timedelta(days=_SEEN_IDS_RETENTION_DAYS)).isoformat()
+    seen_data = {k: v for k, v in seen_data.items() if k >= cutoff}
+
+    # 限制单天大小
+    for day, ids in seen_data.items():
+        if len(ids) > _SEEN_IDS_MAX_SIZE_PER_DAY:
+            seen_data[day] = ids[-_SEEN_IDS_MAX_SIZE_PER_DAY:]
+
+    try:
+        with open(_SEEN_IDS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(seen_data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[警告] 保存 seen_ids 失败: {e}")
 
 
 def find_latest_two_files():
@@ -195,6 +250,31 @@ def generate_hold_std():
         print("持仓文件读取失败")
         return False
 
+    # 过滤掉表头行、合计行和无效记录（防止CSV中包含多余表头或统计行）
+    _INVALID_CONTRACT_NAMES = {
+        "合约ID", "合约名", "合约代码", "合约名称",
+        "合计", "总计", "汇总", "小计",
+        "Total", "TOTAL", "total", "Summary", "SUMMARY", "summary",
+    }
+
+    def _is_valid_hold_row(r):
+        contract = str(r.get("合约ID") or r.get("合约") or "").strip()
+        if not contract or contract in _INVALID_CONTRACT_NAMES:
+            return False
+        vol = r.get("持仓量") or r.get("手数") or "0"
+        try:
+            if float(str(vol).strip()) <= 0:
+                return False
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    original_count = len(rows)
+    rows = [r for r in rows if _is_valid_hold_row(r)]
+    filtered = original_count - len(rows)
+    if filtered:
+        print(f"[过滤] 已剔除 {filtered} 条无效记录（表头/空合约/零持仓）")
+
     hold_std_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
     with open(hold_std_path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
@@ -238,9 +318,30 @@ def main():
     latest_rows.sort(key=lambda r: _time_sort_key(r, time_key))
     prev_rows.sort(key=lambda r: _time_sort_key(r, time_key))
 
-    # 找出新增记录：以报单编号为键，最新文件里有但旧文件里没有的
+    # 从最新文件名提取交易日，按交易日隔离 seen_ids（防止跨天 OrderSysID 复用）
+    trading_day = _extract_trading_day_from_filename(latest_file)
+    print(f"交易日: {trading_day}")
+
+    # 加载已见过的报单编号（按交易日分组）
+    seen_data = _load_seen_ids()
+    seen_ids = seen_data.get(trading_day, [])
+    seen_set = set(seen_ids)
+
+    # 找出新增记录：以报单编号为键，最新文件里有但旧文件里没有且没见过的新委托
     prev_ids = {row.get(id_key) for row in prev_rows}
-    new_rows = [row for row in latest_rows if row.get(id_key) not in prev_ids]
+    new_rows = [row for row in latest_rows if row.get(id_key) not in prev_ids and row.get(id_key) not in seen_set]
+
+    # 更新已见过列表：把最新文件里的所有报单编号都记入当天
+    updated = False
+    for row in latest_rows:
+        oid = row.get(id_key)
+        if oid and oid not in seen_set:
+            seen_ids.append(oid)
+            seen_set.add(oid)
+            updated = True
+    if updated:
+        seen_data[trading_day] = seen_ids
+        _save_seen_ids(seen_data)
 
     if not new_rows:
         print("结果: 委托数据无变化（无新增委托）")

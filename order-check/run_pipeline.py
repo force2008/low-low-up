@@ -168,6 +168,10 @@ def _ensure_mgr(mgr_holder, hold_std_path, main_contracts_path, conf, env_name):
         if mgr_holder[0] is None or not getattr(mgr_holder[0], "is_login", False):
             if mgr_holder[0] is not None:
                 try:
+                    mgr_holder[0].shutdown()
+                except Exception:
+                    pass
+                try:
                     del mgr_holder[0]
                 except Exception:
                     pass
@@ -201,6 +205,10 @@ def _do_sync(
         logger.error("持仓对齐异常: %s", e)
         with _mgr_lock:
             if mgr_holder and mgr_holder[0] is not None:
+                try:
+                    mgr_holder[0].shutdown()
+                except Exception:
+                    pass
                 try:
                     del mgr_holder[0]
                 except Exception:
@@ -528,6 +536,13 @@ def main():
         except Exception as e:
             logger.error("主循环异常: %s", e)
             time.sleep(CHECK_INTERVAL)
+
+    # 退出前清理 PositionSyncManager 实例
+    if _mgr_holder[0] is not None:
+        try:
+            _mgr_holder[0].shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

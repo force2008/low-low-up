@@ -47,6 +47,17 @@ envs = {
         "appid": "",
         "user_product_info": "",
     },
+    "simu-7x24": {
+        "td": "tcp://182.254.243.31:40001",
+        "md": "tcp://182.254.243.31:40011",
+        #"user_id": "17872",
+        "user_id":"17882",
+        "password": "123456",
+        "broker_id": "9999",
+        "authcode": "0000000000000000",
+        "appid": "simnow_client_test",
+        "user_product_info": "",
+    },
     # 仿真vip
     "simu-vip": {
         "td": "tcp://vip.openctp.cn:30003",
