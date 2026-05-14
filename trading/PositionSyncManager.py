@@ -238,6 +238,15 @@ class PositionSyncManager(CTdSpiBase):
         self._processed_signal_data: dict = {}
         self._load_processed_ids()
 
+        # 成交回报去重：记录已处理的成交（用于去重，避免一个委托多个成交回报时重复更新hold.json）
+        # 格式: {(OrderRef, TradeTime): timestamp}
+        self._processed_trades: Dict[Tuple[str, str], float] = {}
+        self._processed_trades_lock = threading.Lock()
+
+        # 持仓更新防抖：确保同一个合约方向的成交，只更新一次hold.json
+        self._last_hold_update_time: Dict[str, float] = {}
+        self._HOLD_UPDATE_DEBOUNCE_SEC = 2.0  # 2秒内只更新一次
+
         super().__init__(conf=conf)
 
         # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
@@ -958,11 +967,31 @@ class PositionSyncManager(CTdSpiBase):
         return order_ref
 
     def cancel_order(self, order_ref: str) -> bool:
+        # 模糊匹配：尝试多种方式找到订单
+        info = None
+        matched_ref = None
+        ref_raw = str(order_ref or "").strip('\x00') if order_ref else ""
+        ref_stripped = ref_raw.strip()
+        ref_lstrip = ref_raw.lstrip() if ref_raw else ""
+
         with self._order_lock:
-            info = self._orders.get(order_ref)
+            for key in (order_ref, ref_raw, ref_stripped, ref_lstrip):
+                if key and key in self._orders:
+                    info = self._orders[key]
+                    matched_ref = key
+                    break
+            # 如果还没找到，尝试用 sys_id + exchange 匹配
             if not info:
-                self.print(f"[撤单] OrderRef={order_ref} 不在订单列表中")
-                return False
+                for key, oi in self._orders.items():
+                    if oi.get("sys_id") == order_ref:
+                        info = oi
+                        matched_ref = key
+                        break
+
+        if not info:
+            self.print(f"[撤单] OrderRef={order_ref} 不在订单列表中，尝试从 CTP 查询...")
+            # 如果找不到，尝试通过 CTP 查询找到订单信息
+            return False
 
         req = tdapi.CThostFtdcInputOrderActionField()
         req.BrokerID = self._broker_id
@@ -972,20 +1001,23 @@ class PositionSyncManager(CTdSpiBase):
         req.InstrumentID = info["instr"]
         req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
 
+        # 优先使用 OrderSysID 撤单（更可靠）
         if info.get("sys_id"):
             req.OrderSysID = info["sys_id"]
+            self.print(f"[撤单] {info['instr']} OrderSysID={info['sys_id']}")
         else:
             req.FrontID = self._front_id or 0
             req.SessionID = self._session_id or 0
-            req.OrderRef = order_ref
+            # 使用规范化后的 ref
+            req.OrderRef = matched_ref if matched_ref else order_ref
+            self.print(f"[撤单] {info['instr']} OrderRef={matched_ref}")
 
         cancel_event = threading.Event()
         cancel_result = [None]  # None=未返回, True=成功, False=失败
         with self._order_lock:
-            self._cancel_events[order_ref] = cancel_event
+            self._cancel_events[matched_ref if matched_ref else order_ref] = cancel_event
             self._cancel_result = cancel_result
 
-        self.print(f"[撤单] {info['instr']} OrderRef={order_ref}")
         self._api.ReqOrderAction(req, 0)
 
         # 等待最多 3 秒，同时检查撤单结果
@@ -1002,9 +1034,38 @@ class PositionSyncManager(CTdSpiBase):
         # 超时或结果已知
         if cancel_result[0] is None:
             # 超时，保守返回 True 让调用者继续
-            self.print(f"[撤单] OrderRef={order_ref} 等待响应超时，保守处理")
+            self.print(f"[撤单] OrderRef={matched_ref} 等待响应超时，保守处理")
             return True
         return cancel_result[0]
+
+    def _cancel_order_by_sysid(self, order_sys_id: str, exchange_id: str, instrument_id: str) -> bool:
+        """通过 OrderSysID 撤单（不依赖 _orders 内存缓存）"""
+        req = tdapi.CThostFtdcInputOrderActionField()
+        req.BrokerID = self._broker_id
+        req.InvestorID = self._user_id
+        req.UserID = self._user_id
+        req.ExchangeID = exchange_id
+        req.InstrumentID = instrument_id
+        req.OrderSysID = order_sys_id
+        req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
+
+        cancel_event = threading.Event()
+        self._cancel_events[order_sys_id] = cancel_event
+        self._cancel_result = [None]
+
+        self.print(f"[撤单] {instrument_id} OrderSysID={order_sys_id}")
+        self._api.ReqOrderAction(req, 0)
+
+        timeout = 3
+        waited = 0
+        while waited < timeout:
+            if cancel_event.wait(timeout=0.5):
+                break
+            waited += 0.5
+        if self._cancel_result[0] is None:
+            self.print(f"[撤单] OrderSysID={order_sys_id} 等待响应超时，保守处理")
+            return True
+        return self._cancel_result[0]
 
     # ------------------------------------------------------------------
     # CTP 回调
@@ -1146,6 +1207,35 @@ class PositionSyncManager(CTdSpiBase):
         trade_direction = str(getattr(pTrade, "Direction", "") or "").strip().strip('\x00')
         trade_offset = str(getattr(pTrade, "OffsetFlag", "") or "").strip().strip('\x00')
 
+        # 获取成交时间用于去重
+        trade_time = str(getattr(pTrade, "TradeTime", "") or "").strip()
+        trade_date = str(getattr(pTrade, "TradeDate", "") or "").strip()
+        trade_key = (order_ref, trade_date, trade_time)
+
+        # ========== 成交去重逻辑 ==========
+        current_time = time.time()
+        should_update_hold = False
+
+        with self._processed_trades_lock:
+            if trade_key in self._processed_trades:
+                # 重复的成交回报，只打印日志不更新hold.json
+                self.print(
+                    f"[成交-去重] {trade_instr} OrderRef={order_ref} "
+                    f"Volume={trade_volume} (重复回报，已忽略)"
+                )
+            else:
+                # 新的成交
+                self._processed_trades[trade_key] = current_time
+                should_update_hold = True
+
+                # 清理过期的去重记录（保留最近5分钟）
+                expired_keys = [
+                    k for k, ts in self._processed_trades.items()
+                    if current_time - ts > 300
+                ]
+                for k in expired_keys:
+                    del self._processed_trades[k]
+
         with self._order_lock:
             # 精确匹配
             info = self._orders.get(order_ref)
@@ -1174,13 +1264,25 @@ class PositionSyncManager(CTdSpiBase):
             f"Volume={trade_volume} Price={trade_price} "
             f"Dir={trade_direction} Offset={trade_offset}"
         )
-        self._notify_async(
-            f"✅ 成交回报\n"
-            f"合约：{instr}\n"
-            f"成交手数：{trade_volume} 手\n"
-            f"成交价格：{trade_price}\n"
-            f"OrderRef：{order_ref}"
-        )
+
+        # 合并同合约同方向的成交通知，减少飞书通知数量
+        # 使用防抖机制：2秒内同一合约同方向只通知一次
+        notify_key = f"{trade_instr}_{trade_direction}"
+        last_notify = self._last_hold_update_time.get(notify_key, 0)
+        if current_time - last_notify >= self._HOLD_UPDATE_DEBOUNCE_SEC:
+            self._last_hold_update_time[notify_key] = current_time
+            self._notify_async(
+                f"✅ 成交回报\n"
+                f"合约：{instr}\n"
+                f"成交手数：{trade_volume} 手\n"
+                f"成交价格：{trade_price}\n"
+                f"OrderRef：{order_ref}"
+            )
+
+        # ========== 更新 hold.json ==========
+        # 只在新的首次成交时更新，避免重复拉取持仓
+        if should_update_hold:
+            self._update_hold_json_from_ctp()
 
         # 同步成交手数到文件
         if info:
@@ -1188,6 +1290,130 @@ class PositionSyncManager(CTdSpiBase):
             self._update_order_file_status(
                 order_ref, status=None, volume_traded=trade_volume, session_id=session_id
             )
+
+    def _update_hold_json_file(self):
+        """
+        使用已查询的持仓数据更新 hold.json 文件
+        """
+        try:
+            if not self._actual_positions:
+                self.print("[更新hold] 无持仓数据，跳过")
+                return
+
+            # 聚合持仓
+            aggregated = {}
+            for pos in self._actual_positions:
+                contract = pos.get("InstrumentID", "")
+                if not contract:
+                    continue
+
+                today_vol = int(pos.get("TodayPosition", 0) or 0)
+                yd_vol = int(pos.get("YdPosition", 0) or 0)
+                total_vol = today_vol + yd_vol
+
+                if total_vol == 0:
+                    continue
+
+                pos_dir = pos.get("PosiDirection", 0)
+                if pos_dir == 2:
+                    direction = "买"
+                elif pos_dir == 3:
+                    direction = "卖"
+                else:
+                    continue
+
+                key = (contract, direction)
+                aggregated[key] = aggregated.get(key, 0) + total_vol
+
+            # 转换为 hold.json 格式
+            hold_rows = []
+            for (contract, direction), volume in aggregated.items():
+                hold_rows.append({
+                    "合约ID": contract,
+                    "买/卖": direction,
+                    "手数": str(volume),
+                    "来源": "CTP持仓查询"
+                })
+
+            # 写入 hold.json
+            hold_json_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                '..', 'order-check', 'hold.json'
+            )
+            os.makedirs(os.path.dirname(hold_json_path), exist_ok=True)
+            with open(hold_json_path, 'w', encoding='utf-8') as f:
+                json.dump(hold_rows, f, ensure_ascii=False, indent=2)
+            self.print(f"[更新hold] hold.json 已更新（共 {len(hold_rows)} 条）")
+
+        except Exception as e:
+            self.print(f"[更新hold] 异常: {e}")
+
+    def _update_hold_json_from_ctp(self):
+        """
+        从 CTP 查询持仓并更新 hold.json
+        使用防抖机制避免频繁查询
+        """
+        # 防抖：同一进程内限制更新频率
+        current_time = time.time()
+        last_update = getattr(self, '_last_hold_json_update', 0)
+        if current_time - last_update < 3.0:  # 3秒内不重复更新
+            return
+
+        self._last_hold_json_update = current_time
+
+        try:
+            # 查询当前持仓
+            positions = self.query_positions(timeout=10)
+            if positions is None:
+                self.print("[更新hold] 持仓查询失败")
+                return
+
+            # 聚合持仓
+            aggregated = {}
+            for pos in positions:
+                contract = pos.get("InstrumentID", "")
+                if not contract:
+                    continue
+
+                today_vol = int(pos.get("TodayPosition", 0) or 0)
+                yd_vol = int(pos.get("YdPosition", 0) or 0)
+                total_vol = today_vol + yd_vol
+
+                if total_vol == 0:
+                    continue
+
+                pos_dir = pos.get("PosiDirection", 0)
+                if pos_dir == 2:
+                    direction = "买"
+                elif pos_dir == 3:
+                    direction = "卖"
+                else:
+                    continue
+
+                key = (contract, direction)
+                aggregated[key] = aggregated.get(key, 0) + total_vol
+
+            # 转换为 hold.json 格式
+            hold_rows = []
+            for (contract, direction), volume in aggregated.items():
+                hold_rows.append({
+                    "合约ID": contract,
+                    "买/卖": direction,
+                    "手数": str(volume),
+                    "来源": "CTP成交回报"
+                })
+
+            # 写入 hold.json
+            hold_json_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                '..', 'order-check', 'hold.json'
+            )
+            with open(hold_json_path, 'w', encoding='utf-8') as f:
+                json.dump(hold_rows, f, ensure_ascii=False, indent=2)
+            self.print(f"[更新hold] hold.json 已从 CTP 成交回报更新（共 {len(hold_rows)} 条）")
+
+        except Exception as e:
+            self.print(f"[更新hold] 异常: {e}")
 
     def OnRspOrderAction(
         self,
@@ -1226,7 +1452,10 @@ class PositionSyncManager(CTdSpiBase):
         else:
             display_ref = order_ref if order_ref else "未知"
             self.print(f"[撤单响应] OrderRef={display_ref}")
+            # 撤单成功，更新订单状态为已撤销
             if info:
+                info["status"] = self._OST_CANCELED
+                info["event"].set()
                 with self._order_lock:
                     cancel_result = getattr(self, '_cancel_result', None)
                     if cancel_result is not None:
@@ -1309,6 +1538,29 @@ class PositionSyncManager(CTdSpiBase):
                 refs.append(ref)
         return refs
 
+    def _get_pending_orders_by_sysid(
+        self, instrument_id: str, direction: str, offset_flag: int, ctp_orders: List[dict]
+    ) -> List[dict]:
+        """从 CTP 查询结果中直接获取指定合约+方向+开平的未成交委托列表（按 OrderSysID 匹配）"""
+        if not ctp_orders:
+            return []
+        inst_upper = instrument_id.upper()
+        expected_dir = tdapi.THOST_FTDC_D_Buy if direction == "buy" else tdapi.THOST_FTDC_D_Sell
+        pending = []
+        for o in ctp_orders:
+            status = o.get("OrderStatus", "")
+            if status not in ("1", "3"):
+                continue
+            if o.get("InstrumentID", "").upper() != inst_upper:
+                continue
+            if o.get("Direction", 0) != expected_dir:
+                continue
+            offset_val = o.get("CombOffsetFlag", tdapi.THOST_FTDC_OF_Open)
+            if offset_val != offset_flag:
+                continue
+            pending.append(o)
+        return pending
+
     def _calc_pending_from_ctp(
         self, ctp_orders: List[dict], contract: str, pos_direction: int, is_open: bool
     ) -> int:
@@ -1366,8 +1618,33 @@ class PositionSyncManager(CTdSpiBase):
                 if status not in ("1", "3"):
                     continue
                 ref = o.get("OrderRef", "")
-                if not ref or ref in existing_refs:
+                ref_raw = str(ref or "").strip('\x00') if ref else ""
+                ref_stripped = ref_raw.strip()
+                ref_lstrip = ref_raw.lstrip() if ref_raw else ""
+
+                # 模糊匹配：尝试多种方式找到已存在的 ref
+                actual_ref = None
+                if ref and ref in existing_refs:
+                    actual_ref = ref
+                elif ref_raw and ref_raw in existing_refs:
+                    actual_ref = ref_raw
+                elif ref_stripped and ref_stripped in existing_refs:
+                    actual_ref = ref_stripped
+                elif ref_lstrip and ref_lstrip in existing_refs:
+                    actual_ref = ref_lstrip
+                else:
+                    # 用 OrderSysID + ExchangeID 组合匹配
+                    sys_id = o.get("OrderSysID", "")
+                    exchange_id = o.get("ExchangeID", "") or self._guess_exchange(o.get("InstrumentID", ""))
+                    for existing_ref in existing_refs:
+                        existing_info = self._orders.get(existing_ref, {})
+                        if existing_info.get("sys_id") == sys_id and existing_info.get("exchange") == exchange_id:
+                            actual_ref = existing_ref
+                            break
+
+                if actual_ref is not None:
                     continue
+                # 不存在，添加到 _orders
                 instrument_id = o.get("InstrumentID", "")
                 exchange_id = o.get("ExchangeID", "") or self._guess_exchange(instrument_id)
                 direction_val = o.get("Direction", 0)
@@ -1380,7 +1657,8 @@ class PositionSyncManager(CTdSpiBase):
                 offset_flag = o.get("CombOffsetFlag", tdapi.THOST_FTDC_OF_Open)
                 # 设置 submit_time 为较早时间，让监控线程尽快触发撤单重挂
                 fake_submit_time = time.time() - self.ORDER_TIMEOUT_SECONDS - 10
-                self._orders[ref] = {
+                key_ref = ref_stripped if ref_stripped else ref_lstrip if ref_lstrip else ref_raw if ref_raw else "ext"
+                self._orders[key_ref] = {
                     "event": threading.Event(),
                     "status": status,
                     "sys_id": o.get("OrderSysID", ""),
@@ -1393,7 +1671,7 @@ class PositionSyncManager(CTdSpiBase):
                     "replace_count": 0,
                     "from_ctp_sync": True,
                 }
-                existing_refs.add(ref)
+                existing_refs.add(key_ref)
                 synced += 1
         if synced:
             self.print(f"[同步] 已将 {synced} 条 CTP 未成交委托同步到内存，等待自动撤单重挂")
@@ -1412,7 +1690,8 @@ class PositionSyncManager(CTdSpiBase):
             if is_open:
                 pos_dir = 2 if direction == tdapi.THOST_FTDC_D_Buy else 3
             else:
-                pos_dir = 2 if direction == tdapi.THOST_FTDC_D_Sell else 3
+                # 平仓方向同方向：空头平仓(买平)→空头方向(3)，多头平仓(卖平)→多头方向(2)
+                pos_dir = 3 if direction == tdapi.THOST_FTDC_D_Buy else 2
             vol_total = o.get("VolumeTotalOriginal", 0)
             vol_traded = o.get("VolumeTraded", 0)
             remain = max(0, vol_total - vol_traded)
@@ -1599,18 +1878,6 @@ class PositionSyncManager(CTdSpiBase):
                 actual_agg = self._aggregate_actual_positions()
                 self.print(f"[信息] 二次确认后实际持仓 {len(positions2)} 条记录")
 
-        # 2 分钟冷却，避免 TTS/线上环境成交不同步导致来回切
-        # 例外：空仓需建仓时立即同步，不等待冷却
-        FULL_SYNC_COOLDOWN = 120  # 2 分钟
-        elapsed = time.time() - self._last_full_sync_time
-        is_empty_position = not actual_agg and target
-        if elapsed < FULL_SYNC_COOLDOWN and not is_empty_position:
-            self.print(
-                f"[冷却] 距离上次仓位对齐仅 {int(elapsed)} 秒（每 {FULL_SYNC_COOLDOWN // 60} 分钟对齐一次），跳过"
-            )
-            return True
-        self._last_full_sync_time = time.time()
-
         # 查询 CTP 当前委托（程序重启后 _orders 可能为空，必须查 CTP 才能知道真实在途委托）
         ctp_orders = self.query_orders(timeout=5, only_pending=True, today_only=True)
         if ctp_orders is None:
@@ -1626,6 +1893,9 @@ class PositionSyncManager(CTdSpiBase):
 
         # 持仓对比（扣除在途委托后的有效持仓）
         effective_actual: Dict[Tuple[str, int], int] = {}
+
+        # 更新 hold.json（当前持仓快照）
+        self._update_hold_json_file()
         all_keys = set(actual_agg.keys()) | set(target.keys())
         for key in all_keys:
             contract, direction = key
@@ -1668,14 +1938,44 @@ class PositionSyncManager(CTdSpiBase):
 
         ALIGN_COOLDOWN = 60  # 同一合约同方向补单/平仓冷却秒数
 
+        # 操作日志：记录实际执行的操作
+        action_log = []
+
+        # 调试：打印对比结果
+        self.print(f"[对比] 标准持仓汇总: {dict(target)}")
+        self.print(f"[对比] 实际持仓汇总: {dict(actual_agg)}")
+        self.print(f"[对比] 有效持仓汇总: {dict(effective_actual)}")
+        self.print(f"[对比] 缺额: {missing_orders}")
+        self.print(f"[对比] 超额: {excess_orders}")
+
+        # 兜底检查：如果有合约只在 actual_agg 中但不在 excess_orders 中，强制加入
+        std_keys = set(target.keys())
+        actual_keys = set(actual_agg.keys())
+        only_in_actual = actual_keys - std_keys
+        for key in only_in_actual:
+            contract, direction = key
+            vol = actual_agg.get(key, 0)
+            # 检查是否已经在 excess_orders 中
+            already_added = any(eo["contract"] == contract and eo["direction"] == direction for eo in excess_orders)
+            if not already_added and vol > 0:
+                self.print(f"[补检] {contract} {direction} {vol}手 只在实际中，强制加入超额平仓")
+                excess_orders.append({
+                    "contract": contract,
+                    "direction": direction,
+                    "volume": vol,
+                })
+
         if missing_orders:
             self.print(f"[补单] 标准持仓有 {len(missing_orders)} 个合约缺额，自动补齐...")
             for mo in missing_orders:
-                cooldown_key = (mo["contract"], 2 if mo["direction"] == "buy" else 3, "open")
-                last_time = self._last_align_time.get(cooldown_key, 0)
-                if time.time() - last_time < ALIGN_COOLDOWN:
-                    self.print(f"[冷却] {mo['contract']} {mo['direction']} 最近 {ALIGN_COOLDOWN}s 内已对齐，跳过")
-                    continue
+                # 先撤掉之前未成交的同方向开仓委托
+                pos_dir = 2 if mo["direction"] == "buy" else 3
+                pending_refs = self._get_pending_order_refs(mo["contract"], mo["direction"], tdapi.THOST_FTDC_OF_Open)
+                if pending_refs:
+                    self.print(f"[撤旧单] {mo['contract']} {mo['direction']} 存在 {len(pending_refs)} 笔未成交开仓委托，先撤单")
+                    for ref in pending_refs:
+                        self.cancel_order(ref)
+                    time.sleep(1)  # 等待撤单生效
 
                 info = self._get_contract_info(mo["contract"])
                 md = self.query_market_data(mo["contract"], timeout=3)
@@ -1700,7 +2000,7 @@ class PositionSyncManager(CTdSpiBase):
                     f"[补单] {mo['contract']} {mo['direction']} {mo['volume']}手 "
                     f"限价={limit_price}"
                 )
-                self._place_order(
+                ok = self._place_order(
                     exchange_id=info["ExchangeID"],
                     instrument_id=mo["contract"],
                     direction=mo["direction"],
@@ -1709,24 +2009,36 @@ class PositionSyncManager(CTdSpiBase):
                     offset_flag=tdapi.THOST_FTDC_OF_Open,
                     wait_fill=False,
                 )
+                if ok:
+                    action_log.append(f"🆕 补单成功: {mo['contract']} {mo['direction']} {mo['volume']}手 @{limit_price}")
+                else:
+                    action_log.append(f"❌ 补单失败: {mo['contract']} {mo['direction']} {mo['volume']}手")
                 self._last_align_time[cooldown_key] = time.time()
                 time.sleep(0.3)
 
-            # 发送补单汇总通知
-            if missing_orders:
-                lines = ["📋 持仓缺额已自动提交补单"]
-                for mo in missing_orders:
-                    lines.append(f"  {mo['contract']} {'买' if mo['direction']=='buy' else '卖'} {mo['volume']}手")
-                self._notify_async("\n".join(lines))
-
         if excess_orders:
             self.print(f"[平仓] 发现 {len(excess_orders)} 个合约超额持仓，自动平仓...")
+            self.print(f"[平仓-debug] excess_orders 详情: {excess_orders}")
             for eo in excess_orders:
-                cooldown_key = (eo["contract"], eo["direction"], "close")
-                last_time = self._last_align_time.get(cooldown_key, 0)
-                if time.time() - last_time < ALIGN_COOLDOWN:
-                    self.print(f"[冷却] {eo['contract']} {'多' if eo['direction']==2 else '空'} 最近 {ALIGN_COOLDOWN}s 内已平仓，跳过")
-                    continue
+                # 先检查是否有未成交的同方向平仓委托需要撤掉（直接从 CTP 查询结果中查找）
+                close_dir_label = "sell" if eo["direction"] == 2 else "buy"
+                pending_from_ctp = self._get_pending_orders_by_sysid(
+                    eo["contract"], close_dir_label, tdapi.THOST_FTDC_OF_Close, ctp_orders
+                )
+                if pending_from_ctp:
+                    self.print(f"[撤旧单] {eo['contract']} {close_dir_label} 存在 {len(pending_from_ctp)} 笔未成交平仓委托，先撤单")
+                    action_log.append(f"🔄 撤单: {eo['contract']} {close_dir_label} {len(pending_from_ctp)} 笔")
+                    for o in pending_from_ctp:
+                        order_ref = o.get("OrderRef", "")
+                        order_sys_id = o.get("OrderSysID", "")
+                        if order_sys_id:
+                            self._cancel_order_by_sysid(order_sys_id, o.get("ExchangeID", ""), eo["contract"])
+                        elif order_ref:
+                            self.cancel_order(order_ref)
+                    time.sleep(1)  # 等待撤单生效
+                    # 重新查询持仓
+                    self.query_positions(timeout=5)
+                    actual_agg = self._aggregate_actual_positions()
 
                 detail = self._get_position_detail(eo["contract"], eo["direction"])
                 info = self._get_contract_info(eo["contract"])
@@ -1785,7 +2097,7 @@ class PositionSyncManager(CTdSpiBase):
                     self.print(
                         f"[平仓-平今] {eo['contract']} {'卖' if close_direction=='sell' else '买'} {close_today}手 限价={limit_price}"
                     )
-                    self._place_order(
+                    ok = self._place_order(
                         exchange_id=exchange_id,
                         instrument_id=eo["contract"],
                         direction=close_direction,
@@ -1794,6 +2106,10 @@ class PositionSyncManager(CTdSpiBase):
                         offset_flag=tdapi.THOST_FTDC_OF_CloseToday,
                         wait_fill=False,
                     )
+                    if ok:
+                        action_log.append(f"🆕 平仓成功: {eo['contract']} {'卖' if close_direction=='sell' else '买'} {close_today}手 @{limit_price} (平今)")
+                    else:
+                        action_log.append(f"❌ 平仓失败: {eo['contract']} {'卖' if close_direction=='sell' else '买'} {close_today}手 (平今)")
                     diff -= close_today
                     time.sleep(0.3)
 
@@ -1803,7 +2119,7 @@ class PositionSyncManager(CTdSpiBase):
                     self.print(
                         f"[平仓-{label}] {eo['contract']} {'卖' if close_direction=='sell' else '买'} {diff}手 限价={limit_price}"
                     )
-                    self._place_order(
+                    ok = self._place_order(
                         exchange_id=exchange_id,
                         instrument_id=eo["contract"],
                         direction=close_direction,
@@ -1812,17 +2128,17 @@ class PositionSyncManager(CTdSpiBase):
                         offset_flag=offset,
                         wait_fill=False,
                     )
+                    if ok:
+                        action_log.append(f"🆕 平仓成功: {eo['contract']} {'卖' if close_direction=='sell' else '买'} {diff}手 @{limit_price} ({label})")
+                    else:
+                        action_log.append(f"❌ 平仓失败: {eo['contract']} {'卖' if close_direction=='sell' else '买'} {diff}手 ({label})")
                     diff -= diff
                     time.sleep(0.3)
 
                 self._last_align_time[cooldown_key] = time.time()
 
-            # 发送平仓汇总通知
-            lines = ["📉 超额持仓已自动提交平仓"]
-            for eo in excess_orders:
-                dname = "多" if eo["direction"] == 2 else "空"
-                lines.append(f"  {eo['contract']} {dname} {eo['volume']}手")
-            self._notify_async("\n".join(lines))
+        # ========== 生成详细的同步结果通知 ==========
+        self._send_sync_notification(target, actual_agg, effective_actual, pending_map, missing_orders, excess_orders, action_log)
 
         if missing_orders or excess_orders:
             self.print("[结论] 持仓调整完成（缺额已补 / 超额已平）")
@@ -1834,6 +2150,119 @@ class PositionSyncManager(CTdSpiBase):
         self.print("=" * 60)
         self._is_first_run = False
         return True
+
+    def _send_sync_notification(self, target: dict, actual_agg: dict, effective_actual: dict,
+                                 pending_map: dict, missing_orders: list, excess_orders: list,
+                                 action_log: list = None):
+        """发送详细的持仓同步结果飞书通知"""
+        lines = []
+        action_log = action_log or []
+
+        # 统计汇总
+        total_std_vol = sum(target.values())
+        total_actual_vol = sum(actual_agg.values())
+        total_effective_vol = sum(effective_actual.values())
+
+        # 检查总手数是否一致
+        has_vol_diff = (total_std_vol != total_actual_vol)
+
+        # 检查是否有具体的合约差异
+        has_missing = len(missing_orders) > 0
+        has_excess = len(excess_orders) > 0
+
+        if not has_missing and not has_excess and not has_vol_diff:
+            # 持仓完全一致
+            lines.append("✅ 持仓同步完成：一致")
+            lines.append(f"📊 标准持仓: {total_std_vol} 手 ({len(target)} 个合约)")
+            lines.append(f"📊 实际持仓: {total_actual_vol} 手 ({len(actual_agg)} 个合约)")
+            lines.append("无差异，无需操作")
+        else:
+            # 有差异
+            lines.append("🔄 持仓同步完成：有差异")
+            lines.append("=" * 25)
+
+            # 显示对比汇总
+            lines.append(f"📊 标准持仓: {total_std_vol} 手 ({len(target)} 个合约)")
+            lines.append(f"📊 实际持仓: {total_actual_vol} 手 ({len(actual_agg)} 个合约)")
+            lines.append(f"📊 有效持仓: {total_effective_vol} 手 (扣除在途委托)")
+
+            if has_vol_diff:
+                diff = total_actual_vol - total_std_vol
+                sign = "+" if diff > 0 else ""
+                lines.append(f"⚠️ 总手数差: {sign}{diff} 手")
+
+            # 在途委托明细
+            if pending_map:
+                pending_items = [(k, v) for k, v in pending_map.items() if v > 0]
+                if pending_items:
+                    lines.append("-" * 25)
+                    lines.append(f"📋 在途委托 ({len(pending_items)} 笔)：")
+                    for (contract, direction, is_open), vol in sorted(pending_items):
+                        dname = "买开" if (direction == 2 and is_open) else \
+                                "卖开" if (direction == 3 and is_open) else \
+                                "买平" if (direction == 2 and not is_open) else "卖平"
+                        lines.append(f"  {contract} {dname} {vol}手")
+                    lines.append("  (已自动撤掉上述在途委托)")
+
+            lines.append("=" * 25)
+
+            # 缺额（需要开仓）
+            if missing_orders:
+                lines.append(f"📈 缺额开仓 ({len(missing_orders)} 个)：")
+                total_missing = 0
+                for mo in missing_orders:
+                    dname = "买" if mo["direction"] == "buy" else "卖"
+                    lines.append(f"  {mo['contract']} {dname} {mo['volume']}手")
+                    total_missing += mo["volume"]
+                lines.append(f"  共计: {total_missing} 手")
+                lines.append("-" * 15)
+
+            # 超额（需要平仓）
+            if excess_orders:
+                lines.append(f"📉 超额平仓 ({len(excess_orders)} 个)：")
+                total_excess = 0
+                for eo in excess_orders:
+                    dname = "多" if eo["direction"] == 2 else "空"
+                    lines.append(f"  {eo['contract']} {dname} {eo['volume']}手")
+                    total_excess += eo["volume"]
+                lines.append(f"  共计: {total_excess} 手")
+                lines.append("-" * 15)
+
+            # 显示合约差异（只在标准持仓和实际持仓的合约不完全相同时）
+            std_contracts = set(target.keys())
+            actual_contracts = set(actual_agg.keys())
+            only_in_std = std_contracts - actual_contracts
+            only_in_actual = actual_contracts - std_contracts
+
+            if only_in_std:
+                lines.append("-" * 25)
+                lines.append(f"⚠️ 标准中有但实际中没有 ({len(only_in_std)} 个)：")
+                lines.append("  (可能是已平仓但未同步)")
+                for c, d in only_in_std:
+                    dname = "买" if d == 2 else "卖"
+                    vol = target[(c, d)]
+                    lines.append(f"  {c} {dname} {vol}手")
+
+            if only_in_actual:
+                lines.append("-" * 25)
+                lines.append(f"⚠️ 实际中有但标准中没有 ({len(only_in_actual)} 个)：")
+                lines.append("  (可能是新开仓但未写入标准持仓)")
+                for c, d in only_in_actual:
+                    dname = "买" if d == 2 else "卖"
+                    vol = actual_agg[(c, d)]
+                    lines.append(f"  {c} {dname} {vol}手")
+
+            lines.append("=" * 25)
+
+            if action_log:
+                lines.append("-" * 25)
+                lines.append("📝 实际操作记录：")
+                for log in action_log:
+                    lines.append(f"  {log}")
+            elif has_missing or has_excess:
+                lines.append("⚠️ 已处理，但无操作记录（可能被冷却跳过）")
+
+        self._notify_async("\n".join(lines))
 
     def _build_positions(self, target: dict, timeout: int = 30) -> bool:
         """首次建仓：账户为空，按 target 买入"""
@@ -1918,10 +2347,10 @@ class PositionSyncManager(CTdSpiBase):
             self.print("[信息] 无新增委托")
             return True
 
-        self.print(f"[信息] 待执行委托 {len(orders)} 条")
+        self.print(f"[信息] 持仓差异订单 {len(orders)} 条待执行")
         success_count = 0
         skipped_count = 0
-        notify_lines = [f"📋 委托文件已更新，待执行 {len(orders)} 条"]
+        notify_lines = [f"📋 持仓差异订单，待执行 {len(orders)} 条"]
 
         def _offset_label(flag):
             return {

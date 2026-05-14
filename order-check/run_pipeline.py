@@ -207,10 +207,10 @@ def run_sync():
         logger.warning("获取交易锁超时（10秒），跳过本次同步")
         return False
 
+    logger.info("=" * 50)
     logger.info("已获取交易锁: 开始持仓同步")
 
     try:
-        logger.info("开始执行: 持仓同步")
         # 重新生成 hold-std.json（从导出的持仓明细 CSV）
         import compare_orders
         gen_ok = compare_orders.generate_hold_std()
@@ -223,12 +223,13 @@ def run_sync():
             with open(hold_std_path, 'r', encoding='utf-8') as f:
                 hold_rows = json.load(f)
             total_vol = sum(int(str(item.get("手数", "0") or "0")) for item in hold_rows)
-            logger.info("hold-std.json 共 %d 条记录，共 %d 手", len(hold_rows), total_vol)
+            logger.info("标准持仓: %d 条记录，共 %d 手", len(hold_rows), total_vol)
 
-        # 执行持仓同步
+        # 执行持仓同步（PositionSyncManager 会详细打印补单/平仓日志）
         from trading.PositionSyncManager import run_position_sync
         MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
 
+        logger.info(">>> 开始持仓对比与同步...")
         sync_ok = run_position_sync(
             hold_std_path=hold_std_path,
             main_contracts_path=MAIN_CONTRACTS_PATH,
@@ -238,11 +239,16 @@ def run_sync():
             env_name=_CTP_ENV_NAME,
         )
         _last_sync_time[0] = time.time()
+
         if sync_ok:
-            logger.info("持仓同步完成")
-            send_feishu_text("✅ 定时持仓同步完成")
+            logger.info("=" * 50)
+            logger.info("【持仓同步完成】")
+            logger.info("  PositionSyncManager 已发送详细飞书通知")
+            logger.info("=" * 50)
+            # 注意：详细通知由 PositionSyncManager._send_sync_notification 发送
         else:
-            logger.warning("持仓同步未完成")
+            logger.warning("持仓同步未完成（可能处于冷却期或有错误）")
+
         return sync_ok
     except Exception as e:
         logger.error("持仓同步异常: %s", e)
@@ -253,6 +259,7 @@ def run_sync():
         if lock:
             lock.release()
             logger.info("已释放交易锁: 持仓同步结束")
+            logger.info("=" * 50)
 
 
 def force_sync():
@@ -303,9 +310,10 @@ def force_sync():
         )
         if sync_ok:
             logger.info("强制同步完成")
-            send_feishu_text("✅ 强制同步完成")
+            # 详细通知由 PositionSyncManager._send_sync_notification 发送
         else:
             logger.warning("强制同步未完成")
+            send_feishu_text("⚠️ 强制同步未完成")
         return sync_ok
     except Exception as e:
         logger.error("强制同步异常: %s", e)
@@ -320,9 +328,10 @@ def force_sync():
 
 
 def run_once():
-    """单次执行：导出 -> 对比"""
-    logger.info("开始执行: 导出 -> 对比")
-    logger.info(">>> 步骤 1/2: 执行自动导出...")
+    """单次执行：导出 -> 持仓差异对比"""
+    logger.info("=" * 50)
+    logger.info("开始执行: 导出 -> 持仓差异对比")
+    logger.info(">>> 步骤 1/3: 执行自动导出...")
     try:
         import automate_export
         success = automate_export.main()
@@ -335,22 +344,31 @@ def run_once():
         return False
     logger.info("导出成功。")
 
-    time.sleep(2)
+    time.sleep(1)
 
-    logger.info(">>> 步骤 2/2: 执行委托对比...")
+    logger.info(">>> 步骤 2/3: 生成持仓文件...")
     try:
         import compare_orders
-        has_change = compare_orders.main()
+        # 生成标准持仓 hold-std.json（从 CSV 持仓明细）
+        gen_std_ok = compare_orders.generate_hold_std()
+
+        # 初始化 hold.json 占位文件
+        # 实际数据由 PositionSyncManager 从 CTP 持仓查询后更新
+        compare_orders.generate_hold()
+
+        if gen_std_ok:
+            logger.info("标准持仓 hold-std.json 生成完成")
+        else:
+            logger.warning("标准持仓 hold-std.json 生成失败")
+
     except Exception as e:
-        logger.error("对比步骤异常: %s", e)
-        has_change = False
+        logger.error("生成持仓文件异常: %s", e)
 
-    if has_change:
-        logger.info("检测到委托数据变化")
-    else:
-        logger.info("委托数据无变化。")
+    logger.info(">>> 步骤 3/3: 持仓差异将在同步时对比（由 PositionSyncManager 处理）")
 
-    return has_change
+    logger.info("=" * 50)
+    # 不再在此处对比，返回 False 让 run_sync 处理对比逻辑
+    return False
 
 
 def export_loop():

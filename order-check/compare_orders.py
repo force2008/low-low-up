@@ -283,7 +283,187 @@ def generate_hold_std():
     hold_std_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
     with open(hold_std_path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
-    print(f"持仓标准文件已写入: {hold_std_path}（共 {len(rows)} 条）")
+    print(f"标准持仓文件已写入: {hold_std_path}（共 {len(rows)} 条）")
+
+    return True
+
+
+def generate_hold():
+    """
+    从 CTP 查询当前持仓，生成 hold.json
+    注意：这个函数需要 CTP 连接，在流水线中由 PositionSyncManager 调用
+    流水线中会检查 hold.json 是否存在，不存在则跳过差异对比
+    """
+    hold_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold.json')
+
+    # 检查文件是否存在
+    if os.path.exists(hold_json_path):
+        # 已存在，不重复生成（由成交回报更新）
+        print(f"hold.json 已存在，跳过生成（如需更新请等待成交回报）")
+        return True
+
+    # 不存在则创建空文件占位
+    with open(hold_json_path, 'w', encoding='utf-8') as f:
+        json.dump([], f, ensure_ascii=False, indent=2)
+    print(f"hold.json 初始化为空文件")
+    return True
+
+
+def compare_hold_diff():
+    """
+    比较 hold-std.json（标准持仓）与 hold.json（当前持仓）的差异
+    生成差异订单并写入 signal.json
+    这是委托订单的唯一来源
+    """
+    hold_std_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
+    hold_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold.json')
+
+    # 检查文件是否存在
+    if not os.path.exists(hold_std_path):
+        print("[差异对比] hold-std.json 不存在，跳过")
+        return False
+    if not os.path.exists(hold_json_path):
+        print("[差异对比] hold.json 不存在，首次生成后重试")
+        # 首次运行，生成 hold.json
+        if not generate_hold():
+            return False
+        # 再次检查
+        if not os.path.exists(hold_json_path):
+            return False
+
+    # 读取文件
+    with open(hold_std_path, 'r', encoding='utf-8') as f:
+        hold_std = json.load(f)
+    with open(hold_json_path, 'r', encoding='utf-8') as f:
+        hold_json = json.load(f)
+
+    # 解析持仓为 {(合约, 方向): 手数} 格式
+    def parse_hold(rows):
+        result = {}
+        for row in rows:
+            contract = row.get("合约ID") or row.get("合约") or row.get("合约代码") or ""
+            contract = str(contract).strip().upper()
+            if not contract:
+                continue
+
+            direction = row.get("买/卖") or row.get("多空") or row.get("方向") or ""
+            volume = row.get("持仓量") or row.get("手数") or "0"
+            try:
+                volume = int(str(volume).strip())
+            except ValueError:
+                volume = 0
+
+            if not contract or volume == 0:
+                continue
+
+            # 确定方向
+            if direction in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
+                direction_key = 2  # 多头
+            elif direction in ("卖", "空头", "空", "Sell", "SELL", "sell", "S"):
+                direction_key = 3  # 空头
+            else:
+                continue
+
+            key = (contract, direction_key)
+            result[key] = result.get(key, 0) + volume
+        return result
+
+    std_positions = parse_hold(hold_std)
+    actual_positions = parse_hold(hold_json)
+
+    # 计算差异
+    all_keys = set(std_positions.keys()) | set(actual_positions.keys())
+    diff_orders = []
+
+    for key in all_keys:
+        contract, direction = key
+        std_vol = std_positions.get(key, 0)
+        actual_vol = actual_positions.get(key, 0)
+
+        if std_vol > actual_vol:
+            # 缺额，需要开仓
+            diff = std_vol - actual_vol
+            diff_orders.append({
+                "合约": contract,
+                "买卖": "买" if direction == 2 else "卖",
+                "开平": "开仓",
+                "volume": diff,
+            })
+        elif actual_vol > std_vol:
+            # 超额，需要平仓
+            diff = actual_vol - std_vol
+            diff_orders.append({
+                "合约": contract,
+                "买卖": "卖" if direction == 2 else "买",
+                "开平": "平仓",
+                "volume": diff,
+            })
+
+    if not diff_orders:
+        print("[差异对比] 标准持仓与当前持仓一致，无差异订单")
+        return False
+
+    print(f"[差异对比] 发现 {len(diff_orders)} 条差异订单:")
+    for order in diff_orders:
+        print(f"  {order['合约']} {order['买卖']} {order['volume']}手 ({order['开平']})")
+
+    # 写入 signal.json
+    signal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'signal.json')
+    with open(signal_path, 'w', encoding='utf-8') as f:
+        json.dump(diff_orders, f, ensure_ascii=False, indent=2)
+    print(f"差异订单已写入: {signal_path}")
+
+    return True
+
+
+def update_hold_json_from_ctp(positions_raw):
+    """
+    根据 CTP 成交回报更新 hold.json
+    positions_raw: CTP 查询返回的原始持仓列表
+    """
+    if not positions_raw:
+        return False
+
+    # 聚合持仓
+    aggregated = {}
+    for pos in positions_raw:
+        contract = pos.get("InstrumentID", "")
+        if not contract:
+            continue
+
+        # 融航柜台可能用 YdPosition 表示昨仓
+        today_vol = int(pos.get("TodayPosition", 0) or 0)
+        yd_vol = int(pos.get("YdPosition", 0) or 0)
+        total_vol = today_vol + yd_vol
+
+        if total_vol == 0:
+            continue
+
+        pos_dir = pos.get("PosiDirection", 0)
+        if pos_dir == 2:  # 净持仓为多
+            direction = "买"
+        elif pos_dir == 3:  # 净持仓为空
+            direction = "卖"
+        else:
+            continue
+
+        key = (contract, direction)
+        aggregated[key] = aggregated.get(key, 0) + total_vol
+
+    # 转换为 hold.json 格式
+    hold_rows = []
+    for (contract, direction), volume in aggregated.items():
+        hold_rows.append({
+            "合约ID": contract,
+            "买/卖": direction,
+            "手数": str(volume),
+            "来源": "CTP成交回报"
+        })
+
+    hold_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold.json')
+    with open(hold_json_path, 'w', encoding='utf-8') as f:
+        json.dump(hold_rows, f, ensure_ascii=False, indent=2)
+    print(f"[更新] hold.json 已从 CTP 成交回报更新（共 {len(hold_rows)} 条）")
 
     return True
 
