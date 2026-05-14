@@ -28,6 +28,11 @@ _SEEN_IDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.seen
 _SEEN_IDS_MAX_SIZE_PER_DAY = 2000
 _SEEN_IDS_RETENTION_DAYS = 7
 
+# ==================== 活跃委托池（部分成交拆分） ====================
+# 用于跟踪尚未完全成交的委托
+# 格式: {order_id: {"total_qty": N, "traded_qty": M, "row": {...}}}
+_ACTIVE_ORDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.active_orders.json')
+
 
 def _extract_trading_day_from_filename(filename):
     """从 CSV 文件名提取交易日，如 'jm0310 所有委托 2026-5-8 11-22-49.csv' -> '2026-05-08'"""

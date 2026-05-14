@@ -298,13 +298,7 @@ class FeishuNotifier:
 
     def _send_payload(self, payload: dict) -> bool:
         """
-        发送请求到飞书
-
-        Args:
-            payload: 消息 payload
-
-        Returns:
-            bool: 发送是否成功
+        发送请求到飞书，使用超时避免阻塞
         """
         try:
             data = json.dumps(payload).encode('utf-8')
@@ -313,22 +307,11 @@ class FeishuNotifier:
                 data=data,
                 headers={'Content-Type': 'application/json'}
             )
-
-            with urllib.request.urlopen(req, timeout=10) as response:
+            # 使用 3 秒超时，服务器不返回也没关系
+            with urllib.request.urlopen(req, timeout=3) as response:
                 result = json.loads(response.read().decode('utf-8'))
-
-                if result.get('code') == 0 or result.get('StatusCode') == 0:
-                    print(f"[飞书通知] 发送成功")
-                    return True
-                else:
-                    print(f"[飞书通知] 发送失败：{result}")
-                    return False
-
-        except urllib.error.URLError as e:
-            print(f"[飞书通知] 网络错误：{e}")
-            return False
-        except Exception as e:
-            print(f"[飞书通知] 未知错误：{e}")
+                return result.get('code') == 0 or result.get('StatusCode') == 0
+        except Exception:
             return False
 
 

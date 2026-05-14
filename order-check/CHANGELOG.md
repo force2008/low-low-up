@@ -1,5 +1,31 @@
 # Changelog
 
+## [2026-05-11]
+
+### Added
+- **多线程架构重构**：`run_pipeline.py` 重构为双线程模式：
+  - 导出线程：每 20 秒执行导出 + 对比
+  - 报单线程：监听 diff 信号，执行报单（独立线程执行）
+  - 两个线程独立运行，互不阻塞
+  - 添加主线程心跳监控，每 9 秒输出一次线程状态
+- 新增 `submit_order.py`：报单模块，调用 `PositionSyncManager.execute_orders()` 执行委托
+- `run_pipeline.py` 启动时执行持仓同步（将 CTP 实际持仓同步到 hold-std.json）
+
+### Changed
+- 飞书通知 `_notify_async()`：超时改为 3 秒，避免阻塞
+- `feishu_notifier.py` `_send_payload()`：超时改为 3 秒，简化异常处理
+- `cancel_order()`：现在正确返回撤单结果（成功/失败）
+- `OnRspOrderAction()`：设置 `cancel_result` 供 `cancel_order()` 获取结果
+- `execute_orders()`：添加 try-except 包装，单条委托失败不影响其他委托处理
+
+### Fixed
+- 修复报单/持仓同步线程卡住的问题（多线程 + 异步通知）
+- 修复 `cancel_order()` 始终返回 True 的问题
+- 修复 `_check_and_replace_pending_orders()` 在 ref 为空时仍尝试撤单的问题
+- 修复平仓时显示"无持仓"的诊断问题：添加调试信息显示实际持仓记录
+- 修复 `sync_and_trade` 中的缩进语法错误
+- Ctrl+C 信号处理：显式设置 shutdown_event
+
 ## [2026-04-28]
 
 ### Added

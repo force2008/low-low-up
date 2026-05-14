@@ -15,6 +15,7 @@
 """
 
 import json
+import logging
 import os
 import queue
 import re
@@ -22,7 +23,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from tkinter import ttk, messagebox, simpledialog
+from typing import Optional, Dict, List, Tuple
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -31,6 +34,33 @@ if PROJECT_ROOT not in sys.path:
 from ctp.base_tdapi import CTdSpiBase, tdapi
 from config import config
 from utils.feishu_notifier import FeishuNotifier
+
+# 导入跨进程交易锁
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "order-check"))
+from trading_lock import get_trading_lock
+
+
+# ==================== 日志配置 ====================
+_LOG_DIR = os.path.join(PROJECT_ROOT, "trading", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, "PositionManagerUI.log")
+
+_ui_logger = logging.getLogger("PositionManagerUI")
+_ui_logger.setLevel(logging.DEBUG)
+
+if not _ui_logger.handlers:
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    # 文件Handler：保留最近5个日志文件，每个最大5MB
+    file_handler = RotatingFileHandler(_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    file_handler.setLevel(logging.DEBUG)
+    _ui_logger.addHandler(file_handler)
+    # 控制台Handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(fmt)
+    console_handler.setLevel(logging.INFO)
+    _ui_logger.addHandler(console_handler)
+# =================================================
 
 
 class PositionManagerUI(CTdSpiBase):
@@ -65,6 +95,9 @@ class PositionManagerUI(CTdSpiBase):
         self._feishu = FeishuNotifier()
         self._order_ref_seq = 0
 
+        # 日志器（使用模块级 logger，避免多实例重复添加 Handler）
+        self._logger = _ui_logger
+
         # UI
         self._tree_pos = None
         self._tree_order = None
@@ -79,6 +112,14 @@ class PositionManagerUI(CTdSpiBase):
         # 委托列表变化检测（避免无意义重绘）
         self._last_order_digest: str = ""
 
+        # 自动撤单重挂配置
+        self._ORDER_TIMEOUT_SECONDS = 60
+        self._MAX_REPLACE_COUNT = 2
+        self._replace_monitor_thread: Optional[threading.Thread] = None
+        self._replace_stop_event = threading.Event()
+        # 追踪本地发出的委托：ref -> {"submit_time": float, "instrument_id": str, "direction": int, "offset_flag": str, "volume": int, "price": float, "replace_count": int, "orig_ref": str}
+        self._local_orders: dict = {}
+
         # 资金数据
         self._account_done = threading.Event()
         self._account_data: dict = {}
@@ -92,6 +133,22 @@ class PositionManagerUI(CTdSpiBase):
         threading.Thread(
             target=self._feishu.send_text, args=(text,), daemon=True
         ).start()
+
+    def log(self, level: str, *args, **kwargs):
+        """写入日志：支持 debug/info/warning/error"""
+        msg = " ".join(str(a) for a in args)
+        if level == "debug":
+            self._logger.debug(msg)
+        elif level == "warning":
+            self._logger.warning(msg)
+        elif level == "error":
+            self._logger.error(msg)
+        else:
+            self._logger.info(msg)
+
+    def print(self, *args, **kwargs):
+        """兼容旧代码：默认 info 级别"""
+        self.log("info", *args, **kwargs)
 
     # ------------------------------------------------------------------
     # UI
@@ -186,6 +243,8 @@ class PositionManagerUI(CTdSpiBase):
                 pass
             # 启动自动轮询
             threading.Thread(target=self._poll_loop, daemon=True).start()
+            # 启动自动撤单重挂监控
+            self._start_replace_monitor()
         except Exception as e:
             self.print(f"[_bootstrap] 异常: {e}")
             import traceback
@@ -447,7 +506,7 @@ class PositionManagerUI(CTdSpiBase):
                     "SessionID": p.SessionID,
                     "ExchangeID": (p.ExchangeID or "").strip(),
                 })
-            self.print(f"[QueryOrder] 收到委托 {p.InstrumentID} Ref={p.OrderRef} Status={p.OrderStatus}")
+            self.print(f"[QueryOrder] 收到委托 {p.InstrumentID} Ref={p.OrderRef} Status={p.OrderStatus} SysID={p.OrderSysID} FrontID={p.FrontID} SessionID={p.SessionID}")
         if bIsLast:
             self._order_done.set()
 
@@ -505,19 +564,25 @@ class PositionManagerUI(CTdSpiBase):
         status = self._normalize_status(pOrder.OrderStatus)
         desc = {"0": "全部成交", "1": "部分成交", "2": "部成部撤", "3": "未成交", "4": "已撤单", "5": "已撤销"}.get(status, f"状态={status}")
         self._update_status(f"委托状态更新: {inst} {ref} {desc}")
-        # 更新本地记录的 OrderStatus 等字段
+        # 更新本地记录的 OrderStatus 等字段（同时按 OrderRef 和 OrderSysID 匹配）
+        sys_id = (pOrder.OrderSysID or "").strip()
+        front_id = pOrder.FrontID
+        session_id = pOrder.SessionID
         with self._orders_lock:
             for o in self._orders_raw:
-                if o.get("OrderRef") == ref:
+                # 按 OrderSysID 精确匹配（跨会话唯一）
+                if sys_id and str(o.get("OrderSysID", "")) == sys_id:
                     o["OrderStatus"] = status
-                    if pOrder.FrontID:
-                        o["FrontID"] = pOrder.FrontID
-                    if pOrder.SessionID:
-                        o["SessionID"] = pOrder.SessionID
-                    if pOrder.ExchangeID:
-                        o["ExchangeID"] = (pOrder.ExchangeID or "").strip()
-                    if pOrder.OrderSysID:
-                        o["OrderSysID"] = (pOrder.OrderSysID or "").strip()
+                    o["FrontID"] = front_id or o.get("FrontID", 0)
+                    o["SessionID"] = session_id or o.get("SessionID", 0)
+                    o["ExchangeID"] = (pOrder.ExchangeID or "").strip() or o.get("ExchangeID", "")
+                    break
+                # 按 OrderRef + FrontID + SessionID 匹配
+                elif o.get("OrderRef") == ref and o.get("FrontID") == front_id and o.get("SessionID") == session_id:
+                    o["OrderStatus"] = status
+                    o["ExchangeID"] = (pOrder.ExchangeID or "").strip() or o.get("ExchangeID", "")
+                    if sys_id:
+                        o["OrderSysID"] = sys_id
                     break
         self._update_tree_order()
 
@@ -620,6 +685,14 @@ class PositionManagerUI(CTdSpiBase):
             f"✅ 成交回报\n合约：{trade_instr}\n"
             f"成交手数：{trade_volume} 手\n成交价格：{trade_price}\nOrderRef：{order_ref}"
         )
+        # 从本地追踪列表中移除已成交的订单（用于自动撤单重挂）
+        with self._orders_lock:
+            for ref, item in list(self._local_orders.items()):
+                # 同时匹配 OrderRef 和合约名（因为不同会话的 OrderRef 格式可能不同）
+                if str(ref) == str(order_ref) or item.get("instrument_id", "").upper() == trade_instr.upper():
+                    self.print(f"[成交处理] {trade_instr} 从本地追踪列表移除 Ref={ref}")
+                    del self._local_orders[ref]
+                    break
         # 成交后刷新委托列表、持仓、资金
         self.master.after(0, self._on_refresh_orders)
         self.master.after(500, lambda: threading.Thread(target=self._refresh_in_thread, daemon=True).start())
@@ -704,7 +777,47 @@ class PositionManagerUI(CTdSpiBase):
             self.query_orders(timeout=10)
             self.query_trades(timeout=10)
             self._merge_submitted_orders()
+            # 将本地追踪的订单合并到 _orders_raw（这些订单可能在当前会话查询中未返回）
+            self._merge_local_orders()
             self._update_tree_order()
+
+    def _merge_local_orders(self):
+        """将本地追踪的订单合并到 _orders_raw，确保自动撤单重挂能正确判断订单状态"""
+        if not self._local_orders:
+            return
+        merged = 0
+        with self._orders_lock:
+            existing_refs = {str(o.get("OrderRef", "")) for o in self._orders_raw}
+            for ref, item in self._local_orders.items():
+                if str(ref) in existing_refs:
+                    continue
+                # 添加本地订单的简化版本（状态从 _orders_raw 中查找，找不到则用默认值）
+                local_status = "3"  # 默认未成交
+                for o in self._orders_raw:
+                    if o.get("InstrumentID", "").upper() == item["instrument_id"].upper():
+                        # 找到同合约的订单，使用其状态
+                        status = self._normalize_status(o.get("OrderStatus", ""))
+                        if status != "3":
+                            local_status = status
+                            break
+                self._orders_raw.append({
+                    "InsertTime": time.strftime("%H:%M:%S"),
+                    "InstrumentID": item["instrument_id"],
+                    "Direction": 0 if item["direction"] == tdapi.THOST_FTDC_D_Buy else 1,
+                    "CombOffsetFlag": "0",
+                    "VolumeTotalOriginal": item["volume"],
+                    "LimitPrice": item["price"],
+                    "OrderStatus": local_status,
+                    "VolumeTraded": 0,
+                    "OrderRef": ref,
+                    "OrderSysID": "",
+                    "FrontID": getattr(self, "_front_id", 0) or 0,
+                    "SessionID": getattr(self, "_session_id", 0) or 0,
+                    "ExchangeID": self._get_contract_info(item["instrument_id"]).get("ExchangeID", ""),
+                })
+                merged += 1
+        if merged:
+            self.print(f"[合并] 将 {merged} 条本地追踪订单合并到委托列表")
 
     def _refresh_account_in_thread(self):
         try:
@@ -958,6 +1071,7 @@ class PositionManagerUI(CTdSpiBase):
         """获取指定合约+方向+开平标志的未成交/部分成交委托列表"""
         result = []
         inst_upper = instrument_id.upper()
+        seen_sys_ids = set()  # 去重：不同会话可能有相同的 OrderRef，用 OrderSysID 去重
         for o in self._orders_raw:
             status = self._normalize_status(o.get("OrderStatus", ""))
             if status in ("0", "4", "5"):  # 全部成交/已撤单/已撤销
@@ -968,8 +1082,15 @@ class PositionManagerUI(CTdSpiBase):
                 continue
             if o.get("CombOffsetFlag", "") not in offset_flags:
                 continue
+            # 用 OrderSysID 去重（OrderRef 在不同会话中可能重复）
+            sys_id = str(o.get("OrderSysID", "") or "").strip()
+            if sys_id and sys_id in seen_sys_ids:
+                continue
+            if sys_id:
+                seen_sys_ids.add(sys_id)
             result.append(o)
         return result
+
 
     def _on_refresh(self):
         if not getattr(self, "is_login", False):
@@ -1103,6 +1224,15 @@ class PositionManagerUI(CTdSpiBase):
 
     def _manual_align_in_thread(self):
         """手工对齐仓位：撤掉在途差异委托，然后提交差异单"""
+        # 等待获取交易锁
+        self.print("[手工对齐] 等待交易锁...")
+        lock = get_trading_lock(timeout=10)
+        if not lock.acquire():
+            self.print("[手工对齐] 获取交易锁失败（可能被其他进程占用），跳过本次对齐")
+            self._update_status("获取交易锁失败")
+            return
+        self.print("[手工对齐] 已获取交易锁: 开始执行手工对齐")
+
         try:
             self._update_status("正在执行手工对齐...")
 
@@ -1188,9 +1318,14 @@ class PositionManagerUI(CTdSpiBase):
                     self.print(f"[对齐-撤单] {contract} 撤掉 {len(pending)} 笔未成交开仓委托")
                     for o in pending:
                         self._cancel_order(o)
-                        time.sleep(0.2)
+                        time.sleep(0.5)
+                    # 等待撤单生效
+                    time.sleep(1.5)
+                    # 撤完后刷新持仓
+                    self.query_positions(timeout=5)
+                    if self._positions_raw:
+                        self._positions_agg = self._aggregate_positions()
 
-                # 查询行情
                 md = self.query_market_data(contract, timeout=3)
                 if direction_label == "buy":
                     price = md.get("AskPrice1", 0) if md else 0
@@ -1222,10 +1357,47 @@ class PositionManagerUI(CTdSpiBase):
                     self.print(f"[对齐-撤单] {contract} 撤掉 {len(pending)} 笔未成交平仓委托")
                     for o in pending:
                         self._cancel_order(o)
-                        time.sleep(0.2)
+                        time.sleep(0.5)
+                    # 等待撤单生效
+                    time.sleep(1.5)
+                    # 刷新持仓
+                    self.query_positions(timeout=5)
+                    if self._positions_raw:
+                        self._positions_agg = self._aggregate_positions()
+
+                # 检查是否还有平仓委托（可能是其他系统/前端下的单）
+                remaining_close = self._get_pending_refs(contract, close_dir_int, ["1", "3", "4"])
+                if remaining_close:
+                    # 检查这些订单是否有 OrderSysID（可撤）或 FrontID+SessionID（当前会话可撤）
+                    cancelable = []
+                    uncancelable = []
+                    my_front = getattr(self, "_front_id", 0) or 0
+                    my_session = getattr(self, "_session_id", 0) or 0
+                    for o in remaining_close:
+                        sys_id = str(o.get("OrderSysID", "") or "").strip()
+                        front_id = o.get("FrontID", 0)
+                        session_id = o.get("SessionID", 0)
+                        if sys_id or (front_id and session_id and front_id == my_front and session_id == my_session):
+                            cancelable.append(o)
+                        else:
+                            uncancelable.append(o)
+                    if uncancelable:
+                        ref_list = ", ".join([str(o.get("OrderRef", "")) for o in uncancelable])
+                        self.print(f"[对齐-警告] {contract} 有 {len(uncancelable)} 笔平仓委托无法撤单（无OrderSysID且非同会话）: {ref_list}")
+                        notify_lines.append(f"⚠️ {contract} 有 {len(uncancelable)} 笔平仓委托无法撤单（{ref_list}），需手动处理")
+                    if cancelable:
+                        for o in cancelable:
+                            self._cancel_order(o)
+                        time.sleep(1.5)
+                        self.query_positions(timeout=5)
+                        if self._positions_raw:
+                            self._positions_agg = self._aggregate_positions()
 
                 # 找到实际持仓记录
-                actual_pos = next((p for p in self._positions_agg if p["InstrumentID"] == contract and p["PosiDirection"] == pos_dir), None)
+                # 直接重新查询持仓，避免依赖可能过时的 _positions_agg
+                current_positions = self.query_positions(timeout=5)
+                current_agg = self._aggregate_positions() if current_positions else []
+                actual_pos = next((p for p in current_agg if p["InstrumentID"] == contract and p["PosiDirection"] == pos_dir), None)
                 if not actual_pos:
                     notify_lines.append(f"❌ {contract} {'多' if pos_dir==2 else '空'}平 {volume}手 — 无持仓")
                     continue
@@ -1248,6 +1420,10 @@ class PositionManagerUI(CTdSpiBase):
             self._refresh_orders_in_thread()
             self._refresh_in_thread()
 
+            # 记录本次手工对齐处理的订单编号到 seen_order_ids.json
+            # 避免 run_pipeline.py 重复处理这些订单
+            self._mark_orders_as_processed()
+
             self._notify_async("\n".join(notify_lines))
             self._update_status("手工对齐完成")
         except Exception as e:
@@ -1255,6 +1431,48 @@ class PositionManagerUI(CTdSpiBase):
             import traceback
             self.print(traceback.format_exc())
             self._update_status(f"手工对齐失败: {e}")
+        finally:
+            lock.release()
+            self.print("[手工对齐] 已释放交易锁")
+
+    def _mark_orders_as_processed(self):
+        """将本次手工对齐提交的订单编号记录到 seen_order_ids.json，避免 run_pipeline.py 重复处理"""
+        try:
+            import datetime
+            seen_file = os.path.join(PROJECT_ROOT, "order-check", ".seen_order_ids.json")
+            today = datetime.date.today().isoformat()
+
+            # 加载现有的 seen_ids
+            if os.path.exists(seen_file):
+                with open(seen_file, "r", encoding="utf-8") as f:
+                    seen_data = json.load(f)
+            else:
+                seen_data = {}
+
+            # 获取今天的列表
+            if today not in seen_data:
+                seen_data[today] = []
+
+            seen_today = set(seen_data.get(today, []))
+            added = 0
+
+            # 从 _orders_raw 中找出本次提交的新订单（OrderSysID 非空）
+            with self._orders_lock:
+                for order in self._orders_raw:
+                    sys_id = str(order.get("OrderSysID", "")).strip()
+                    if sys_id and sys_id not in seen_today:
+                        seen_data[today].append(sys_id)
+                        seen_today.add(sys_id)
+                        added += 1
+
+            if added > 0:
+                # 保存
+                with open(seen_file, "w", encoding="utf-8") as f:
+                    json.dump(seen_data, f, ensure_ascii=False, indent=2)
+                self.print(f"[标记] 已将 {added} 个订单编号加入 seen_order_ids.json")
+
+        except Exception as e:
+            self.print(f"[_mark_orders_as_processed] 异常: {e}")
 
     @staticmethod
     def _extract_hold_field(row: dict, candidates: list) -> str:
@@ -1298,15 +1516,7 @@ class PositionManagerUI(CTdSpiBase):
         if not messagebox.askyesno("确认平仓", f"确认全部平仓？共 {len(self._positions_agg)} 个合约"):
             return
 
-        def _close_all():
-            for pos in self._positions_agg:
-                if self._has_pending_close_order(pos["InstrumentID"], pos["PosiDirection"]):
-                    self._update_status(f"{pos['InstrumentID']} 已有在途平仓委托，跳过")
-                    continue
-                self._do_close_position(pos, allow_prompt=False)
-                time.sleep(0.3)
-
-        threading.Thread(target=_close_all, daemon=True).start()
+        threading.Thread(target=self._do_close_all_batch, daemon=True).start()
 
     def _on_close_selected_best(self):
         sel = self._tree_pos.selection()
@@ -1338,15 +1548,7 @@ class PositionManagerUI(CTdSpiBase):
         if not messagebox.askyesno("确认平仓", f"确认全部对价平仓？共 {len(self._positions_agg)} 个合约"):
             return
 
-        def _close_all_best():
-            for pos in self._positions_agg:
-                if self._has_pending_close_order(pos["InstrumentID"], pos["PosiDirection"]):
-                    self._update_status(f"{pos['InstrumentID']} 已有在途平仓委托，跳过")
-                    continue
-                self._do_close_position(pos, True, allow_prompt=False)
-                time.sleep(0.3)
-
-        threading.Thread(target=_close_all_best, daemon=True).start()
+        threading.Thread(target=self._do_close_all_batch, args=(True,), daemon=True).start()
 
     def _on_cancel_order(self):
         sel = self._tree_order.selection()
@@ -1372,6 +1574,102 @@ class PositionManagerUI(CTdSpiBase):
         if not messagebox.askyesno("确认撤单", f"合约: {inst}\nOrderRef: {order_ref}\n\n确认撤单?"):
             return
         threading.Thread(target=self._cancel_order, args=(order,), daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 批量平仓执行
+    # ------------------------------------------------------------------
+    def _do_close_all_batch(self, best_price: bool = False):
+        """批量平仓：一次性查询持仓和行情，批量委托"""
+        self._update_status("开始批量平仓...")
+
+        # 1. 一次性查询所有持仓
+        self._update_status("查询持仓...")
+        current_positions = self.query_positions(timeout=5)
+        if not current_positions:
+            self._update_status("无持仓，跳过")
+            return
+
+        # 2. 聚合持仓数据
+        position_map = {}
+        for p in current_positions:
+            key = (p.get("InstrumentID", "").upper(), p.get("PosiDirection", 0))
+            if key[0]:
+                if key not in position_map:
+                    position_map[key] = {
+                        "InstrumentID": p.get("InstrumentID", ""),
+                        "PosiDirection": p.get("PosiDirection", 0),
+                        "Position": 0,
+                        "TodayPosition": 0,
+                        "YdPosition": 0,
+                        "ExchangeID": p.get("ExchangeID", ""),
+                    }
+                position_map[key]["Position"] += p.get("Position", 0)
+                position_map[key]["TodayPosition"] += p.get("TodayPosition", 0)
+                position_map[key]["YdPosition"] += p.get("YdPosition", 0)
+
+        positions_to_close = list(position_map.values())
+
+        # 3. 过滤已有在途平仓的合约
+        filtered = []
+        for pos in positions_to_close:
+            if self._has_pending_close_order(pos["InstrumentID"], pos["PosiDirection"]):
+                self._update_status(f"{pos['InstrumentID']} 已有在途平仓委托，跳过")
+            else:
+                filtered.append(pos)
+
+        if not filtered:
+            self._update_status("无有效持仓可平")
+            return
+
+        self._update_status(f"共 {len(filtered)} 个合约待平仓，正在获取行情...")
+
+        # 4. 批量获取行情
+        md_results = {}
+        for pos in filtered:
+            md = self.query_market_data(pos["InstrumentID"], timeout=3)
+            if md:
+                md_results[pos["InstrumentID"]] = md
+
+        # 5. 批量委托
+        self._update_status("批量提交平仓委托...")
+        success_count = 0
+        for pos in filtered:
+            instrument_id = pos["InstrumentID"]
+            direction = pos["PosiDirection"]
+            today = pos["TodayPosition"]
+            yd = pos["YdPosition"]
+            exchange = pos["ExchangeID"]
+
+            md = md_results.get(instrument_id, {})
+            if direction == 2:  # 多头 → 卖出平仓
+                price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+            else:  # 空头 → 买入平仓
+                price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+
+            if price <= 0:
+                self._update_status(f"{instrument_id} 无法获取行情，跳过")
+                continue
+
+            close_direction = tdapi.THOST_FTDC_D_Sell if direction == 2 else tdapi.THOST_FTDC_D_Buy
+            is_shfe = exchange in ("SHFE", "INE")
+
+            # 平今
+            if is_shfe and today > 0:
+                self._send_close_order(exchange, instrument_id, close_direction, today, price, tdapi.THOST_FTDC_OF_CloseToday, "平今", best_price=best_price)
+                time.sleep(0.2)
+
+            # 平昨/平仓
+            remaining = pos["Position"] - today if is_shfe else pos["Position"]
+            if remaining > 0:
+                offset = tdapi.THOST_FTDC_OF_CloseYesterday if is_shfe else tdapi.THOST_FTDC_OF_Close
+                label = "平昨" if is_shfe else "平仓"
+                self._send_close_order(exchange, instrument_id, close_direction, remaining, price, offset, label, best_price=best_price)
+                time.sleep(0.2)
+
+            success_count += 1
+
+        self._update_status(f"批量平仓完成：{success_count}/{len(filtered)} 个合约")
+        self._refresh_orders_in_thread()
 
     # ------------------------------------------------------------------
     # 平仓执行
@@ -1531,6 +1829,18 @@ class PositionManagerUI(CTdSpiBase):
 
         ret = self._api.ReqOrderInsert(req, 0)
         if ret == 0:
+            # 追踪本地委托，用于自动撤单重挂（只追踪开仓委托）
+            if offset_flag == tdapi.THOST_FTDC_OF_Open:
+                self._local_orders[order_ref] = {
+                    "submit_time": time.time(),
+                    "instrument_id": exact_id,
+                    "direction": direction,
+                    "offset_flag": offset_flag,
+                    "volume": volume,
+                    "price": price,
+                    "replace_count": 0,
+                    "orig_ref": "",
+                }
             price_str = str(price) if (best_price and price > 0) or not best_price else "对价"
             msg = f"{label}已提交: {exact_id} {dname} {volume}手 价={price_str} Ref={order_ref}"
             self._update_status(msg)
@@ -1597,6 +1907,17 @@ class PositionManagerUI(CTdSpiBase):
 
         ret = self._api.ReqOrderInsert(req, 0)
         if ret == 0:
+            # 追踪本地委托，用于自动撤单重挂
+            self._local_orders[order_ref] = {
+                "submit_time": time.time(),
+                "instrument_id": exact_id,
+                "direction": direction,
+                "offset_flag": tdapi.THOST_FTDC_OF_Open,
+                "volume": volume,
+                "price": price,
+                "replace_count": 0,
+                "orig_ref": "",
+            }
             msg = f"开仓已提交: {exact_id} {dname} {volume}手 价={price} Ref={order_ref}"
             self._update_status(msg)
             self._notify_async(f"📤 {msg}")
@@ -1612,11 +1933,59 @@ class PositionManagerUI(CTdSpiBase):
     def _cancel_order(self, order: dict):
         """撤单：优先使用 OrderSysID，其次用 FrontID + SessionID + OrderRef"""
         inst = order.get("InstrumentID", "")
-        ref = order.get("OrderRef", "")
+        ref = str(order.get("OrderRef", "")).strip()
         front_id = order.get("FrontID", 0)
         session_id = order.get("SessionID", 0)
         exchange_id = order.get("ExchangeID", "")
-        sys_id = (order.get("OrderSysID", "") or "").strip()
+        sys_id = str(order.get("OrderSysID", "") or "").strip()
+
+        self.print(f"[撤单] >>> 开始撤单: {inst} Ref={ref} FrontID={front_id} SessionID={session_id} OrderSysID={sys_id}")
+
+        # 撤单前重新查询订单列表，获取最新状态避免本地缓存滞后
+        try:
+            with self._orders_lock:
+                self._orders_raw = []
+            self.query_orders(timeout=10)
+            with self._orders_lock:
+                found = None
+                # 优先用 OrderSysID 精确匹配（跨会话唯一）
+                if sys_id:
+                    for o in self._orders_raw:
+                        o_sys = str(o.get("OrderSysID", "") or "").strip()
+                        if o_sys == sys_id:
+                            found = o
+                            break
+                # 次选用 OrderRef + FrontID + SessionID 组合匹配
+                if not found and ref:
+                    for o in self._orders_raw:
+                        o_ref = str(o.get("OrderRef", "")).strip()
+                        o_front = o.get("FrontID", 0)
+                        o_session = o.get("SessionID", 0)
+                        if o_ref == ref and o_front == front_id and o_session == session_id:
+                            found = o
+                            break
+                if found:
+                    status = self._normalize_status(found.get("OrderStatus", ""))
+                    found_sys_id = str(found.get("OrderSysID", "") or "").strip()
+                    self.print(f"[撤单] CTP匹配到: Ref={found.get('OrderRef')} SysID={found_sys_id} Status={status} FrontID={found.get('FrontID')} SessionID={found.get('SessionID')}")
+                    if status in ("0", "4", "5"):
+                        self.print(f"[撤单跳过] {inst} CTP状态={status}，已是终态不重复撤单")
+                        return
+                    # 以CTP最新查到的为准，更新关键字段
+                    front_id = found.get("FrontID", 0) or front_id
+                    session_id = found.get("SessionID", 0) or session_id
+                    exchange_id = found.get("ExchangeID", "") or exchange_id
+                    sys_id = str(found.get("OrderSysID", "") or "").strip() or sys_id
+                else:
+                    self.print(f"[撤单] CTP未查到订单（SysID={sys_id} Ref={ref} FrontID={front_id} SessionID={session_id}），尝试按传入字段撤单")
+        except Exception as e:
+            self.print(f"[撤单] {inst} Ref={ref} 状态查询异常: {e}，按本地状态继续")
+
+        # 本地预检查：若本地状态已是终态，也跳过
+        local_status = self._normalize_status(order.get("OrderStatus", ""))
+        if local_status in ("0", "4", "5"):
+            self.print(f"[撤单跳过] {inst} Ref={ref} 本地状态={local_status}，已是终态不重复撤单")
+            return
 
         exact_id = self._standardize_contract(inst)
         if not exchange_id:
@@ -1633,13 +2002,13 @@ class PositionManagerUI(CTdSpiBase):
         if sys_id:
             # 优先使用 OrderSysID 撤单（跨会话也有效）
             req.OrderSysID = sys_id
-            self.print(f"[撤单] {inst} Ref={ref} 使用 OrderSysID={sys_id}")
+            self.print(f"[撤单] 发送请求: {inst} OrderSysID={sys_id}")
         else:
             # 回退到 FrontID + SessionID + OrderRef
             req.FrontID = front_id or getattr(self, "_front_id", 0) or 0
             req.SessionID = session_id or getattr(self, "_session_id", 0) or 0
             req.OrderRef = ref
-            self.print(f"[撤单] {inst} Ref={ref} FrontID={req.FrontID} SessionID={req.SessionID}")
+            self.print(f"[撤单] 发送请求: {inst} FrontID={req.FrontID} SessionID={req.SessionID} OrderRef={ref}")
 
         ret = self._api.ReqOrderAction(req, 0)
         if ret == 0:
@@ -1647,6 +2016,159 @@ class PositionManagerUI(CTdSpiBase):
         else:
             self._update_status(f"撤单提交失败: {inst} Ref={ref} 返回值={ret}")
             self._notify_async(f"❌ 撤单提交失败: {inst} Ref={ref} 返回值={ret}")
+
+    # ------------------------------------------------------------------
+    # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
+    # ------------------------------------------------------------------
+    def _start_replace_monitor(self):
+        """启动自动撤单重挂监控线程"""
+        if self._replace_monitor_thread and self._replace_monitor_thread.is_alive():
+            return
+        self._replace_stop_event.clear()
+        self._replace_monitor_thread = threading.Thread(
+            target=self._replace_monitor_loop, daemon=True
+        )
+        self._replace_monitor_thread.start()
+        self.print("[监控] 自动撤单重挂监控线程已启动")
+
+    def _stop_replace_monitor(self):
+        """停止自动撤单重挂监控线程"""
+        self._replace_stop_event.set()
+        if self._replace_monitor_thread and self._replace_monitor_thread.is_alive():
+            self._replace_monitor_thread.join(timeout=3)
+        self.print("[监控] 自动撤单重挂监控线程已停止")
+
+    def _replace_monitor_loop(self):
+        """监控循环：每 10 秒检查一次未成交开仓委托"""
+        while not self._replace_stop_event.is_set():
+            self._replace_stop_event.wait(timeout=10)
+            if not getattr(self, "is_login", False):
+                continue
+            try:
+                self._check_and_replace_pending_orders()
+            except Exception as e:
+                self.print(f"[监控异常] 自动撤单重挂检查出错: {e}")
+                import traceback
+                self.print(traceback.format_exc())
+
+    def _check_and_replace_pending_orders(self):
+        """扫描未成交委托（含开平仓），超时则撤单并用最新对手价重挂"""
+        now = time.time()
+        orders_to_replace = []
+
+        # 调试日志：打印当前追踪的订单
+        self.print(f"[自动撤单检查] 当前追踪 {len(self._local_orders)} 个订单:")
+        for ref, item in self._local_orders.items():
+            elapsed = now - item["submit_time"]
+            self.print(f"  Ref={ref} {item['instrument_id']} 开仓 {item['direction']} {item['volume']}手 "
+                        f"已提交 {elapsed:.0f}秒 重挂 {item['replace_count']}次")
+
+        with self._orders_lock:
+            for ref, item in list(self._local_orders.items()):
+                # 只处理开仓委托
+                if item["offset_flag"] != tdapi.THOST_FTDC_OF_Open:
+                    continue
+                # 检查是否已终态（全部成交/已撤单/已撤销）
+                local_order = next((o for o in self._orders_raw if str(o.get("OrderRef", "")) == str(ref)), None)
+                if local_order:
+                    status = self._normalize_status(local_order.get("OrderStatus", ""))
+                    if status in ("0", "4", "5"):  # 全部成交/已撤单/已撤销
+                        self.print(f"[自动撤单] {item['instrument_id']} Ref={ref} 已是终态(Status={status})，从追踪列表移除")
+                        del self._local_orders[ref]
+                        continue
+                # 检查超时
+                elapsed = now - item["submit_time"]
+                if elapsed < self._ORDER_TIMEOUT_SECONDS:
+                    continue
+                # 检查重挂次数
+                if item["replace_count"] >= self._MAX_REPLACE_COUNT:
+                    self.print(f"[自动撤单] {item['instrument_id']} 已重挂 {item['replace_count']} 次，达到上限，不再处理")
+                    # 从追踪列表移除
+                    del self._local_orders[ref]
+                    continue
+                orders_to_replace.append((ref, item))
+
+        if not orders_to_replace:
+            return
+
+        for ref, item in orders_to_replace:
+            instr = item["instrument_id"]
+            direction = item["direction"]
+            volume = item["volume"]
+            orig_ref = ref
+            dname = "买" if direction == tdapi.THOST_FTDC_D_Buy else "卖"
+            self.print(
+                f"[自动撤单] {instr} {dname}开仓 {volume}手 "
+                f"超时 {self._ORDER_TIMEOUT_SECONDS} 秒未成交，执行撤单重挂"
+            )
+
+            # 撤单
+            order_to_cancel = next((o for o in self._orders_raw if str(o.get("OrderRef", "")) == str(ref)), None)
+            if order_to_cancel:
+                self._cancel_order(order_to_cancel)
+            else:
+                self.print(f"[自动撤单] {instr} 本地未找到 Ref={ref}，跳过")
+                continue
+
+            time.sleep(0.5)
+
+            # 查询最新行情
+            md = self.query_market_data(instr, timeout=3)
+            if not md:
+                self.print(f"[自动撤单] {instr} 无法获取行情，跳过重挂")
+                continue
+
+            # 取价逻辑：优先最新成交价，其次对手价
+            limit_price = 0.0
+            last_price = md.get("LastPrice", 0)
+            if last_price > 0:
+                limit_price = last_price
+            if direction == tdapi.THOST_FTDC_D_Buy:
+                # 买开：优先卖价（对手价），其次买价，最后最新价
+                ask = md.get("AskPrice1", 0)
+                bid = md.get("BidPrice1", 0)
+                if ask > 0:
+                    limit_price = ask
+                elif bid > 0:
+                    limit_price = bid
+            else:
+                # 卖开：优先买价（对手价），其次卖价，最后最新价
+                bid = md.get("BidPrice1", 0)
+                ask = md.get("AskPrice1", 0)
+                if bid > 0:
+                    limit_price = bid
+                elif ask > 0:
+                    limit_price = ask
+
+            if limit_price <= 0:
+                self.print(f"[自动撤单] {instr} 无有效价格，跳过重挂")
+                continue
+
+            new_replace_count = item["replace_count"] + 1
+            exchange_id = self._get_contract_info(instr).get("ExchangeID", "")
+
+            self.print(
+                f"[自动重挂] {instr} {dname}开仓 {volume}手 "
+                f"限价={limit_price} (第 {new_replace_count} 次重挂)"
+            )
+
+            # 重新下单
+            self._send_open_order(exchange_id, instr, direction, volume, limit_price)
+
+            # 更新追踪信息（新的 Ref 会在 _send_open_order 中创建）
+            # 标记原订单为已处理（不再监控）
+            if orig_ref in self._local_orders:
+                self._local_orders[orig_ref]["submit_time"] = 0  # 标记为已完成
+
+            self._notify_async(
+                f"🔄 自动撤单重挂\n"
+                f"合约：{instr}\n"
+                f"开平：开仓\n"
+                f"方向：{dname}\n"
+                f"手数：{volume}\n"
+                f"新价格：{limit_price}\n"
+                f"重挂次数：{new_replace_count}"
+            )
 
     def _on_cancel_all_orders(self):
         """撤销所有未成交/部分成交的委托单"""
@@ -1693,17 +2215,29 @@ class PositionManagerUI(CTdSpiBase):
             self._notify_async(msg)
             # ErrorID=1010 订单不存在 / 1011 订单已成交或已撤销：更新本地状态避免反复撤单
             if pRspInfo.ErrorID in (1010, 1011):
+                updated = False
                 with self._orders_lock:
                     for o in self._orders_raw:
-                        if ref and o.get("OrderRef") == ref:
-                            o["OrderStatus"] = "5"  # 已撤销
-                            self.print(f"[{pRspInfo.ErrorID}处理] {inst} Ref={ref} 标记为已撤销")
-                            break
-                        elif sys_id and o.get("OrderSysID") == sys_id:
+                        o_ref = str(o.get("OrderRef", "")).strip()
+                        o_sys = str(o.get("OrderSysID", "")).strip()
+                        # 按 OrderRef 或 OrderSysID 匹配（OrderRef 更精确优先）
+                        if ref and o_ref == ref:
                             o["OrderStatus"] = "5"
-                            self.print(f"[{pRspInfo.ErrorID}处理] {inst} SysID={sys_id} 标记为已撤销")
-                            break
-                self._update_tree_order()
+                            self.print(f"[{pRspInfo.ErrorID}处理] {inst} Ref={ref} SysID={sys_id} 标记为已撤销")
+                            updated = True
+                        elif sys_id and o_sys == sys_id and not updated:
+                            o["OrderStatus"] = "5"
+                            self.print(f"[{pRspInfo.ErrorID}处理] {inst} Ref={ref} SysID={sys_id} 标记为已撤销")
+                            updated = True
+                        elif not ref and not sys_id and not updated:
+                            # 无法精确匹配，尝试按合约名+状态模糊匹配
+                            o_status = self._normalize_status(o.get("OrderStatus", ""))
+                            if o.get("InstrumentID", "").upper() == inst.upper() and o_status not in ("0", "4", "5"):
+                                o["OrderStatus"] = "5"
+                                self.print(f"[{pRspInfo.ErrorID}处理] {inst} Ref={o_ref} SysID={o_sys} 模糊标记为已撤销")
+                                updated = True
+                if updated:
+                    self._update_tree_order()
         else:
             self._update_status(f"撤单成功: {inst} Ref={ref}")
             # 刷新委托列表
@@ -1718,6 +2252,7 @@ class PositionManagerUI(CTdSpiBase):
     def _on_close(self):
         if hasattr(self, "_stop_poll"):
             self._stop_poll.set()
+        self._stop_replace_monitor()
         try:
             self.master.destroy()
         except Exception:

@@ -211,6 +211,9 @@ class PositionSyncManager(CTdSpiBase):
         # 完整仓位对齐冷却（2分钟）
         self._last_full_sync_time: float = 0.0
 
+        # 首次运行标志：只在第一次执行同步时为 True
+        self._is_first_run: bool = True
+
         # 持仓查询锁：防止后台线程和用户操作并发查询导致数据错乱
         self._pos_query_lock = threading.Lock()
 
@@ -245,10 +248,13 @@ class PositionSyncManager(CTdSpiBase):
         self._start_replace_monitor()
 
     def _notify_async(self, text: str):
-        """异步发送飞书通知，避免 HTTP 阻塞报单流程"""
-        threading.Thread(
-            target=self._feishu.send_text, args=(text,), daemon=True
-        ).start()
+        """异步发送飞书通知，完全不阻塞"""
+        def _send():
+            try:
+                self._feishu.send_text(text)
+            except Exception:
+                pass  # 完全忽略异常
+        threading.Thread(target=_send, daemon=True).start()
 
     # ------------------------------------------------------------------
     # 持久化状态（重启后不丢失）
@@ -443,7 +449,8 @@ class PositionSyncManager(CTdSpiBase):
         try:
             with open(self.hold_std_path, "r", encoding="utf-8") as f:
                 self._hold_std = json.load(f)
-            self.print(f"[信息] 已加载标准持仓 {len(self._hold_std)} 条")
+            total_vol = sum(int(str(item.get("手数", "0") or "0")) for item in self._hold_std)
+            self.print(f"[信息] 已加载标准持仓 {len(self._hold_std)} 个合约，共 {total_vol} 手")
             return True
         except Exception as e:
             self.print(f"[错误] 加载 hold-std.json 失败: {e}")
@@ -616,14 +623,17 @@ class PositionSyncManager(CTdSpiBase):
                 except (ValueError, TypeError):
                     posi_dir_val = 0
 
-                self._actual_positions.append({
-                    "InstrumentID": (pInvestorPosition.InstrumentID or "").strip().upper(),
-                    "PosiDirection": posi_dir_val,
-                    "Position": pInvestorPosition.Position,
-                    "TodayPosition": pInvestorPosition.TodayPosition,
-                    "YdPosition": pInvestorPosition.YdPosition,
-                    "ExchangeID": (pInvestorPosition.ExchangeID or "").strip(),
-                })
+                # 过滤净持仓记录(1)，只保留多头(2)/空头(3)明细
+                # 避免净持仓与明细重复计数，或方向不匹配导致误判空仓
+                if posi_dir_val in (2, 3):
+                    self._actual_positions.append({
+                        "InstrumentID": (pInvestorPosition.InstrumentID or "").strip().upper(),
+                        "PosiDirection": posi_dir_val,
+                        "Position": pInvestorPosition.Position,
+                        "TodayPosition": pInvestorPosition.TodayPosition,
+                        "YdPosition": pInvestorPosition.YdPosition,
+                        "ExchangeID": (pInvestorPosition.ExchangeID or "").strip(),
+                    })
         if bIsLast:
             self._pos_query_event.set()
 
@@ -951,6 +961,7 @@ class PositionSyncManager(CTdSpiBase):
         with self._order_lock:
             info = self._orders.get(order_ref)
             if not info:
+                self.print(f"[撤单] OrderRef={order_ref} 不在订单列表中")
                 return False
 
         req = tdapi.CThostFtdcInputOrderActionField()
@@ -969,13 +980,31 @@ class PositionSyncManager(CTdSpiBase):
             req.OrderRef = order_ref
 
         cancel_event = threading.Event()
+        cancel_result = [None]  # None=未返回, True=成功, False=失败
         with self._order_lock:
             self._cancel_events[order_ref] = cancel_event
+            self._cancel_result = cancel_result
 
         self.print(f"[撤单] {info['instr']} OrderRef={order_ref}")
         self._api.ReqOrderAction(req, 0)
-        cancel_event.wait(timeout=3)
-        return True
+
+        # 等待最多 3 秒，同时检查撤单结果
+        timeout = 3
+        waited = 0
+        while waited < timeout:
+            if cancel_event.wait(timeout=0.5):
+                break
+            waited += 0.5
+            # 检查结果是否已知
+            if cancel_result[0] is not None:
+                return cancel_result[0]
+
+        # 超时或结果已知
+        if cancel_result[0] is None:
+            # 超时，保守返回 True 让调用者继续
+            self.print(f"[撤单] OrderRef={order_ref} 等待响应超时，保守处理")
+            return True
+        return cancel_result[0]
 
     # ------------------------------------------------------------------
     # CTP 回调
@@ -984,8 +1013,14 @@ class PositionSyncManager(CTdSpiBase):
         """统一处理报单拒绝/错误回报"""
         if not pRspInfo or pRspInfo.ErrorID == 0:
             return
-        ref = (pInputOrder.OrderRef or "").strip() if pInputOrder else ""
+        # 尝试多种方式匹配订单
+        ref = ""
         inst = (pInputOrder.InstrumentID or "").strip() if pInputOrder else ""
+        if pInputOrder:
+            ref_raw = str(pInputOrder.OrderRef or "").strip('\x00')
+            ref = ref_raw.strip()
+            if not ref:
+                ref = ref_raw
         err_id = pRspInfo.ErrorID
         err_msg = getattr(pRspInfo, "ErrorMsg", "")
         msg = f"❌ {source}: {inst} Ref={ref} ErrorID={err_id} {err_msg}"
@@ -1000,7 +1035,11 @@ class PositionSyncManager(CTdSpiBase):
         # ErrorID=1009 持仓不足：如果是平仓单，撤掉该合约所有未成交平仓委托，下次重新计算后重试
         if err_id == 1009 and inst:
             with self._order_lock:
-                info = self._orders.get(ref)
+                info = None
+                for key in (ref, ref_raw if ref_raw else "", ref.lstrip() if ref else ""):
+                    if key and key in self._orders:
+                        info = self._orders.get(key)
+                        break
                 if info:
                     offset = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
                     if offset != tdapi.THOST_FTDC_OF_Open:
@@ -1042,14 +1081,30 @@ class PositionSyncManager(CTdSpiBase):
         self._handle_order_rejection(pInputOrder, pRspInfo, "报单错误回报")
 
     def OnRtnOrder(self, pOrder: tdapi.CThostFtdcOrderField):
-        order_ref = str(pOrder.OrderRef or "").strip().strip('\x00')
+        order_ref_raw = str(pOrder.OrderRef or "").strip('\x00')
+        order_ref = order_ref_raw.strip()
         sys_id = str(pOrder.OrderSysID or "").strip().strip('\x00')
         status = str(pOrder.OrderStatus or "").strip().strip('\x00')
 
         with self._order_lock:
+            # 精确匹配
             info = self._orders.get(order_ref)
             if not info:
+                # 尝试用原始值（未 strip）匹配
+                info = self._orders.get(order_ref_raw)
+            if not info:
+                # 尝试模糊匹配：去掉前导空格后匹配
+                order_ref_lstrip = order_ref_raw.lstrip()
+                info = self._orders.get(order_ref_lstrip)
+            if not info:
+                # 最后尝试：用 sys_id + exchange 组合匹配
+                for ref, oi in self._orders.items():
+                    if oi.get("sys_id") == sys_id and oi.get("exchange") == str(pOrder.ExchangeID or "").strip():
+                        info = oi
+                        break
+            if not info:
                 return
+
             info["status"] = status
             if sys_id:
                 info["sys_id"] = sys_id
@@ -1074,7 +1129,8 @@ class PositionSyncManager(CTdSpiBase):
         self._update_order_file_status(order_ref, status, sys_id, session_id=session_id)
 
     def OnRtnTrade(self, pTrade: tdapi.CThostFtdcTradeField):
-        order_ref = str(getattr(pTrade, "OrderRef", "") or "").strip().strip('\x00')
+        order_ref_raw = str(getattr(pTrade, "OrderRef", "") or "").strip('\x00')
+        order_ref = order_ref_raw.strip()
         # 安全读取价格/数量（防御性转换，兼容不同 CTP 绑定版本）
         raw_price = getattr(pTrade, "Price", 0.0)
         try:
@@ -1091,7 +1147,23 @@ class PositionSyncManager(CTdSpiBase):
         trade_offset = str(getattr(pTrade, "OffsetFlag", "") or "").strip().strip('\x00')
 
         with self._order_lock:
+            # 精确匹配
             info = self._orders.get(order_ref)
+            if not info:
+                # 尝试用原始值匹配
+                info = self._orders.get(order_ref_raw)
+            if not info:
+                # 尝试模糊匹配
+                order_ref_lstrip = order_ref_raw.lstrip()
+                info = self._orders.get(order_ref_lstrip)
+            if not info:
+                # 用 SysID + Exchange 匹配
+                trade_sys_id = str(getattr(pTrade, "OrderSysID", "") or "").strip()
+                exchange_id = str(getattr(pTrade, "ExchangeID", "") or "").strip()
+                for ref, oi in self._orders.items():
+                    if oi.get("sys_id") == trade_sys_id and oi.get("exchange") == exchange_id:
+                        info = oi
+                        break
 
         instr = info["instr"] if info else trade_instr
         if not instr:
@@ -1124,19 +1196,47 @@ class PositionSyncManager(CTdSpiBase):
         nRequestID: int,
         bIsLast: bool,
     ):
-        order_ref = (pInputOrderAction.OrderRef or "").strip()
+        order_ref_raw = str(pInputOrderAction.OrderRef or "").strip('\x00') if pInputOrderAction else ""
+        order_ref = order_ref_raw.strip() if order_ref_raw else ""
+
+        # 尝试多种方式匹配订单和撤单事件
+        cancel_key = None
+        with self._order_lock:
+            for key in (order_ref, order_ref_raw, order_ref_raw.lstrip() if order_ref_raw else ""):
+                if key and key in self._cancel_events:
+                    cancel_key = key
+                    break
+            info = None
+            for key in (order_ref, order_ref_raw, order_ref_raw.lstrip() if order_ref_raw else ""):
+                if key and key in self._orders:
+                    info = self._orders.get(key)
+                    break
+
         if pRspInfo and pRspInfo.ErrorID != 0:
+            display_ref = order_ref if order_ref else "未知"
             self.print(
-                f"[撤单失败] OrderRef={order_ref} "
+                f"[撤单失败] OrderRef={display_ref} "
                 f"ErrorID={pRspInfo.ErrorID} {pRspInfo.ErrorMsg}"
             )
+            if info:
+                with self._order_lock:
+                    cancel_result = getattr(self, '_cancel_result', None)
+                    if cancel_result is not None:
+                        cancel_result[0] = False
         else:
-            self.print(f"[撤单响应] OrderRef={order_ref}")
+            display_ref = order_ref if order_ref else "未知"
+            self.print(f"[撤单响应] OrderRef={display_ref}")
+            if info:
+                with self._order_lock:
+                    cancel_result = getattr(self, '_cancel_result', None)
+                    if cancel_result is not None:
+                        cancel_result[0] = True
 
         with self._order_lock:
-            ev = self._cancel_events.pop(order_ref, None)
-        if ev:
-            ev.set()
+            if cancel_key:
+                ev = self._cancel_events.pop(cancel_key, None)
+                if ev:
+                    ev.set()
 
     def _is_order_pending(self, info: dict) -> bool:
         """判断订单是否仍在途中（未最终完结）"""
@@ -1195,6 +1295,9 @@ class PositionSyncManager(CTdSpiBase):
         refs = []
         with self._order_lock:
             for ref, info in self._orders.items():
+                # 过滤掉空 ref
+                if not ref:
+                    continue
                 if not self._is_order_pending(info):
                     continue
                 if info.get("instr", "").upper() != inst_upper:
@@ -1632,7 +1735,13 @@ class PositionSyncManager(CTdSpiBase):
                 # 防御：实际持仓为 0 或 CTP 数据滞后，跳过
                 actual_pos = detail["Position"]
                 if actual_pos <= 0:
-                    self.print(f"[跳过] {eo['contract']} {'多' if eo['direction']==2 else '空'} 实际持仓为 {actual_pos}，跳过平仓（CTP 数据可能滞后）")
+                    # 打印调试信息，帮助诊断问题
+                    contract_upper = eo["contract"].upper()
+                    matching_positions = [p for p in self._actual_positions if p.get("InstrumentID", "").upper() == contract_upper]
+                    if matching_positions:
+                        self.print(f"[调试] {eo['contract']} 在 _actual_positions 中有 {len(matching_positions)} 条记录: {matching_positions}")
+                        self.print(f"[调试] 查询方向={eo['direction']}，但记录中的 PosiDirection: {[p.get('PosiDirection') for p in matching_positions]}")
+                    self.print(f"[跳过] {eo['contract']} {'多' if eo['direction']==2 else '空'} 实际持仓为 {actual_pos}，跳过平仓（CTP 数据可能滞后或方向不匹配）")
                     continue
 
                 # 防御：扣除已挂未成交平仓委托后的可用可平量
@@ -1718,10 +1827,12 @@ class PositionSyncManager(CTdSpiBase):
         if missing_orders or excess_orders:
             self.print("[结论] 持仓调整完成（缺额已补 / 超额已平）")
             self.print("=" * 60)
+            self._is_first_run = False
             return True
 
         self.print("[结论] 持仓一致，无需操作")
         self.print("=" * 60)
+        self._is_first_run = False
         return True
 
     def _build_positions(self, target: dict, timeout: int = 30) -> bool:
@@ -1842,162 +1953,168 @@ class PositionSyncManager(CTdSpiBase):
         processed_ids = set(self._processed_signal_data.get(trading_day, []))
 
         for order in orders:
-            # 报单编号去重：compare_orders 从 CSV 差集生成 signal.json，同一笔委托可能在多轮 CSV 导出后被反复识别
-            signal_id = self._extract_field(order, ["报单编号", "OrderRef", "order_ref", "ID", "id"])
-            contract = self._standardize_contract(self._extract_field(order, ["合约", "合约名", "InstrumentID", "instrument_id"]))
-            direction_str = self._extract_field(order, ["方向", "买卖", "买/卖", "Direction", "direction"])
-            offset_str = self._extract_field(order, ["开平", "开平标志", "OffsetFlag", "offset_flag", "offset"])
-            volume_str = self._extract_field(order, ["手数", "数量", "总报单量", "委托数量", "报单数量", "Volume", "volume"])
-            price_str = self._extract_field(order, ["价格", "委托价", "Price", "price", "LimitPrice"])
-
-            # 预解析字段，用于通知
-            _vol = 0
             try:
-                _vol = int(str(volume_str).strip()) if volume_str else 0
-            except ValueError:
-                pass
-            _sig = signal_id or "无编号"
+                # 报单编号去重：compare_orders 从 CSV 差集生成 signal.json，同一笔委托可能在多轮 CSV 导出后被反复识别
+                signal_id = self._extract_field(order, ["报单编号", "OrderRef", "order_ref", "ID", "id"])
+                contract = self._standardize_contract(self._extract_field(order, ["合约", "合约名", "InstrumentID", "instrument_id"]))
+                direction_str = self._extract_field(order, ["方向", "买卖", "买/卖", "Direction", "direction"])
+                offset_str = self._extract_field(order, ["开平", "开平标志", "OffsetFlag", "offset_flag", "offset"])
+                volume_str = self._extract_field(order, ["手数", "数量", "总报单量", "委托数量", "报单数量", "Volume", "volume"])
+                price_str = self._extract_field(order, ["价格", "委托价", "Price", "price", "LimitPrice"])
 
-            if signal_id and signal_id in processed_ids:
-                msg = f"⏭️ {contract} {direction_str or '?'} {_vol}手（编号{_sig}）：已处理过，跳过"
-                self.print(f"[跳过] 报单编号 {signal_id} 已处理过，避免重复提交")
-                notify_lines.append(msg)
-                skipped_count += 1
-                continue
+                # 预解析字段，用于通知
+                _vol = 0
+                try:
+                    _vol = int(str(volume_str).strip()) if volume_str else 0
+                except ValueError:
+                    pass
+                _sig = signal_id or "无编号"
 
-            if not contract or not direction_str or not volume_str:
-                self.print(f"[跳过] 委托字段不全: {order}")
-                notify_lines.append(f"⏭️ {contract or '?'} {direction_str or '?'} {_vol}手：字段不全，跳过")
-                skipped_count += 1
-                continue
-
-            try:
-                volume = int(str(volume_str).strip())
-                price = float(str(price_str).strip()) if price_str else 0.0
-            except ValueError:
-                self.print(f"[跳过] 委托数值解析失败: {order}")
-                notify_lines.append(f"⏭️ {contract} {direction_str} {_vol}手：数值解析失败，跳过")
-                skipped_count += 1
-                continue
-
-            # 方向映射
-            if direction_str in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
-                direction = tdapi.THOST_FTDC_D_Buy
-                direction_label = "buy"
-            elif direction_str in ("卖", "空头", "空", "Sell", "SELL", "sell", "S"):
-                direction = tdapi.THOST_FTDC_D_Sell
-                direction_label = "sell"
-            else:
-                self.print(f"[跳过] 未知方向: {direction_str}")
-                notify_lines.append(f"⏭️ {contract} {direction_str} {volume}手：未知方向，跳过")
-                skipped_count += 1
-                continue
-
-            # 开平映射
-            if offset_str in ("开仓", "Open", "OPEN", "open", "开"):
-                offset_flag = tdapi.THOST_FTDC_OF_Open
-            elif offset_str in ("平仓", "Close", "CLOSE", "close", "平"):
-                offset_flag = tdapi.THOST_FTDC_OF_Close
-            elif offset_str in ("平今", "CloseToday", "close_today", "closetoday"):
-                offset_flag = tdapi.THOST_FTDC_OF_CloseToday
-            elif offset_str in ("平昨", "CloseYesterday", "close_yesterday", "closeyesterday"):
-                offset_flag = tdapi.THOST_FTDC_OF_CloseYesterday
-            else:
-                # 默认按方向推断：买=开仓，卖=平仓（可调整）
-                offset_flag = tdapi.THOST_FTDC_OF_Open if direction == tdapi.THOST_FTDC_D_Buy else tdapi.THOST_FTDC_OF_Close
-                self.print(f"[警告] 未识别开平标志 '{offset_str}'，默认使用 {'开仓' if offset_flag == tdapi.THOST_FTDC_OF_Open else '平仓'}")
-
-            off_label = _offset_label(offset_flag)
-            dir_label = _dir_label(direction_label)
-
-            # --------------------------------------------------------------
-            # 平仓单防御：检查持仓是否足够 + 1009 冷却
-            # --------------------------------------------------------------
-            if offset_flag != tdapi.THOST_FTDC_OF_Open:
-                # 买平 → 需要有空仓 (PosiDirection=3)
-                # 卖平 → 需要有多仓 (PosiDirection=2)
-                required_pos_dir = 3 if direction == tdapi.THOST_FTDC_D_Buy else 2
-                actual_pos = 0
-                if current_positions:
-                    for pos in current_positions:
-                        if pos.get("InstrumentID", "").upper() == contract.upper() and pos.get("PosiDirection") == required_pos_dir:
-                            actual_pos += pos.get("Position", 0)
-                if actual_pos <= 0:
-                    self.print(f"[跳过] {contract} 平仓单：当前无对应持仓，跳过")
-                    notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：当前无对应持仓，跳过")
+                if signal_id and signal_id in processed_ids:
+                    msg = f"⏭️ {contract} {direction_str or '?'} {_vol}手（编号{_sig}）：已处理过，跳过"
+                    self.print(f"[跳过] 报单编号 {signal_id} 已处理过，避免重复提交")
+                    notify_lines.append(msg)
                     skipped_count += 1
                     continue
-                if volume > actual_pos:
-                    self.print(f"[警告] {contract} 平仓手数 {volume} 超过持仓 {actual_pos}，调整为 {actual_pos}")
-                    volume = actual_pos
-            # --------------------------------------------------------------
 
-            info = self._get_contract_info(contract)
-            exchange_id = info["ExchangeID"]
-
-            env = getattr(self, "env_name", "")
-            is_file_price = env in ("online", "simu")
-            if is_file_price:
-                # online 环境：严格使用委托文件里的价格挂限价单
-                if price <= 0:
-                    self.print(f"[跳过] {contract} 委托文件未提供有效价格，跳过报单")
-                    notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：无有效价格，跳过")
+                if not contract or not direction_str or not volume_str:
+                    self.print(f"[跳过] 委托字段不全: {order}")
+                    notify_lines.append(f"⏭️ {contract or '?'} {direction_str or '?'} {_vol}手：字段不全，跳过")
                     skipped_count += 1
                     continue
-                limit_price = price
-            else:
-                # 非 online/simu 环境（TTS/simu-vip 等）：查询市场对手价挂限价单
-                md = self.query_market_data(contract, timeout=3)
-                if direction_label == "buy":
-                    market_price = md.get("AskPrice1", 0) if md else 0
+
+                try:
+                    volume = int(str(volume_str).strip())
+                    price = float(str(price_str).strip()) if price_str else 0.0
+                except ValueError:
+                    self.print(f"[跳过] 委托数值解析失败: {order}")
+                    notify_lines.append(f"⏭️ {contract} {direction_str} {_vol}手：数值解析失败，跳过")
+                    skipped_count += 1
+                    continue
+
+                # 方向映射
+                if direction_str in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
+                    direction = tdapi.THOST_FTDC_D_Buy
+                    direction_label = "buy"
+                elif direction_str in ("卖", "空头", "空", "Sell", "SELL", "sell", "S"):
+                    direction = tdapi.THOST_FTDC_D_Sell
+                    direction_label = "sell"
                 else:
-                    market_price = md.get("BidPrice1", 0) if md else 0
-                if not market_price:
-                    market_price = md.get("LastPrice", 0) if md else 0
-                if market_price <= 0:
-                    self.print(f"[跳过] {contract} 无法获取市场价格，跳过报单")
-                    notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：无法获取市场价格，跳过")
+                    self.print(f"[跳过] 未知方向: {direction_str}")
+                    notify_lines.append(f"⏭️ {contract} {direction_str} {volume}手：未知方向，跳过")
                     skipped_count += 1
                     continue
-                limit_price = market_price
 
-            # 检查是否有相同合约+方向+开平的未成交委托，有则先撤旧单再重挂
-            pending_refs = self._get_pending_order_refs(contract, direction_label, offset_flag)
-            if pending_refs:
-                self.print(f"[撤旧单] {contract} 存在 {len(pending_refs)} 笔未成交委托，先撤单再重挂")
-                notify_lines.append(f"🔄 {contract} {dir_label}{off_label} {volume}手：撤掉 {len(pending_refs)} 笔旧单，重新挂单")
-                for ref in pending_refs:
-                    self.cancel_order(ref)
-                    time.sleep(0.2)
-            else:
-                notify_lines.append(f"🆕 {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂单")
+                # 开平映射
+                if offset_str in ("开仓", "Open", "OPEN", "open", "开"):
+                    offset_flag = tdapi.THOST_FTDC_OF_Open
+                elif offset_str in ("平仓", "Close", "CLOSE", "close", "平"):
+                    offset_flag = tdapi.THOST_FTDC_OF_Close
+                elif offset_str in ("平今", "CloseToday", "close_today", "closetoday"):
+                    offset_flag = tdapi.THOST_FTDC_OF_CloseToday
+                elif offset_str in ("平昨", "CloseYesterday", "close_yesterday", "closeyesterday"):
+                    offset_flag = tdapi.THOST_FTDC_OF_CloseYesterday
+                else:
+                    # 默认按方向推断：买=开仓，卖=平仓
+                    offset_flag = tdapi.THOST_FTDC_OF_Open if direction == tdapi.THOST_FTDC_D_Buy else tdapi.THOST_FTDC_OF_Close
+                    self.print(f"[警告] 未识别开平标志 '{offset_str}'，默认使用 {'开仓' if offset_flag == tdapi.THOST_FTDC_OF_Open else '平仓'}")
 
-            ok = self._place_order(
-                exchange_id=exchange_id,
-                instrument_id=contract,
-                direction=direction_label,
-                volume=volume,
-                limit_price=limit_price,
-                offset_flag=offset_flag,
-                wait_fill=False,
-            )
-            if ok:
-                success_count += 1
-                if signal_id:
-                    processed_ids.add(signal_id)
-                    self._processed_signal_data[trading_day] = list(processed_ids)
-                    self._save_processed_ids()
-                # 更新通知行（替换为新挂详情）
+                off_label = _offset_label(offset_flag)
+                dir_label = _dir_label(direction_label)
+
+                # --------------------------------------------------------------
+                # 平仓单防御：检查持仓是否足够
+                # --------------------------------------------------------------
+                if offset_flag != tdapi.THOST_FTDC_OF_Open:
+                    # 买平 → 需要有空仓 (PosiDirection=3)
+                    # 卖平 → 需要有多仓 (PosiDirection=2)
+                    required_pos_dir = 3 if direction == tdapi.THOST_FTDC_D_Buy else 2
+                    actual_pos = 0
+                    if current_positions:
+                        for pos in current_positions:
+                            if pos.get("InstrumentID", "").upper() == contract.upper() and pos.get("PosiDirection") == required_pos_dir:
+                                actual_pos += pos.get("Position", 0)
+                    if actual_pos <= 0:
+                        self.print(f"[跳过] {contract} 平仓单：当前无对应持仓，跳过")
+                        notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：当前无对应持仓，跳过")
+                        skipped_count += 1
+                        continue
+                    if volume > actual_pos:
+                        self.print(f"[警告] {contract} 平仓手数 {volume} 超过持仓 {actual_pos}，调整为 {actual_pos}")
+                        volume = actual_pos
+
+                info = self._get_contract_info(contract)
+                exchange_id = info["ExchangeID"]
+
+                env = getattr(self, "env_name", "")
+                is_file_price = env in ("online", "simu")
+                if is_file_price:
+                    # online/simu 环境：严格使用委托文件里的价格挂限价单
+                    if price <= 0:
+                        self.print(f"[跳过] {contract} 委托文件未提供有效价格，跳过报单")
+                        notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：无有效价格，跳过")
+                        skipped_count += 1
+                        continue
+                    limit_price = price
+                else:
+                    # 非 online/simu 环境：查询市场对手价挂限价单
+                    md = self.query_market_data(contract, timeout=3)
+                    if direction_label == "buy":
+                        market_price = md.get("AskPrice1", 0) if md else 0
+                    else:
+                        market_price = md.get("BidPrice1", 0) if md else 0
+                    if not market_price:
+                        market_price = md.get("LastPrice", 0) if md else 0
+                    if market_price <= 0:
+                        self.print(f"[跳过] {contract} 无法获取市场价格，跳过报单")
+                        notify_lines.append(f"⏭️ {contract} {dir_label}{off_label} {volume}手：无法获取市场价格，跳过")
+                        skipped_count += 1
+                        continue
+                    limit_price = market_price
+
+                # 检查是否有相同合约+方向+开平的未成交委托，有则先撤旧单再重挂
+                pending_refs = self._get_pending_order_refs(contract, direction_label, offset_flag)
                 if pending_refs:
-                    notify_lines[-1] = f"🔄 {contract} {dir_label}{off_label} {volume}手 @{limit_price}：撤旧单后新挂 (Ref={ok})"
+                    self.print(f"[撤旧单] {contract} 存在 {len(pending_refs)} 笔未成交委托，先撤单再重挂")
+                    notify_lines.append(f"🔄 {contract} {dir_label}{off_label} {volume}手：撤掉 {len(pending_refs)} 笔旧单，重新挂单")
+                    for ref in pending_refs:
+                        self.cancel_order(ref)
+                        time.sleep(0.2)
                 else:
-                    notify_lines[-1] = f"✅ {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂成功 (Ref={ok})"
-            else:
-                if pending_refs:
-                    notify_lines[-1] = f"❌ {contract} {dir_label}{off_label} {volume}手：撤旧单后新挂失败"
+                    notify_lines.append(f"🆕 {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂单")
+
+                ok = self._place_order(
+                    exchange_id=exchange_id,
+                    instrument_id=contract,
+                    direction=direction_label,
+                    volume=volume,
+                    limit_price=limit_price,
+                    offset_flag=offset_flag,
+                    wait_fill=False,
+                )
+                if ok:
+                    success_count += 1
+                    if signal_id:
+                        processed_ids.add(signal_id)
+                        self._processed_signal_data[trading_day] = list(processed_ids)
+                        self._save_processed_ids()
+                    # 更新通知行（替换为新挂详情）
+                    if pending_refs:
+                        notify_lines[-1] = f"🔄 {contract} {dir_label}{off_label} {volume}手 @{limit_price}：撤旧单后新挂 (Ref={ok})"
+                    else:
+                        notify_lines[-1] = f"✅ {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂成功 (Ref={ok})"
                 else:
-                    notify_lines[-1] = f"❌ {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂失败"
-            time.sleep(0.3)
+                    if pending_refs:
+                        notify_lines[-1] = f"❌ {contract} {dir_label}{off_label} {volume}手：撤旧单后新挂失败"
+                    else:
+                        notify_lines[-1] = f"❌ {contract} {dir_label}{off_label} {volume}手 @{limit_price}：新挂失败"
+                time.sleep(0.3)
+            except Exception as e:
+                self.print(f"[错误] 处理委托时异常: {e}")
+                import traceback
+                traceback.print_exc()
+                skipped_count += 1
+                continue
 
         pending = len(orders) - skipped_count
         self.print("=" * 60)
@@ -2246,6 +2363,10 @@ class PositionSyncManager(CTdSpiBase):
 
         for item in orders_to_replace:
             ref = item["ref"]
+            # 防御：ref 不能为空
+            if not ref:
+                self.print(f"[跳过] OrderRef 为空，跳过撤单重挂")
+                continue
             # 二次确认：释放锁后订单状态可能已变化
             with self._order_lock:
                 current_info = self._orders.get(ref)
@@ -2261,7 +2382,10 @@ class PositionSyncManager(CTdSpiBase):
             )
 
             # 撤单
-            self.cancel_order(ref)
+            cancel_ok = self.cancel_order(ref)
+            if not cancel_ok:
+                self.print(f"[跳过] 撤单失败，跳过重挂")
+                continue
             time.sleep(0.5)
 
             # 确认原单最终状态
