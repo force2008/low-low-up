@@ -1,5 +1,44 @@
 # Changelog
 
+## [2026-05-15]
+
+### Added
+- **PositionSyncManager 日志集成**：`PositionSyncManager.print()` 方法增加日志输出到 `run_pipeline.py` 的日志文件，使调试信息可见
+- 新增 `set_logger()` 方法：允许注入日志记录器
+
+### Fixed
+- **CTP 常量类型比较修复**：`order_ops.py` 和 `sync.py` 中的 CTP 常量比较（Direction、CombOffsetFlag）改为统一转换为字符串后比较，避免 int vs str 类型不匹配导致在途委托过滤失败
+- `query_orders()` 过滤未成交委托时使用字符串比较：`OrderStatus in ("1", "3")`
+- **平仓前撤销相反方向开仓委托**：平仓前先撤销与 excess 相关的在途开仓委托（如平空头时撤销买开），避免持仓计算错误
+- **新增"撤销在途"逻辑**：遍历 pending_map，对于标准持仓中不存在的开仓委托（方向/合约），直接撤销，而不是等待下次同步
+
+### Changed
+- `run_position_sync()` 函数新增 `logger` 参数：支持注入日志记录器
+- **增强调试日志**：`[调试]` 输出包含 raw repr 显示实际存储的值，便于排查 CTP 常量类型问题
+
+## [2026-05-14]
+
+### Added
+- **PositionSyncManager 重构**：拆分为 `trading/position_sync/` 目录下的多个小文件：
+  - `constants.py`: 交易时段配置常量
+  - `base.py`: CTP基类 + 初始化 + CTP回调
+  - `data.py`: 合约信息加载 + 持仓标准文件
+  - `market.py`: 行情 + 持仓 + 委托查询
+  - `order_ops.py`: 报单/撤单 + 在途委托处理
+  - `sync.py`: sync_and_trade + execute_orders
+  - `position_sync_manager.py`: 主入口（多继承组装）
+
+### Changed
+- **移除冷却时间**：`sync_and_trade` 不再使用 2 分钟冷却，直接按标准持仓对比
+- 导入路径更新：`from trading.PositionSyncManager` → `from trading.position_sync`
+
+### Fixed
+- 修复平仓方向判断 BUG：`_build_pending_map` 中空头平仓（买平）方向错误，改为 `pos_dir = 3 if direction == Buy else 2`
+- 新增 `_cancel_order_by_sysid` 方法：通过 OrderSysID 直接撤单，不依赖内存缓存
+- 修复 SHFE 合约大小写问题：`rb2610` 等上期所合约转成小写
+- 修复委托查询超时时返回 True 但未执行同步的问题
+- 修复多继承顺序导致方法被覆盖的问题（Base 在最后）
+
 ## [2026-05-11]
 
 ### Added

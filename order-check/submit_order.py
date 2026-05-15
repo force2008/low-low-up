@@ -40,7 +40,7 @@ def _ensure_mgr():
     """确保 PositionSyncManager 实例存在且已登录"""
     with _mgr_lock:
         if _mgr_holder[0] is None:
-            from trading.PositionSyncManager import PositionSyncManager
+            from trading.position_sync.position_sync_manager import PositionSyncManager
             _mgr_holder[0] = PositionSyncManager(
                 hold_std_path=_HOLD_STD_PATH,
                 main_contracts_path=_MAIN_CONTRACTS_PATH,

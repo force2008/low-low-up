@@ -226,7 +226,7 @@ def run_sync():
             logger.info("标准持仓: %d 条记录，共 %d 手", len(hold_rows), total_vol)
 
         # 执行持仓同步（PositionSyncManager 会详细打印补单/平仓日志）
-        from trading.PositionSyncManager import run_position_sync
+        from trading.position_sync.position_sync_manager import run_position_sync
         MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
 
         logger.info(">>> 开始持仓对比与同步...")
@@ -234,10 +234,12 @@ def run_sync():
             hold_std_path=hold_std_path,
             main_contracts_path=MAIN_CONTRACTS_PATH,
             trade_volume=1,
+            logger=logger,
             timeout=60,
             conf=None,
             env_name=_CTP_ENV_NAME,
         )
+        logger.info(">>> 持仓同步返回: sync_ok=%s", sync_ok)
         _last_sync_time[0] = time.time()
 
         if sync_ok:
@@ -297,7 +299,7 @@ def force_sync():
         compare_orders.generate_hold_std()
         hold_std_path = os.path.join(_CURR_DIR_SYNC, 'hold-std.json')
 
-        from trading.PositionSyncManager import run_position_sync
+        from trading.position_sync.position_sync_manager import run_position_sync
         MAIN_CONTRACTS_PATH = os.path.join(_PROJECT_ROOT_SYNC, 'data', 'contracts', 'main_contracts.json')
 
         sync_ok = run_position_sync(
@@ -307,6 +309,7 @@ def force_sync():
             timeout=60,
             conf=None,
             env_name=_CTP_ENV_NAME,
+            logger=logger,
         )
         if sync_ok:
             logger.info("强制同步完成")
@@ -533,7 +536,7 @@ def main():
     logger.info("启动持仓同步...")
     logger.info("=" * 60)
     try:
-        from trading.PositionSyncManager import run_position_sync
+        from trading.position_sync.position_sync_manager import run_position_sync
         MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
         sync_ok = run_position_sync(
             hold_std_path=hold_std_path,
@@ -542,6 +545,7 @@ def main():
             timeout=60,
             conf=None,
             env_name=_CTP_ENV_NAME,
+            logger=logger,
         )
         if sync_ok:
             logger.info("持仓同步完成")
