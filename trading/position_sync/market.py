@@ -13,7 +13,7 @@ import json
 import os
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # 把项目根目录加入路径，以便导入 ctp 模块
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,28 +26,53 @@ from ctp.base_tdapi import tdapi
 class PositionSyncManagerMarket:
     """持仓同步管理器 - 行情持仓查询部分"""
 
-    def query_market_data(self, instrument_id: str, timeout: int = 5) -> Optional[dict]:
-        """通过交易API查询合约行情快照，返回最新买卖价（线程安全）"""
+    def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2) -> Optional[dict]:
+        """通过交易API查询合约行情快照，返回最新买卖价（线程安全，支持重试）"""
         exact_id = self._standardize_contract(instrument_id)
-        with self._md_lock:
-            self._md_request_id += 1
-            req_id = self._md_request_id
-            pending = {"event": threading.Event(), "data": None}
-            self._md_pending[req_id] = pending
-        req = tdapi.CThostFtdcQryDepthMarketDataField()
-        req.InstrumentID = exact_id
-        self._api.ReqQryDepthMarketData(req, req_id)
-        ok = pending["event"].wait(timeout=timeout)
-        if not ok:
-            self.print(f"[警告] {exact_id} 行情查询超时")
-        with self._md_lock:
-            data = pending.get("data")
-            self._md_pending.pop(req_id, None)
-        return data
+        last_error = None
 
-    def query_positions(self, timeout: int = 10, retries: int = 1, blocking: bool = True) -> Optional[List[dict]]:
+        for attempt in range(max_retries + 1):
+            # 获取 request_id（使用锁保护全局计数器）
+            with self._md_lock:
+                self._md_request_id += 1
+                req_id = self._md_request_id
+                pending = {"event": threading.Event(), "data": None}
+                self._md_pending[req_id] = pending
+
+            # 发送查询请求（释放锁后再等待，避免阻塞其他查询）
+            req = tdapi.CThostFtdcQryDepthMarketDataField()
+            req.InstrumentID = exact_id
+            self._api.ReqQryDepthMarketData(req, req_id)
+            ok = pending["event"].wait(timeout=timeout)
+
+            # 获取结果（使用锁保护_pending字典）
+            with self._md_lock:
+                data = pending.get("data")
+                self._md_pending.pop(req_id, None)
+
+            if ok and data:
+                return data
+
+            last_error = f"行情查询超时 (attempt {attempt + 1}/{max_retries + 1})"
+            if attempt < max_retries:
+                time.sleep(0.5)  # 等待后重试
+
+        self.print(f"[警告] {exact_id} 行情查询连续失败: {last_error}")
+        return None
+
+    def query_market_data_batch(self, instrument_ids: List[str], timeout: int = 5) -> Dict[str, dict]:
+        """批量查询多个合约的行情（串行查询，返回字典）"""
+        result = {}
+        for inst in instrument_ids:
+            md = self.query_market_data(inst, timeout=timeout)
+            if md:
+                result[inst] = md
+        return result
+
+    def query_positions(self, timeout: int = 10, retries: int = 2, blocking: bool = True) -> Optional[List[dict]]:
         """查询持仓，超时返回 None（调用者需区分"超时"和"确实无持仓"）
         blocking=False 时若已有查询在进行则返回 None，避免竞态覆盖数据
+        retries: 最大重试次数（默认2次）
         """
         self.print("[持仓查询] 开始查询...")
         if not blocking and self._pos_query_lock.locked():
@@ -61,7 +86,7 @@ class PositionSyncManagerMarket:
                 req = tdapi.CThostFtdcQryInvestorPositionField()
                 req.BrokerID = self._broker_id
                 req.InvestorID = self._user_id
-                self.print(f"[持仓查询] 发送请求，attempt={attempt}")
+                self.print(f"[持仓查询] 发送请求，attempt={attempt + 1}/{retries + 1}")
                 self._api.ReqQryInvestorPosition(req, 0)
                 ok = self._pos_query_event.wait(timeout=timeout)
                 if ok:

@@ -143,10 +143,10 @@ class PositionSyncManagerData:
                 if inst not in self._contract_info:
                     return czce_fmt
 
-        # 3. 通过 ProductID 确定交易所：DCE/GFEX/SHFE 统一小写
+        # 3. 通过 ProductID 确定交易所：DCE/GFEX/SHFE/INE 统一小写
         product_id = inst.rstrip("0123456789")
         exchange = self._product_exchange_map.get(product_id)
-        if exchange in ("DCE", "GFEX", "SHFE"):
+        if exchange in ("DCE", "GFEX", "SHFE", "INE"):
             lower_inst = inst.lower()
             exact = self._instrument_exact_case.get(lower_inst.upper())
             if exact:
@@ -168,7 +168,13 @@ class PositionSyncManagerData:
         try:
             with open(self.hold_std_path, "r", encoding="utf-8") as f:
                 self._hold_std = json.load(f)
-            total_vol = sum(int(str(item.get("手数", "0") or "0")) for item in self._hold_std)
+            total_vol = 0
+            for item in self._hold_std:
+                vol = item.get("持仓量") or item.get("手数") or item.get("数量") or "0"
+                try:
+                    total_vol += int(float(str(vol).strip()))
+                except (ValueError, TypeError):
+                    pass
             self.print(f"[信息] 已加载标准持仓 {len(self._hold_std)} 个合约，共 {total_vol} 手")
             return True
         except Exception as e:

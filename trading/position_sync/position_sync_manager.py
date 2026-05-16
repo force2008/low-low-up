@@ -72,7 +72,7 @@ def run_position_sync(
     env_name: str = None,
     logger=None,
 ) -> bool:
-    """便捷函数：运行持仓同步"""
+    """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
     try:
         print(f"[run_position_sync] 创建 PositionSyncManager...")
@@ -84,7 +84,6 @@ def run_position_sync(
             conf=conf,
             env_name=env_name,
         )
-        # 注入日志记录器，使 PositionSyncManager.print() 输出到日志文件
         if logger:
             mgr.set_logger(logger)
         print(f"[run_position_sync] PositionSyncManager 创建成功，调用 sync_and_trade...")
@@ -110,6 +109,109 @@ def run_position_sync(
                 pass
 
 
+def run_position_sync_loop(
+    hold_std_path: str,
+    main_contracts_path: str,
+    trade_volume: int = 1,
+    conf=None,
+    env_name: str = None,
+    logger=None,
+    stop_event=None,
+) -> bool:
+    """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
+
+    逻辑：
+    1. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
+    2. 持续监控：持续对比，发现差异立即处理
+    3. 无固定间隔：不需要每N秒同步一次，有差异就处理
+
+    Args:
+        hold_std_path: 标准持仓文件路径
+        main_contracts_path: 主力合约配置路径
+        trade_volume: 交易手数
+        conf: CTP 配置
+        env_name: 环境名称
+        logger: 日志记录器
+        stop_event: 停止事件（threading.Event），设为 None 则一直运行
+
+    Returns:
+        bool: 是否正常结束
+    """
+    import threading
+    import os
+    mgr = None
+    last_hold_std_mtime = 0
+
+    def _log(msg):
+        if logger:
+            logger.info(msg)
+        print(msg)
+
+    try:
+        _log(f"[同步] 创建 PositionSyncManager...")
+        _log(f"  hold_std_path={hold_std_path}")
+        _log(f"  main_contracts_path={main_contracts_path}")
+
+        mgr = PositionSyncManager(
+            hold_std_path=hold_std_path,
+            main_contracts_path=main_contracts_path,
+            conf=conf,
+            env_name=env_name,
+        )
+        if logger:
+            mgr.set_logger(logger)
+
+        # 获取初始文件的修改时间
+        if os.path.exists(hold_std_path):
+            last_hold_std_mtime = os.path.getmtime(hold_std_path)
+
+        _log(f"[同步] PositionSyncManager 创建成功，开始监控...")
+
+        # 首次同步
+        _log("[同步] 首次同步...")
+        mgr.sync_and_trade(trade_volume=trade_volume)
+
+        # 持续监控循环
+        while True:
+            # 检查停止信号
+            if stop_event is not None and stop_event.is_set():
+                _log("[同步] 收到停止信号，退出")
+                break
+
+            # 检查 hold-std.json 是否更新
+            if os.path.exists(hold_std_path):
+                current_mtime = os.path.getmtime(hold_std_path)
+                if current_mtime > last_hold_std_mtime:
+                    _log(f"[同步] 检测到 hold-std.json 更新，执行同步...")
+                    last_hold_std_mtime = current_mtime
+                    mgr.sync_and_trade(trade_volume=trade_volume)
+                else:
+                    # 文件没变，短暂等待后继续监控
+                    threading.Event().wait(timeout=2)
+            else:
+                # 文件不存在，短暂等待
+                threading.Event().wait(timeout=2)
+
+    except Exception as e:
+        import traceback
+        _log(f"[异常] 同步循环出错: {e}")
+        traceback.print_exc()
+        return False
+    finally:
+        if mgr is not None:
+            _log("[同步] 关闭 PositionSyncManager...")
+            try:
+                mgr.shutdown()
+            except Exception:
+                pass
+            try:
+                del mgr
+            except Exception:
+                pass
+        _log("[同步] 同步循环已退出")
+        return True
+
+
 # 向后兼容：直接从 position_sync_manager 导入 PositionSyncManager
 __all__ = [
     'PositionSyncManager',
@@ -119,6 +221,7 @@ __all__ = [
     'PositionSyncManagerOrderOps',
     'PositionSyncManagerSync',
     'run_position_sync',
+    'run_position_sync_loop',
 ]
 
 

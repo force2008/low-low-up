@@ -107,6 +107,73 @@ class PositionSyncManagerOrderOps:
         )
         return order_ref
 
+    def _place_order(
+        self,
+        exchange_id: str,
+        instrument_id: str,
+        direction: str,
+        volume: int,
+        limit_price: float,
+        offset_flag: int,
+    ) -> bool:
+        """通用下单方法，支持指定开平标志，返回 True/False"""
+        exact_id = self._standardize_contract(instrument_id)
+        if exact_id.upper() in self._invalid_instruments:
+            self.print(f"[跳过] {exact_id} 在无效合约列表中（1006），跳过报单")
+            return False
+        order_ref = self._next_order_ref()
+
+        req = tdapi.CThostFtdcInputOrderField()
+        req.BrokerID = self._broker_id
+        req.InvestorID = self._user_id
+        req.ExchangeID = exchange_id
+        req.InstrumentID = exact_id
+        req.OrderRef = order_ref
+        req.LimitPrice = limit_price
+        req.OrderPriceType = tdapi.THOST_FTDC_OPT_LimitPrice
+        req.Direction = tdapi.THOST_FTDC_D_Buy if direction == "buy" else tdapi.THOST_FTDC_D_Sell
+        req.CombOffsetFlag = offset_flag
+        req.CombHedgeFlag = tdapi.THOST_FTDC_HF_Speculation
+        req.VolumeTotalOriginal = volume
+        req.IsAutoSuspend = 0
+        req.IsSwapOrder = 0
+        req.TimeCondition = tdapi.THOST_FTDC_TC_GFD
+        req.VolumeCondition = tdapi.THOST_FTDC_VC_AV
+        req.ContingentCondition = tdapi.THOST_FTDC_CC_Immediately
+        req.ForceCloseReason = tdapi.THOST_FTDC_FCC_NotForceClose
+
+        fill_event = threading.Event()
+        with self._order_lock:
+            self._orders[order_ref] = {
+                "event": fill_event,
+                "status": "submitted",
+                "sys_id": "",
+                "instr": exact_id,
+                "exchange": exchange_id,
+                "volume": volume,
+                "direction": direction,
+                "offset_flag": offset_flag,
+                "submit_time": time.time(),
+                "replace_count": 0,
+            }
+
+        ret = self._api.ReqOrderInsert(req, 0)
+        if ret != 0:
+            self.print(f"[错误] {exact_id} 报单发送失败，返回值={ret}")
+            with self._order_lock:
+                self._orders[order_ref]["status"] = "send_failed"
+            self._notify_async(
+                f"❌ 报单发送失败\n合约：{exact_id}\n方向：{direction}\n"
+                f"手数：{volume} 手\n限价：{limit_price}\n开平：{offset_flag}\n错误码：{ret}"
+            )
+            return False
+
+        self.print(
+            f"[报单] {exact_id} {direction} {volume}手 "
+            f"限价={limit_price} OrderRef={order_ref}"
+        )
+        return True
+
     def cancel_order(self, order_ref: str) -> bool:
         # 模糊匹配：尝试多种方式找到订单
         info = None
@@ -451,3 +518,141 @@ class PositionSyncManagerOrderOps:
             key = (instrument_id, pos_dir, is_open)
             result[key] = result.get(key, 0) + remain
         return result
+
+    # ------------------------------------------------------------------
+    # 自动撤单重挂监控（每 45 秒检查一次）
+    # ------------------------------------------------------------------
+    def _check_and_replace_pending_orders(self):
+        """扫描未成交委托，价格变化超过 1 个 tick 则撤单重挂"""
+        # 获取所有未成交的委托
+        pending_orders = []
+        with self._order_lock:
+            for ref, info in self._orders.items():
+                if not self._is_order_pending(info):
+                    continue
+                pending_orders.append((ref, info))
+
+        if not pending_orders:
+            return
+
+        self.print(f"[监控] 检查 {len(pending_orders)} 个未成交委托...")
+
+        # 按合约分组查询行情
+        contracts_to_query = set()
+        for ref, info in pending_orders:
+            contracts_to_query.add(info.get("instr", "").upper())
+
+        # 批量查询行情
+        market_data_map = {}
+        for contract in contracts_to_query:
+            md = self.query_market_data(contract, timeout=3, max_retries=2)
+            if md:
+                market_data_map[contract.upper()] = md
+
+        # 检查每个委托
+        cancel_list = []
+        for ref, info in pending_orders:
+            contract = info.get("instr", "").upper()
+            md = market_data_map.get(contract)
+            if not md:
+                continue
+
+            last_price = info.get("limit_price", 0) or info.get("last_md_price", 0)
+            direction = info.get("direction", "")
+            offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+
+            if direction == "buy":
+                current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+            else:
+                current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+
+            if not current_price or current_price <= 0:
+                continue
+
+            # 获取 price tick
+            info_obj = self._get_contract_info(contract.lower())
+            price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
+
+            # 检查价格变化
+            if last_price > 0 and abs(current_price - last_price) >= price_tick:
+                replace_count = info.get("replace_count", 0)
+                if replace_count >= self.MAX_REPLACE_COUNT:
+                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，不再处理")
+                    continue
+
+                cancel_list.append({
+                    "ref": ref,
+                    "info": info,
+                    "old_price": last_price,
+                    "new_price": current_price,
+                })
+
+        # 执行撤单和重挂
+        if cancel_list:
+            self.print(f"[监控] 发现 {len(cancel_list)} 个委托价格变化，需要撤单重挂")
+            for item in cancel_list:
+                self._cancel_and_replace(item, market_data_map)
+
+    def _cancel_and_replace(self, item: dict, market_data_map: dict):
+        """撤单并重挂"""
+        ref = item["ref"]
+        info = item["info"]
+        contract = info.get("instr", "")
+        direction = info.get("direction", "")
+        offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+        volume = info.get("volume", 0)
+        old_price = item["old_price"]
+        new_price = item["new_price"]
+
+        # 撤单
+        order_sys_id = info.get("sys_id", "")
+        exchange_id = info.get("exchange", "")
+        if order_sys_id:
+            self._cancel_order_by_sysid(order_sys_id, exchange_id, contract)
+        else:
+            self.cancel_order(ref)
+        time.sleep(0.5)
+
+        # 重新获取行情
+        md = market_data_map.get(contract.upper())
+        if md:
+            if direction == "buy":
+                current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+            else:
+                current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+        else:
+            current_price = new_price
+
+        # 获取交易所
+        info_obj = self._get_contract_info(contract.lower())
+        if info_obj:
+            exchange_id = info_obj.get("ExchangeID", exchange_id)
+
+        # 重挂
+        ok = self._place_order(
+            exchange_id=exchange_id,
+            instrument_id=contract,
+            direction=direction,
+            volume=volume,
+            limit_price=current_price,
+            offset_flag=offset_flag,
+        )
+
+        if ok:
+            # 更新计数
+            with self._order_lock:
+                if ref in self._orders:
+                    self._orders[ref]["replace_count"] = info.get("replace_count", 0) + 1
+
+            # 发送通知
+            d = "买" if direction == "buy" else "卖"
+            self._notify_async(
+                f"🔄 撤单重挂\n"
+                f"合约: {contract}\n"
+                f"方向: {d}\n"
+                f"原价格: {old_price}\n"
+                f"新价格: {current_price}"
+            )
+            self.print(f"[监控] {contract} 撤单重挂 @{current_price}")
+        else:
+            self.print(f"[监控] {contract} 撤单重挂失败")

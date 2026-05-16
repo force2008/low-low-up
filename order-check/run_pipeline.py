@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一键流水线：自动导出 -> 委托对比 -> 飞书通知
-使用多线程架构：
-  - 导出线程：每20秒执行导出+对比
-  - 报单线程：检测到diff时执行报单（独立线程）
-两个线程独立运行，互不阻塞
+一键流水线：自动导出 -> 持仓同步
+使用单线程架构：
+  - 导出线程：每20秒执行导出+持仓同步
+  - 持仓对齐由 PositionSyncManager.sync_and_trade() 处理，支持一次性挂出所有委托
 
 使用方式:
     python run_pipeline.py [online|simu|7x24]
@@ -18,7 +17,6 @@ import datetime
 import json
 import logging
 import threading
-import queue
 from logging.handlers import RotatingFileHandler
 
 # 确保当前目录在模块搜索路径中
@@ -139,9 +137,7 @@ def seconds_until_next_session():
 
 
 # ==================== 线程间通信 ====================
-order_queue = queue.Queue()
 shutdown_event = threading.Event()
-_active_order_thread = [None]
 _last_sync_time = [0]
 _last_key_alert_time = [None]  # 记录上次发送关键时间点提醒的日期
 # =================================================
@@ -222,7 +218,14 @@ def run_sync():
         if os.path.exists(hold_std_path):
             with open(hold_std_path, 'r', encoding='utf-8') as f:
                 hold_rows = json.load(f)
-            total_vol = sum(int(str(item.get("手数", "0") or "0")) for item in hold_rows)
+            # 支持多种字段名：持仓量、手数、数量
+            total_vol = 0
+            for item in hold_rows:
+                vol = item.get("持仓量") or item.get("手数") or item.get("数量") or "0"
+                try:
+                    total_vol += int(float(str(vol).strip()))
+                except (ValueError, TypeError):
+                    pass
             logger.info("标准持仓: %d 条记录，共 %d 手", len(hold_rows), total_vol)
 
         # 执行持仓同步（PositionSyncManager 会详细打印补单/平仓日志）
@@ -306,7 +309,7 @@ def force_sync():
             hold_std_path=hold_std_path,
             main_contracts_path=MAIN_CONTRACTS_PATH,
             trade_volume=1,
-            timeout=60,
+            timeout=120,  # 首次建仓可能需要挂出50+合约的委托
             conf=None,
             env_name=_CTP_ENV_NAME,
             logger=logger,
@@ -375,7 +378,13 @@ def run_once():
 
 
 def export_loop():
-    """导出线程：每CHECK_INTERVAL秒执行导出+对比"""
+    """导出线程：每CHECK_INTERVAL秒执行导出+同步
+
+    持仓对齐完全由 PositionSyncManager.sync_and_trade() 处理：
+    - 直接计算 target vs actual_agg → missing_orders / excess_orders
+    - 批量并行下单，不受时间限制
+    - 支持首次建仓一次性挂出所有合约的委托
+    """
     logger.info("[导出线程] 启动")
     last_heartbeat = time.time()
 
@@ -386,16 +395,9 @@ def export_loop():
                 check_key_time_and_alert()
 
                 has_diff = run_once()
-                if has_diff:
-                    order_queue.put('new_diff')
-                    logger.info("[导出线程] 已发送报单信号")
                 last_heartbeat = time.time()
 
-                # 定时持仓同步（每SYNC_INTERVAL秒）
-                if time.time() - _last_sync_time[0] >= SYNC_INTERVAL:
-                    logger.info("[导出线程] 触发定时持仓同步")
-                    if run_sync():
-                        order_queue.put('new_diff')  # 同步后可能产生新委托
+                # 注意：同步由 sync_loop() 持续监控，不需要定时调用
             else:
                 now_time = datetime.datetime.now().time()
                 wait_sec = seconds_until_next_session()
@@ -424,57 +426,6 @@ def export_loop():
     logger.info("[导出线程] 退出")
 
 
-def order_loop():
-    """报单线程：监听diff信号，启动独立线程执行报单"""
-    logger.info("[报单线程] 启动")
-    last_execution_time = 0
-
-    while not shutdown_event.is_set():
-        try:
-            try:
-                signal = order_queue.get(timeout=1)
-            except Exception as q_err:
-                logger.debug("[报单线程] 队列获取异常: %s", q_err)
-                time.sleep(0.5)
-                continue
-
-            if signal == 'new_diff':
-                current_time = time.time()
-                if current_time - last_execution_time < 3:
-                    logger.info("[报单线程] 跳过重复信号（距上次%.1f秒）", current_time - last_execution_time)
-                    continue
-
-                if _active_order_thread[0] and _active_order_thread[0].is_alive():
-                    logger.info("[报单线程] 上一个报单还在执行，跳过本次")
-                    continue
-
-                last_execution_time = current_time
-                logger.info("[报单线程] 收到报单信号，启动报单执行线程...")
-
-                def _run_order():
-                    try:
-                        import submit_order
-                        sys.argv = ['submit_order', _CTP_ENV_NAME]
-                        submit_order.main()
-                        logger.info("[报单执行线程] 报单完成")
-                    except Exception as e:
-                        logger.error("[报单执行线程] 报单异常: %s", e)
-                        import traceback
-                        logger.error(traceback.format_exc())
-
-                t = threading.Thread(target=_run_order, daemon=True, name="OrderExecution")
-                _active_order_thread[0] = t
-                t.start()
-
-        except Exception as e:
-            logger.error("[报单线程] 循环异常: %s", e)
-            import traceback
-            logger.error(traceback.format_exc())
-            time.sleep(1)
-
-    logger.info("[报单线程] 退出")
-
-
 def main():
     import signal as _signal_module
     def _signal_handler(sig, frame):
@@ -485,12 +436,10 @@ def main():
         _signal_module.signal(_signal_module.SIGTERM, _signal_handler)
 
     logger.info("=" * 60)
-    logger.info("流水线已启动（多线程模式）")
-    logger.info("  - 导出线程: 每%d秒检查并导出", CHECK_INTERVAL)
-    logger.info("  - 报单线程: 检测到diff时执行报单")
-    logger.info("  - 定时同步: 每%d秒执行持仓对齐", SYNC_INTERVAL)
+    logger.info("流水线已启动（双线程模式）")
+    logger.info("  - 导出线程: 每%d秒检查并导出，生成 hold-std.json", CHECK_INTERVAL)
+    logger.info("  - 同步线程: 持续监控，发现差异立即处理")
     logger.info("  - 关键时间: %s 强制对齐", KEY_ALIGN_TIMES)
-    logger.info("  - 启动时: 执行持仓同步")
     logger.info("  - 当前CTP环境: %s", _CTP_ENV_NAME)
     if SKIP_TRADING_TIME_CHECK:
         logger.info("  - 跳过交易时段检查")
@@ -498,11 +447,9 @@ def main():
     logger.info("按 Ctrl+C 停止")
     logger.info("=" * 60)
 
-    # 启动导出线程和报单线程（先启动，让导出线程可以并行运行）
+    # 启动导出线程（持仓对齐完全由 PositionSyncManager 处理，无报单线程）
     export_thread = threading.Thread(target=export_loop, name="ExportThread", daemon=True)
-    order_thread = threading.Thread(target=order_loop, name="OrderThread", daemon=True)
     export_thread.start()
-    order_thread.start()
 
     # 启动时先执行导出，获取最新持仓数据
     logger.info(">>> 启动时先执行导出...")
@@ -531,50 +478,51 @@ def main():
         except Exception as e:
             logger.error("生成持仓文件失败: %s", e)
 
-    # 执行持仓同步（同步到 hold-std.json）
+    # 执行持仓同步（持续运行模式，保持 CTP 连接，持续接收成交回报）
     logger.info("=" * 60)
-    logger.info("启动持仓同步...")
+    logger.info("启动持仓同步线程（持续运行模式）...")
     logger.info("=" * 60)
-    try:
-        from trading.position_sync.position_sync_manager import run_position_sync
-        MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
-        sync_ok = run_position_sync(
-            hold_std_path=hold_std_path,
-            main_contracts_path=MAIN_CONTRACTS_PATH,
-            trade_volume=1,
-            timeout=60,
-            conf=None,
-            env_name=_CTP_ENV_NAME,
-            logger=logger,
-        )
-        if sync_ok:
-            logger.info("持仓同步完成")
-        else:
-            logger.warning("持仓同步未完成")
-    except Exception as e:
-        logger.error("持仓同步异常: %s", e)
-        import traceback
-        logger.error(traceback.format_exc())
 
-    # 主线程监控，定期输出心跳
-    check_count = 0
-    while export_thread.is_alive() or order_thread.is_alive():
-        time.sleep(3)
-        check_count += 1
-        order_exec_status = "无" if _active_order_thread[0] is None else ("运行" if _active_order_thread[0].is_alive() else "停止")
-        if check_count % 3 == 0:
-            logger.info("[主线程] 心跳 - 导出线程: %s, 报单线程: %s, 报单执行: %s",
-                        "运行" if export_thread.is_alive() else "停止",
-                        "运行" if order_thread.is_alive() else "停止",
-                        order_exec_status)
-        if shutdown_event.is_set():
-            logger.info("[主线程] 收到退出信号，等待子线程退出...")
-    export_thread.join(timeout=10)
-    order_thread.join(timeout=10)
-    if export_thread.is_alive():
-        logger.warning("[主线程] 导出线程未能正常退出")
-    if order_thread.is_alive():
-        logger.warning("[主线程] 报单线程未能正常退出")
+    def sync_loop():
+        """同步线程：持续同步持仓"""
+        try:
+            from trading.position_sync.position_sync_manager import run_position_sync_loop
+            MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
+            hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
+            run_position_sync_loop(
+                hold_std_path=hold_std_path,
+                main_contracts_path=MAIN_CONTRACTS_PATH,
+                trade_volume=1,
+                conf=None,
+                env_name=_CTP_ENV_NAME,
+                logger=logger,
+                stop_event=shutdown_event,
+            )
+        except Exception as e:
+            logger.error("[同步线程] 异常: %s", e)
+            import traceback
+            logger.error(traceback.format_exc())
+
+    # 启动同步线程
+    sync_thread = threading.Thread(target=sync_loop, name="SyncThread", daemon=True)
+    sync_thread.start()
+
+    # 主线程监控，等待退出信号
+    logger.info("两个工作线程已启动：导出线程 + 同步线程")
+    logger.info("按 Ctrl+C 停止")
+    while not shutdown_event.is_set():
+        time.sleep(1)
+        if export_thread.is_alive():
+            logger.info("[主线程] 心跳 - 导出线程: 运行 | 同步线程: 运行")
+        else:
+            logger.warning("[主线程] 导出线程已停止")
+
+    # 等待同步线程退出
+    logger.info("[主线程] 收到退出信号，等待同步线程退出...")
+    sync_thread.join(timeout=10)
+    if sync_thread.is_alive():
+        logger.warning("[主线程] 同步线程未能正常退出")
+
     logger.info("流水线已退出")
 
 

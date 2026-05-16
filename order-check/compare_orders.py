@@ -290,22 +290,14 @@ def generate_hold_std():
 
 def generate_hold():
     """
-    从 CTP 查询当前持仓，生成 hold.json
-    注意：这个函数需要 CTP 连接，在流水线中由 PositionSyncManager 调用
-    流水线中会检查 hold.json 是否存在，不存在则跳过差异对比
+    占位函数，不再使用
+    hold.json 由 PositionSyncManager 在每次同步时从 CTP 查询后更新
     """
     hold_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold.json')
-
-    # 检查文件是否存在
-    if os.path.exists(hold_json_path):
-        # 已存在，不重复生成（由成交回报更新）
-        print(f"hold.json 已存在，跳过生成（如需更新请等待成交回报）")
-        return True
-
-    # 不存在则创建空文件占位
-    with open(hold_json_path, 'w', encoding='utf-8') as f:
-        json.dump([], f, ensure_ascii=False, indent=2)
-    print(f"hold.json 初始化为空文件")
+    # 确保文件存在，避免后续代码检查时报错
+    if not os.path.exists(hold_json_path):
+        with open(hold_json_path, 'w', encoding='utf-8') as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
     return True
 
 

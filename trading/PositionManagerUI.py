@@ -344,17 +344,17 @@ class PositionManagerUI(CTdSpiBase):
                 if inst not in self._contract_info:
                     return czce_fmt
 
-        # 3. 通过 ProductID 确定交易所：DCE/GFEX 统一小写
+        # 3. 通过 ProductID 确定交易所：DCE/GFEX/SHFE/INE 统一小写
         product_id = inst.rstrip("0123456789")
         exchange = self._product_exchange_map.get(product_id)
-        if exchange in ("DCE", "GFEX"):
+        if exchange in ("DCE", "GFEX", "SHFE", "INE"):
             lower_inst = inst.lower()
             exact = self._instrument_exact_case.get(lower_inst.upper())
             if exact:
                 return exact
             return lower_inst
 
-        # 未知交易所（如 SHFE 部分小写合约），保留原始大小写
+        # 未知交易所（如其他需要小写的品种），保留原始大小写
         return instrument_id.strip()
 
     def _get_contract_info(self, instrument_id: str) -> dict:

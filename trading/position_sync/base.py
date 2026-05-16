@@ -79,8 +79,15 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 持仓查询锁：防止后台线程和用户操作并发查询导致数据错乱
         self._pos_query_lock = threading.Lock()
 
-        # 行情查询（线程安全：按 request_id 隔离）
-        self._md_lock = threading.Lock()
+        # 同步互斥锁：防止并发调用 sync_and_trade
+        # 使用阻塞模式，5秒超时，避免重复同步
+        self._sync_lock = threading.Lock()
+
+        # 标记当前实例是否正在执行同步（用于进程内快速检查）
+        self._is_syncing = False
+
+        # 行情查询（线程安全：按 request_id 隔离，使用递归锁支持重入）
+        self._md_lock = threading.RLock()
         self._md_request_id = 0
         self._md_pending: Dict[int, dict] = {}
 
@@ -116,16 +123,23 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._last_hold_update_time: Dict[str, float] = {}
         self._HOLD_UPDATE_DEBOUNCE_SEC = 2.0  # 2秒内只更新一次
 
-        print("[__init__] 准备调用 super().__init__...")
-        super().__init__(conf=conf)
-        print("[__init__] super().__init__ 完成")
+        # 异步持仓更新标志（避免重复调度）
+        self._hold_update_scheduled = False
 
-        # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
+        # 先初始化监控线程相关变量（必须在 super().__init__ 之前，因为后者可能阻塞）
         self.ORDER_TIMEOUT_SECONDS = 60
         self.MAX_REPLACE_COUNT = 2
         self._replace_monitor_thread: Optional[threading.Thread] = None
         self._replace_stop_event = threading.Event()
+
+        print("[__init__] 准备调用 super().__init__...")
+        super().__init__(conf=conf)
+        print("[__init__] super().__init__ 完成，start_monitor")
+
+        # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
+        # 注意：必须在 super().__init__ 之后调用，因为后者会阻塞直到登录成功
         self._start_replace_monitor()
+        print("[__init__] 监控线程启动完成")
 
     def _notify_async(self, text: str):
         """异步发送飞书通知，完全不阻塞"""
@@ -411,10 +425,12 @@ class PositionSyncManagerBase(CTdSpiBase):
                 f"OrderRef：{order_ref}"
             )
 
-        # ========== 更新 hold.json ==========
-        # 只在新的首次成交时更新，避免重复拉取持仓
+        # ========== 异步更新 hold.json ==========
+        # 移除同步持仓查询，避免阻塞成交回报处理
+        # PositionManagerUI 就是这样处理的，批量成交会更快
+        # 如果需要更新持仓，应该由单独的线程定时执行，而不是在 OnRtnTrade 中同步查询
         if should_update_hold:
-            self._update_hold_json_from_ctp()
+            self._schedule_hold_update()
 
         # 同步成交手数到文件
         if info:
@@ -711,11 +727,14 @@ class PositionSyncManagerBase(CTdSpiBase):
 
     def _start_replace_monitor(self):
         """启动自动撤单重挂监控线程"""
+        self.print(f"[监控] 尝试启动监控线程, 当前状态: thread={self._replace_monitor_thread}")
         if self._replace_monitor_thread and self._replace_monitor_thread.is_alive():
+            self.print("[监控] 监控线程已在运行，跳过")
             return
         self._replace_stop_event.clear()
         self._replace_monitor_thread = threading.Thread(
-            target=self._replace_monitor_loop, daemon=True
+            target=self._replace_monitor_loop, daemon=True,
+            name="PositionSyncMonitor"
         )
         self._replace_monitor_thread.start()
         self.print("[监控] 自动撤单重挂监控线程已启动")
@@ -728,15 +747,116 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.print("[监控] 自动撤单重挂监控线程已停止")
 
     def _replace_monitor_loop(self):
-        """监控循环：每 10 秒检查一次未成交开仓委托"""
+        """监控循环：每 45 秒做一次仓位对比，发现差异则同步"""
+        self.print("[监控] 监控线程启动，等待首次检查...")
+        CHECK_INTERVAL = 45  # 检查间隔
         while not self._replace_stop_event.is_set():
-            self._replace_stop_event.wait(10)
+            self._replace_stop_event.wait(CHECK_INTERVAL)
             if self._replace_stop_event.is_set():
+                self.print("[监控] 收到停止信号，退出循环")
                 break
             try:
+                self.print(f"[监控] 开始第 N 次检查 (间隔 {CHECK_INTERVAL} 秒)")
+                # 1. 先检查未成交委托是否需要撤单重挂
                 self._check_and_replace_pending_orders()
+
+                # 2. 做一次仓位对比
+                self._check_position_diff()
+                self.print("[监控] 本次检查完成")
             except Exception as e:
-                self.print(f"[监控异常] 自动撤单重挂检查出错: {e}")
+                import traceback
+                self.print(f"[监控异常] 监控检查出错: {e}")
+                self.print(traceback.format_exc())
+
+    def _check_position_diff(self):
+        """检查仓位差异，有差异则同步"""
+        # 获取锁，防止与 sync_and_trade 并发
+        if not self._sync_lock.acquire(blocking=True, timeout=5):
+            self.print("[监控] 锁被占用，跳过本次检查")
+            return
+
+        try:
+            # 查询 CTP 实际持仓
+            positions = self.query_positions(timeout=10)
+            if positions is None:
+                self.print("[监控] 持仓查询失败")
+                return
+
+            # 加载标准持仓
+            if not self._load_hold_std():
+                self.print("[监控] 加载标准持仓失败")
+                return
+
+            # 聚合持仓
+            actual_agg = self._aggregate_actual_positions()
+            target = self._parse_hold_std()
+
+            # 计算差异
+            missing = []
+            excess = []
+            for key, t_vol in target.items():
+                a_vol = actual_agg.get(key, 0)
+                if t_vol > a_vol:
+                    contract, direction = key
+                    missing.append({
+                        "contract": contract,
+                        "direction": "buy" if direction == 2 else "sell",
+                        "volume": t_vol - a_vol,
+                    })
+
+            for key, a_vol in actual_agg.items():
+                t_vol = target.get(key, 0)
+                if a_vol > t_vol:
+                    contract, direction = key
+                    excess.append({
+                        "contract": contract,
+                        "direction": direction,
+                        "volume": a_vol - t_vol,
+                    })
+
+            if missing or excess:
+                # 有差异，发送通知并执行同步
+                lines = ["🔄 45秒检测到仓位差异，准备同步："]
+                if missing:
+                    total_missing = sum(mo["volume"] for mo in missing)
+                    lines.append(f"📈 缺额开仓 ({len(missing)} 个合约，共 {total_missing} 手):")
+                    for mo in missing[:5]:
+                        d = "买" if mo["direction"] == "buy" else "卖"
+                        lines.append(f"  {mo['contract']} {d} {mo['volume']}手")
+                    if len(missing) > 5:
+                        lines.append(f"  ... 等共 {len(missing)} 个")
+                if excess:
+                    total_excess = sum(eo["volume"] for eo in excess)
+                    lines.append(f"📉 超额平仓 ({len(excess)} 个合约，共 {total_excess} 手):")
+                    for eo in excess[:5]:
+                        d = "多" if eo["direction"] == 2 else "空"
+                        lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
+                    if len(excess) > 5:
+                        lines.append(f"  ... 等共 {len(excess)} 个")
+
+                self._notify_async("\n".join(lines))
+                self.print(f"[监控] 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个")
+
+                # 执行同步（已持有锁，传入 lock_held=True）
+                self._do_sync(trade_volume=1, lock_held=True)
+            else:
+                # 无差异也要发送定期通知，让用户知道系统一直在检查
+                total_target = sum(t for t in target.values())
+                total_actual = sum(a for a in actual_agg.values())
+                self._notify_async(
+                    f"✅ 45秒持仓检测\n"
+                    f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
+                    f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
+                    f"状态: 仓位一致 ✓"
+                )
+                self.print("[监控] 45秒检测: 仓位一致")
+
+        except Exception as e:
+            import traceback
+            self.print(f"[监控] 检查仓位差异异常: {e}")
+            traceback.print_exc()
+        finally:
+            self._sync_lock.release()
 
     def _next_order_ref(self) -> str:
         with self._order_lock:
@@ -752,8 +872,76 @@ class PositionSyncManagerBase(CTdSpiBase):
         """使用已查询的持仓数据更新 hold.json 文件"""
         pass
 
+    def _schedule_hold_update(self):
+        """安排异步持仓更新（避免阻塞成交回报）"""
+        # 使用定时器，延迟 2 秒后执行，给批量成交留出时间
+        def _delayed_update():
+            try:
+                self._update_hold_json_from_ctp_async()
+            except Exception:
+                pass
+        # 只在还没有待执行的更新时安排新任务
+        if not getattr(self, '_hold_update_scheduled', False):
+            self._hold_update_scheduled = True
+            threading.Timer(2.0, _delayed_update).start()
+
+    def _update_hold_json_from_ctp_async(self):
+        """从 CTP 异步查询持仓并更新 hold.json（供成交回报调用）"""
+        try:
+            positions = self.query_positions(timeout=5)
+            if positions is None:
+                self.print("[异步更新hold] 持仓查询失败")
+                return
+
+                # 聚合持仓
+                aggregated = {}
+                for pos in positions:
+                    contract = pos.get("InstrumentID", "")
+                    if not contract:
+                        continue
+
+                    today_vol = int(pos.get("TodayPosition", 0) or 0)
+                    yd_vol = int(pos.get("YdPosition", 0) or 0)
+                    total_vol = today_vol + yd_vol
+                    if total_vol == 0:
+                        continue
+
+                    pos_dir = pos.get("PosiDirection", 0)
+                    if pos_dir == 2:
+                        direction = "买"
+                    elif pos_dir == 3:
+                        direction = "卖"
+                    else:
+                        continue
+
+                    key = (contract, direction)
+                    aggregated[key] = aggregated.get(key, 0) + total_vol
+
+                # 转换为 hold.json 格式
+                hold_rows = []
+                for (contract, direction), volume in aggregated.items():
+                    hold_rows.append({
+                        "合约ID": contract,
+                        "买/卖": direction,
+                        "手数": str(volume),
+                        "来源": "CTP成交回报"
+                    })
+
+                # 写入 hold.json
+                hold_json_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    '..', 'order-check', 'hold.json'
+                )
+                with open(hold_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(hold_rows, f, ensure_ascii=False, indent=2)
+                self.print(f"[异步更新hold] 已更新（共 {len(hold_rows)} 条）")
+        except Exception as e:
+            self.print(f"[异步更新hold] 异常: {e}")
+        finally:
+            self._hold_update_scheduled = False
+
     def _update_hold_json_from_ctp(self):
-        """从 CTP 查询持仓并更新 hold.json"""
+        """从 CTP 查询持仓并更新 hold.json（保留用于其他场景）"""
         pass
 
     def cancel_order(self, order_ref: str) -> bool:
