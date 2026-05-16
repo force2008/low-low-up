@@ -577,7 +577,19 @@ class PositionSyncManagerOrderOps:
             if last_price > 0 and abs(current_price - last_price) >= price_tick:
                 replace_count = info.get("replace_count", 0)
                 if replace_count >= self.MAX_REPLACE_COUNT:
-                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，不再处理")
+                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，发送告警")
+                    # 发送飞书告警通知
+                    d = "买" if direction == "buy" else "卖"
+                    vol = info.get("volume", 0)
+                    self._notify_async(
+                        f"⚠️ 委托未能成交告警\n"
+                        f"合约: {contract}\n"
+                        f"方向: {d}\n"
+                        f"手数: {vol}\n"
+                        f"委托价: {last_price}\n"
+                        f"当前价: {current_price}\n"
+                        f"已重挂 {replace_count} 次，请人工处理"
+                    )
                     continue
 
                 cancel_list.append({

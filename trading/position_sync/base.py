@@ -128,7 +128,7 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         # 先初始化监控线程相关变量（必须在 super().__init__ 之前，因为后者可能阻塞）
         self.ORDER_TIMEOUT_SECONDS = 60
-        self.MAX_REPLACE_COUNT = 2
+        self.MAX_REPLACE_COUNT = 3
         self._replace_monitor_thread: Optional[threading.Thread] = None
         self._replace_stop_event = threading.Event()
 
