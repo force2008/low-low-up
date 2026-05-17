@@ -76,8 +76,15 @@ TRADING_SESSIONS = [
 ]
 CHECK_INTERVAL = 20  # 秒
 SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
+
+# 自动退出配置（仅 online 环境生效）
 AUTO_EXIT_AFTER_DAILY_CLOSE = True
-DAILY_CLOSE_TIME = datetime.time(15, 15, 0)
+# 收盘时间点列表（online 环境时在这些时间自动退出）
+CLOSE_TIMES = [
+    datetime.time(11, 30, 0),   # 日盘1收盘
+    datetime.time(15, 15, 0),   # 日盘2收盘
+    datetime.time(2, 30, 0),    # 夜盘收盘
+]
 
 # 关键时间点强制对齐（格式：HH:MM）
 KEY_ALIGN_TIMES = ["14:58", "14:59", "15:00"]
@@ -402,12 +409,14 @@ def export_loop():
                 now_time = datetime.datetime.now().time()
                 wait_sec = seconds_until_next_session()
                 logger.info("[导出线程] 非交易时间，距离下次开盘还有 %d 分 %d 秒", wait_sec // 60, wait_sec % 60)
-                if now_time >= DAILY_CLOSE_TIME:
-                    send_feishu_text("当日交易结束")
-                    if AUTO_EXIT_AFTER_DAILY_CLOSE and _CTP_ENV_NAME == "online":
-                        logger.info("[导出线程] 日盘已结束，准备退出")
-                        shutdown_event.set()
-                        break
+                # 检查是否到达收盘时间点（仅 online 环境生效）
+                if AUTO_EXIT_AFTER_DAILY_CLOSE and _CTP_ENV_NAME == "online":
+                    for close_time in CLOSE_TIMES:
+                        if now_time >= close_time:
+                            send_feishu_text(f"当日交易结束 ({close_time.strftime('%H:%M')})")
+                            logger.info("[导出线程] 已到收盘时间 %s，准备退出", close_time)
+                            shutdown_event.set()
+                            break
                 last_heartbeat = time.time()
 
             # 等待下一个周期，定期输出心跳

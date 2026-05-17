@@ -574,7 +574,7 @@ class PositionSyncManagerOrderOps:
             price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
 
             # 检查价格变化
-            if last_price > 0 and abs(current_price - last_price) >= price_tick:
+            if last_price > 0 and abs(current_price - last_price) > price_tick:
                 replace_count = info.get("replace_count", 0)
                 if replace_count >= self.MAX_REPLACE_COUNT:
                     self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，发送告警")
