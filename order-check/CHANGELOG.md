@@ -3,6 +3,10 @@
 ## [2026-05-16]
 
 ### Added
+- **交易日检查**：启动时检查 `config/trade_date.json` 确认今日是否为交易日
+  - 非交易日自动退出，避免无效运行
+  - 支持 `--force` 参数强制运行（用于非交易日测试）
+  - 使用方式：`python run_pipeline.py simu --force`
 - **定时任务脚本**：新增 `order-check/scheduler_setup.bat`
   - 自动创建 Windows 任务计划
   - 设置 08:59、12:59、20:59 三个启动时间

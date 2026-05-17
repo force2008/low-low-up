@@ -19,6 +19,54 @@ import logging
 import threading
 from logging.handlers import RotatingFileHandler
 
+# ==================== 交易日检查 ====================
+# 交易日列表文件路径
+_TRADE_DATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config", "trade_date.json"
+)
+# 解析强制运行参数（用于非交易日测试）
+_FORCE_RUN = "--force" in sys.argv
+if _FORCE_RUN:
+    sys.argv.remove("--force")  # 移除，避免影响后续参数解析
+
+
+def _is_trading_day() -> bool:
+    """检查今天是否为交易日
+
+    Returns:
+        True: 今天可以运行
+        False: 今天不能运行，程序应该退出
+    """
+    today = datetime.date.today().isoformat()
+
+    # 强制运行模式
+    if _FORCE_RUN:
+        logger.info(f"[交易日] 强制运行模式，今日({today})作为交易日处理")
+        return True
+
+    # 检查交易日文件是否存在
+    if not os.path.exists(_TRADE_DATE_FILE):
+        logger.warning(f"[交易日] 交易日文件不存在: {_TRADE_DATE_FILE}，跳过检查")
+        return True
+
+    try:
+        with open(_TRADE_DATE_FILE, 'r', encoding='utf-8') as f:
+            trade_dates = json.load(f)
+        trade_dates_set = set(trade_dates)
+
+        if today in trade_dates_set:
+            logger.info(f"[交易日] 今日({today})是交易日，可以运行")
+            return True
+        else:
+            logger.warning(f"[交易日] 今日({today})不是交易日，程序退出")
+            print(f"[交易日] 今日({today})不是交易日，程序退出")
+            print(f"如需强制运行，请使用: python run_pipeline.py {' '.join(sys.argv[1:])} --force")
+            return False
+    except Exception as e:
+        logger.error(f"[交易日] 读取交易日文件失败: {e}")
+        return True  # 出错时允许运行
+
 # 确保当前目录在模块搜索路径中
 _CURR_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _CURR_DIR)
@@ -436,6 +484,10 @@ def export_loop():
 
 
 def main():
+    # 交易日检查
+    if not _is_trading_day():
+        return  # 非交易日，直接退出
+
     import signal as _signal_module
     def _signal_handler(sig, frame):
         logger.info("收到中断信号，准备退出...")
