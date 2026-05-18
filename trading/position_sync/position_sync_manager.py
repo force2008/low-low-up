@@ -121,9 +121,10 @@ def run_position_sync_loop(
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
     逻辑：
-    1. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
-    2. 持续监控：持续对比，发现差异立即处理
-    3. 无固定间隔：不需要每N秒同步一次，有差异就处理
+    1. 登录 CTP，建立连接
+    2. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
+    3. 持续监控：发现 hold-std.json 更新时执行同步
+    4. 永不关闭连接：保持长连接直到收到 stop_event
 
     Args:
         hold_std_path: 标准持仓文件路径
@@ -140,7 +141,6 @@ def run_position_sync_loop(
     import threading
     import os
     mgr = None
-    last_hold_std_mtime = 0
 
     def _log(msg):
         if logger:
@@ -161,17 +161,18 @@ def run_position_sync_loop(
         if logger:
             mgr.set_logger(logger)
 
+        _log(f"[同步] PositionSyncManager 创建成功，开始监控...")
+
         # 获取初始文件的修改时间
+        last_hold_std_mtime = 0
         if os.path.exists(hold_std_path):
             last_hold_std_mtime = os.path.getmtime(hold_std_path)
-
-        _log(f"[同步] PositionSyncManager 创建成功，开始监控...")
 
         # 首次同步
         _log("[同步] 首次同步...")
         mgr.sync_and_trade(trade_volume=trade_volume)
 
-        # 持续监控循环
+        # 持续监控循环（永不关闭连接）
         while True:
             # 检查停止信号
             if stop_event is not None and stop_event.is_set():
@@ -198,6 +199,7 @@ def run_position_sync_loop(
         traceback.print_exc()
         return False
     finally:
+        # 退出时关闭连接（只有收到停止信号或异常时才关闭）
         if mgr is not None:
             _log("[同步] 关闭 PositionSyncManager...")
             try:

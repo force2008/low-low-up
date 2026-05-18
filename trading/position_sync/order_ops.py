@@ -143,9 +143,11 @@ class PositionSyncManagerOrderOps:
         req.ForceCloseReason = tdapi.THOST_FTDC_FCC_NotForceClose
 
         fill_event = threading.Event()
+        order_result_event = threading.Event()  # 用于等待报单确认（成功或拒绝）
         with self._order_lock:
             self._orders[order_ref] = {
                 "event": fill_event,
+                "order_result_event": order_result_event,  # 报单结果事件
                 "status": "submitted",
                 "sys_id": "",
                 "instr": exact_id,
@@ -155,6 +157,8 @@ class PositionSyncManagerOrderOps:
                 "offset_flag": offset_flag,
                 "submit_time": time.time(),
                 "replace_count": 0,
+                "limit_price": limit_price,  # 保存委托价格，用于撤单重挂时对比价格变化
+                "pending_rejection": False,  # 标记是否收到拒绝（由回调设置）
             }
 
         ret = self._api.ReqOrderInsert(req, 0)
@@ -162,6 +166,7 @@ class PositionSyncManagerOrderOps:
             self.print(f"[错误] {exact_id} 报单发送失败，返回值={ret}")
             with self._order_lock:
                 self._orders[order_ref]["status"] = "send_failed"
+            order_result_event.set()  # 通知等待方报单失败
             self._notify_async(
                 f"❌ 报单发送失败\n合约：{exact_id}\n方向：{direction}\n"
                 f"手数：{volume} 手\n限价：{limit_price}\n开平：{offset_flag}\n错误码：{ret}"
@@ -171,6 +176,26 @@ class PositionSyncManagerOrderOps:
         self.print(
             f"[报单] {exact_id} {direction} {volume}手 "
             f"限价={limit_price} OrderRef={order_ref}"
+        )
+
+        # 等待报单确认（最多 3 秒），如果收到拒绝则返回 False
+        confirmed = order_result_event.wait(timeout=3)
+        with self._order_lock:
+            info = self._orders.get(order_ref)
+            if info and info.get("pending_rejection"):
+                # 收到拒绝
+                self.print(f"[拒绝] {exact_id} 报单被服务器拒绝")
+                self._notify_async(
+                    f"❌ 报单被拒绝\n合约：{exact_id}\n方向：{direction}\n"
+                    f"手数：{volume} 手\n限价：{limit_price}"
+                )
+                return False
+
+        # 报单提交成功
+        offset_label = "开仓" if offset_flag == tdapi.THOST_FTDC_OF_Open else "平仓"
+        self._notify_async(
+            f"📤 报单提交\n合约：{exact_id}\n方向：{direction}（{offset_label}）\n"
+            f"手数：{volume} 手\n限价：{limit_price}"
         )
         return True
 
@@ -220,6 +245,12 @@ class PositionSyncManagerOrderOps:
             req.OrderRef = matched_ref if matched_ref else order_ref
             self.print(f"[撤单] {info['instr']} OrderRef={matched_ref}")
 
+        # 发送撤单通知
+        self._notify_async(
+            f"📤 撤单请求\n合约：{info['instr']}\n方向：{info['direction']}\n"
+            f"手数：{info['volume']} 手"
+        )
+
         cancel_event = threading.Event()
         cancel_result = [None]  # None=未返回, True=成功, False=失败
         with self._order_lock:
@@ -246,9 +277,61 @@ class PositionSyncManagerOrderOps:
             return True
         return cancel_result[0]
 
+    def _cancel_order_no_wait(self, order_ref: str) -> bool:
+        """直接发送撤单请求，不等待响应（用于 CTP 回调中的异步撤单）"""
+        # 模糊匹配订单
+        info = None
+        matched_ref = None
+        ref_raw = str(order_ref or "").strip('\x00') if order_ref else ""
+        ref_stripped = ref_raw.strip()
+        ref_lstrip = ref_raw.lstrip() if ref_raw else ""
+
+        with self._order_lock:
+            for key in (order_ref, ref_raw, ref_stripped, ref_lstrip):
+                if key and key in self._orders:
+                    info = self._orders[key]
+                    matched_ref = key
+                    break
+            if not info:
+                for key, oi in self._orders.items():
+                    if oi.get("sys_id") == order_ref:
+                        info = oi
+                        matched_ref = key
+                        break
+
+        if not info:
+            self.print(f"[撤单-无等待] OrderRef={order_ref} 不在订单列表中")
+            return False
+
+        req = tdapi.CThostFtdcInputOrderActionField()
+        req.BrokerID = self._broker_id
+        req.InvestorID = self._user_id
+        req.UserID = self._user_id
+        req.ExchangeID = info["exchange"]
+        req.InstrumentID = info["instr"]
+        req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
+
+        # 优先使用 OrderSysID 撤单
+        if info.get("sys_id"):
+            req.OrderSysID = info["sys_id"]
+        else:
+            req.FrontID = self._front_id or 0
+            req.SessionID = self._session_id or 0
+            req.OrderRef = matched_ref if matched_ref else order_ref
+
+        ret = self._api.ReqOrderAction(req, 0)
+        self.print(f"[撤单-无等待] {info['instr']} Ref={matched_ref} 返回={ret}")
+        return ret == 0
+
     def _cancel_order_by_sysid(self, order_sys_id: str, exchange_id: str, instrument_id: str) -> bool:
         """通过 OrderSysID 撤单（不依赖 _orders 内存缓存）"""
         self.print(f"[撤单开始] {instrument_id} OrderSysID={order_sys_id} Exchange={exchange_id}")
+
+        # 发送撤单通知
+        self._notify_async(
+            f"📤 撤单请求\n合约：{instrument_id}\nOrderSysID：{order_sys_id}"
+        )
+
         req = tdapi.CThostFtdcInputOrderActionField()
         req.BrokerID = self._broker_id
         req.InvestorID = self._user_id
@@ -486,6 +569,7 @@ class PositionSyncManagerOrderOps:
                     "submit_time": fake_submit_time,
                     "replace_count": 0,
                     "from_ctp_sync": True,
+                    "limit_price": o.get("LimitPrice", 0),  # 保存委托价格，用于撤单重挂时对比价格变化
                 }
                 existing_refs.add(key_ref)
                 synced += 1

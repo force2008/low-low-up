@@ -145,9 +145,13 @@ class PositionSyncManagerBase(CTdSpiBase):
         """异步发送飞书通知，完全不阻塞"""
         def _send():
             try:
-                self._feishu.send_text(text)
-            except Exception:
-                pass  # 完全忽略异常
+                success = self._feishu.send_text(text)
+                if success:
+                    self.print(f"[飞书] 通知发送成功")
+                else:
+                    self.print(f"[飞书] 通知发送失败")
+            except Exception as e:
+                self.print(f"[飞书] 通知发送异常: {e}")
         threading.Thread(target=_send, daemon=True).start()
 
     def set_logger(self, logger):
@@ -241,31 +245,97 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         # ErrorID=1009 持仓不足：如果是平仓单，撤掉该合约所有未成交平仓委托，下次重新计算后重试
         if err_id == 1009 and inst:
-            with self._order_lock:
-                info = None
-                for key in (ref, ref_raw if ref_raw else "", ref.lstrip() if ref else ""):
-                    if key and key in self._orders:
-                        info = self._orders.get(key)
-                        break
-                if info:
-                    offset = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
-                    if offset != tdapi.THOST_FTDC_OF_Open:
-                        dir_label = info.get("direction", "")
-                        # 撤掉该合约所有未成交平仓单
-                        pending_refs = self._get_pending_order_refs(inst, dir_label, offset)
-                        if pending_refs:
-                            self.print(f"[1009处理] {inst} 平仓被拒绝，撤掉 {len(pending_refs)} 笔未成交平仓委托，下次重新计算后重试")
-                            for pending_ref in pending_refs:
-                                self.cancel_order(pending_ref)
-                                time.sleep(0.2)
-                        else:
-                            self.print(f"[1009处理] {inst} 平仓被拒绝，无在途平仓单可撤，下次重新计算后重试")
+            # 使用线程异步处理，避免在 CTP 回调中阻塞
+            def _handle_1009_async():
+                try:
+                    with self._order_lock:
+                        info = None
+                        matched_key = None
+                        # 尝试多种方式匹配
+                        for key in (ref, ref_raw if ref_raw else "", ref.lstrip() if ref else ""):
+                            if key and key in self._orders:
+                                info = self._orders.get(key)
+                                matched_key = key
+                                break
+                        # 如果还是找不到，用 instrument + direction 反向查找
+                        if not info and inst:
+                            for key, oi in self._orders.items():
+                                if oi.get("instr", "").upper() == inst.upper():
+                                    info = oi
+                                    matched_key = key
+                                    break
+
+                        if info:
+                            offset = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+                            if offset != tdapi.THOST_FTDC_OF_Open:
+                                dir_label = info.get("direction", "")
+                                vol = info.get("volume", 0)
+                                # 撤掉该合约所有未成交平仓单
+                                pending_refs = self._get_pending_order_refs(inst, dir_label, offset)
+                                if pending_refs:
+                                    self.print(f"[1009处理] {inst} 平仓被拒绝，撤掉 {len(pending_refs)} 笔未成交平仓委托")
+                                    for pending_ref in pending_refs:
+                                        try:
+                                            # 直接发送撤单请求，不等待响应
+                                            self._cancel_order_no_wait(pending_ref)
+                                        except Exception as e:
+                                            self.print(f"[1009处理] 撤单失败: {e}")
+                                # 1009 错误说明持仓不足，很可能是相反方向的开仓委托还没成交
+                                # 先撤销相反方向的开仓委托，让下次同步能正确计算
+                                opposite_dir = "sell" if dir_label == "buy" else "buy"
+                                pending_open_refs = self._get_pending_order_refs(inst, opposite_dir, tdapi.THOST_FTDC_OF_Open)
+                                if pending_open_refs:
+                                    self.print(f"[1009处理] {inst} 撤销相反方向开仓委托 {len(pending_open_refs)} 笔")
+                                    for pending_ref in pending_open_refs:
+                                        try:
+                                            self._cancel_order_no_wait(pending_ref)
+                                        except Exception as e:
+                                            self.print(f"[1009处理] 撤单失败: {e}")
+                                else:
+                                    self.print(f"[1009处理] {inst} 平仓被拒绝，无相反方向开仓委托可撤")
+                                # 发送飞书告警
+                                d = "多" if dir_label == "buy" else "空"
+                                self._notify_async(
+                                    f"⚠️ 平仓被拒绝（1009 持仓不足）\n"
+                                    f"合约: {inst}\n"
+                                    f"方向: {d}\n"
+                                    f"手数: {vol}\n"
+                                    f"原因: 持仓不足，已撤销相反方向开仓委托\n"
+                                    f"下次同步将重新计算"
+                                )
+                except Exception as e:
+                    self.print(f"[1009处理] 异步处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            # 在新线程中异步处理，避免阻塞 CTP 回调
+            threading.Thread(target=_handle_1009_async, daemon=True).start()
+            return  # 立即返回，不在回调中等待
 
         with self._order_lock:
-            info = self._orders.get(ref)
+            info = None
+            matched_key = None
+            # 尝试多种方式匹配订单
+            for key in (ref, ref_raw if ref_raw else "", ref.lstrip() if ref else ""):
+                if key and key in self._orders:
+                    info = self._orders.get(key)
+                    matched_key = key
+                    break
+            # 如果还是找不到，用 instrument 查找
+            if not info and inst:
+                for key, oi in self._orders.items():
+                    if oi.get("instr", "").upper() == inst.upper():
+                        info = oi
+                        matched_key = key
+                        break
             if info:
                 info["status"] = "rejected"
+                info["pending_rejection"] = True  # 标记收到拒绝
                 info["event"].set()
+                # 触发报单结果事件，通知 _place_order 等待方
+                order_result_event = info.get("order_result_event")
+                if order_result_event:
+                    order_result_event.set()
 
         self._update_order_file_status(ref, status="rejected")
 
@@ -330,6 +400,11 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         if status == self._OST_ALL_TRADED:
             info["event"].set()
+
+        # 触发报单结果事件，通知 _place_order 等待方（如果是未成交或其他状态也需要通知）
+        order_result_event = info.get("order_result_event")
+        if order_result_event:
+            order_result_event.set()
 
         # 同步状态到文件
         session_id = getattr(pOrder, "SessionID", 0)
@@ -770,8 +845,11 @@ class PositionSyncManagerBase(CTdSpiBase):
 
     def _check_position_diff(self):
         """检查仓位差异，有差异则同步"""
+        lock_acquired = False
         # 获取锁，防止与 sync_and_trade 并发
-        if not self._sync_lock.acquire(blocking=True, timeout=5):
+        if self._sync_lock.acquire(blocking=True, timeout=5):
+            lock_acquired = True
+        else:
             self.print("[监控] 锁被占用，跳过本次检查")
             return
 
@@ -843,20 +921,31 @@ class PositionSyncManagerBase(CTdSpiBase):
                 # 无差异也要发送定期通知，让用户知道系统一直在检查
                 total_target = sum(t for t in target.values())
                 total_actual = sum(a for a in actual_agg.values())
-                self._notify_async(
-                    f"✅ 45秒持仓检测\n"
-                    f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
-                    f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
-                    f"状态: 仓位一致 ✓"
-                )
-                self.print("[监控] 45秒检测: 仓位一致")
+                # 检查总手数是否一致
+                if total_target != total_actual:
+                    self._notify_async(
+                        f"⚠️ 45秒持仓检测\n"
+                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
+                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
+                        f"状态: 手数不一致 ⚠️"
+                    )
+                    self.print(f"[监控] 45秒检测: 手数不一致 (标准:{total_target} vs 实际:{total_actual})")
+                else:
+                    self._notify_async(
+                        f"✅ 45秒持仓检测\n"
+                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
+                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
+                        f"状态: 仓位一致 ✓"
+                    )
+                    self.print("[监控] 45秒检测: 仓位一致")
 
         except Exception as e:
             import traceback
             self.print(f"[监控] 检查仓位差异异常: {e}")
             traceback.print_exc()
         finally:
-            self._sync_lock.release()
+            if lock_acquired:
+                self._sync_lock.release()
 
     def _next_order_ref(self) -> str:
         with self._order_lock:
