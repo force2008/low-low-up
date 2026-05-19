@@ -607,7 +607,7 @@ class PositionSyncManagerOrderOps:
     # 自动撤单重挂监控（每 45 秒检查一次）
     # ------------------------------------------------------------------
     def _check_and_replace_pending_orders(self):
-        """扫描未成交委托，价格变化超过 1 个 tick 则撤单重挂"""
+        """扫描未成交委托，检查是否需要撤单重挂"""
         # 获取所有未成交的委托
         pending_orders = []
         with self._order_lock:
@@ -619,12 +619,32 @@ class PositionSyncManagerOrderOps:
         if not pending_orders:
             return
 
-        self.print(f"[监控] 检查 {len(pending_orders)} 个未成交委托...")
+        # 先查询持仓和标准持仓，找出缺额合约
+        positions = self.query_positions(timeout=10)
+        if not positions:
+            self.print("[监控] 持仓查询失败，跳过检查")
+            return
+
+        self._actual_positions = positions
+        actual_agg = self._aggregate_actual_positions()
+        target = self._parse_hold_std()
+
+        # 计算缺额合约
+        missing_contracts = set()
+        for key, t_vol in target.items():
+            contract, direction = key
+            a_vol = actual_agg.get(key, 0)
+            if t_vol > a_vol:
+                missing_contracts.add((contract.upper(), direction))
+
+        self.print(f"[监控] 检查 {len(pending_orders)} 个未成交委托，缺额合约: {[c[0] for c in missing_contracts]}")
 
         # 按合约分组查询行情
         contracts_to_query = set()
         for ref, info in pending_orders:
             contracts_to_query.add(info.get("instr", "").upper())
+        for contract, _ in missing_contracts:
+            contracts_to_query.add(contract.upper())
 
         # 批量查询行情
         market_data_map = {}
@@ -635,6 +655,7 @@ class PositionSyncManagerOrderOps:
 
         # 检查每个委托
         cancel_list = []
+
         for ref, info in pending_orders:
             contract = info.get("instr", "").upper()
             md = market_data_map.get(contract)
@@ -643,7 +664,6 @@ class PositionSyncManagerOrderOps:
 
             last_price = info.get("limit_price", 0) or info.get("last_md_price", 0)
             direction = info.get("direction", "")
-            offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
 
             if direction == "buy":
                 current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
@@ -657,25 +677,14 @@ class PositionSyncManagerOrderOps:
             info_obj = self._get_contract_info(contract.lower())
             price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
 
-            # 检查价格变化
+            # 只在价格变化超过tick时才撤单重挂
             if last_price > 0 and abs(current_price - last_price) >= price_tick:
                 replace_count = info.get("replace_count", 0)
                 if replace_count >= self.MAX_REPLACE_COUNT:
-                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，发送告警")
-                    # 发送飞书告警通知
-                    d = "买" if direction == "buy" else "卖"
-                    vol = info.get("volume", 0)
-                    self._notify_async(
-                        f"⚠️ 委托未能成交告警\n"
-                        f"合约: {contract}\n"
-                        f"方向: {d}\n"
-                        f"手数: {vol}\n"
-                        f"委托价: {last_price}\n"
-                        f"当前价: {current_price}\n"
-                        f"已重挂 {replace_count} 次，请人工处理"
-                    )
+                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，跳过")
                     continue
 
+                self.print(f"[监控] {contract} 价格变化 {last_price}->{current_price}，撤单重挂")
                 cancel_list.append({
                     "ref": ref,
                     "info": info,
@@ -699,6 +708,14 @@ class PositionSyncManagerOrderOps:
         volume = info.get("volume", 0)
         old_price = item["old_price"]
         new_price = item["new_price"]
+
+        # 检查冷却机制：如果是平仓委托且在1009冷却期内，跳过重挂
+        if offset_flag != tdapi.THOST_FTDC_OF_Open:
+            current_time = time.time()
+            last_rejected = getattr(self, '_last_1009_reject', {}).get(contract.upper(), 0)
+            if current_time - last_rejected < 30:
+                self.print(f"[撤单重挂] {contract} 在1009冷却期内（30秒），跳过重挂")
+                return
 
         # 撤单
         order_sys_id = info.get("sys_id", "")
@@ -725,6 +742,19 @@ class PositionSyncManagerOrderOps:
             exchange_id = info_obj.get("ExchangeID", exchange_id)
 
         # 重挂
+        # 如果是平仓委托（不是开仓），重挂前先检查持仓是否足够
+        if offset_flag != tdapi.THOST_FTDC_OF_Open:
+            # 平仓委托，检查持仓是否足够
+            pos_direction = 2 if direction == "sell" else 3  # 卖平对应多头，买平对应空头
+            pos_vol = self._get_actual_position_volume(contract, pos_direction)
+            if pos_vol <= 0:
+                self.print(f"[撤单重挂] {contract} 已是空仓，跳过重挂（避免1009）")
+                return
+            # 如果持仓小于委托量，按实际持仓重挂
+            if pos_vol < volume:
+                self.print(f"[撤单重挂] {contract} 持仓变化 {volume}->{pos_vol}，调整委托量")
+                volume = pos_vol
+
         ok = self._place_order(
             exchange_id=exchange_id,
             instrument_id=contract,

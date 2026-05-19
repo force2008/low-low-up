@@ -1,56 +1,83 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## 2026-05-18
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+### 修复：超额持仓计算错误
 
-## [Unreleased]
+**问题描述**
+- 持仓差异检测到 fu2609 多 2 手（标准 8 vs 实际 10）
+- 但同步通知显示"缺额开仓: 0 个, 超额平仓: 0 个"，没有提交平仓委托
+- 平仓委托显示"卖 0 手"，数量为 0
 
-### Added
-- 止损空间检查：止损空间小于0.3%时不开仓，避免被正常波动触发止损
-  - 修改文件: `strategies/low_low_up/StrategyLowLowUp.py`
-  - 修改位置: `get_initial_stop_loss` 方法
-  - 修改内容: 在60分钟和5分钟止损计算后增加止损空间检查，返回 None 表示不开仓
+**根本原因**
+1. **双重扣减**：`pending_close` 在两个地方被扣减
+   - 在 `_build_pending_map` 中映射到了持仓方向
+   - 在 `effective_actual` 计算时又被扣减了一次
+   - 导致有效持仓比实际小 2 手
 
-### Fixed
-- 平仓后清空预检测信号：避免用旧信号立即开仓
-  - 修改文件: `KlineCollector_v2.py`
-  - 修改位置: `_check_stop_loss_v2` 方法
-  - 修改内容: 平仓后清空 `precheck_signals_green` 和 `precheck_signals_red`
+2. **1009 拒绝循环**：提交平仓委托时没有冷却机制，被 1009 拒绝后立即重试导致反复失败
 
-### Fixed
-- 集合竞价K线时间归属修复：08:55和20:55的集合竞价数据归到正确时段
-  - 修改文件: `KlineCollector_v2.py`
-  - 修改位置: `_get_kline_time` 方法
-  - 修改内容: 
-    - 08:55 集合竞价归到 09:00
-    - 20:55 集合竞价归到 21:00
-  - 修改位置2: `add_tick` 方法
-  - 修改内容2: 跳过保存08:00和20:00的虚假K线（直接从09:00和21:00开始）
+**修复内容**
 
-### Changed
-- 策略重构：统一策略逻辑到 StrategyLowLowUp.py
-  - 修改文件: `strategies/low_low_up/StrategyLowLowUp.py`, `KlineCollector_v2.py`, `backtest/strategy_backtest.py`
-  - 新增方法:
-    - `check_60m_precheck`: 检查60分钟预检测信号
-    - `check_5m_entry_signal`: 检查5分钟入场信号
-  - 止损计算统一使用 `strategy.get_initial_stop_loss()`
+1. **[sync.py]** 不再从 `effective_actual` 中扣减 `pending_close`
+   ```python
+   # 修复前
+   pending_close = pending_map.get((contract.upper(), direction, False), 0)
+   effective_actual[key] = a_vol + pending_open - pending_close
 
-### Removed
-- 排除胜率过低的品种: rr, wr, pk
-  - 修改文件: `utils/strategy_config.py`, `KlineCollector_v2.py`, `backtest/strategy_backtest.py`
-  - 在 `Config.EXCLUDED_PRODUCTS` 中配置
+   # 修复后
+   pending_close = 0  # 不再扣减
+   effective_actual[key] = a_vol + pending_open - pending_close
+   ```
 
----
+2. **[sync.py]** 修复双重扣减问题：excess_orders 的 volume 已经扣除了 pending_close，不需要再减
+   ```python
+   # 修复前
+   pending_close_vol = self._get_pending_close_volume(contract, pos_dir)
+   available = actual_pos - pending_close_vol
 
-## [v1.0.0] - 2026-04-08
+   # 修复后
+   available = actual_pos  # 直接用实际持仓
+   ```
 
-### Added
-- 初始版本
-- 多时间框架策略 (60分钟+5分钟)
-- MACD指标计算
-- 绿柱堆识别
-- 底背离/底抬升信号检测
-- 止损计算（使用绿柱堆低点）
-- 飞书通知
+3. **[sync.py]** 添加 1009 冷却机制：30秒内不重复尝试同一合约
+   ```python
+   # 检查该合约是否之前被 1009 拒绝过（冷却机制）
+   current_time = time.time()
+   last_rejected = getattr(self, '_last_1009_reject', {}).get(contract.upper(), 0)
+   if current_time - last_rejected < 30:  # 30秒内不重复尝试同一合约
+       self.print(f"[平] {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
+       skip_close[0] += 1
+       continue
+   ```
+
+4. **[sync.py]** 记录 1009 拒绝时间
+   ```python
+   # 记录 1009 拒绝时间，用于冷却
+   if not hasattr(self, '_last_1009_reject'):
+       self._last_1009_reject = {}
+   self._last_1009_reject[contract.upper()] = time.time()
+   ```
+
+5. **[base.py]** 1009 错误处理改为异步执行
+   - 在新线程中异步处理 1009 错误，避免阻塞 CTP 回调
+   - 不等待撤单响应，直接发送请求后返回
+
+6. **[order_ops.py]** 添加 `_cancel_order_no_wait()` 方法
+   - 用于快速撤单，不等待响应
+   - 专门用于 CTP 回调中的异步撤单场景
+
+7. **[sync.py]** 添加平仓调试日志
+   ```python
+   self.print(f"[平调试] {contract} excess_orders.volume={eo['volume']}, actual_pos={actual_pos}, pending_close_vol={pending_close_vol}, available={available}")
+   self.print(f"[平调试] {contract} diff初始值={diff}")
+   ```
+
+8. **[sync.py]** 修复 close_vol_submitted 跟踪问题
+   - 添加 `close_vol_submitted` 变量跟踪实际提交的平仓数量
+   - 避免 `diff` 变量被修改后导致通知显示 0 手的问题
+
+### 相关文件
+- `trading/position_sync/sync.py`
+- `trading/position_sync/base.py`
+- `trading/position_sync/order_ops.py`

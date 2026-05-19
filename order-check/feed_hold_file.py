@@ -30,7 +30,7 @@ PROJECT_ROOT = os.path.dirname(_CURR_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 # ==================== 文件夹配置 ====================
-FEED_DIR = r"C:\projects\feed2"      # 源文件夹
+FEED_DIR = r"C:\projects\feed"      # 源文件夹
 DATA_DIR = r"C:\ronghang\data"      # 目标文件夹
 COPY_INTERVAL = 20  # 拷贝间隔（秒）
 COPIED_FILES_LOG = os.path.join(_CURR_DIR, "copied_files.json")  # 已拷贝文件记录

@@ -86,10 +86,10 @@ class PositionSyncManagerSync:
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
 
-            # 5. 查询在途委托
+            # 5. 查询在途委托（必须先查询，同步到 _orders）
             ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
             if ctp_orders:
-                self.print(f"[委托] CTP 在途 {len(ctp_orders)} 条")
+                self.print(f"[委托] CTP 在途 {len(ctp_orders)} 条，已同步到内存")
                 self._sync_ctp_orders_to_memory(ctp_orders)
             else:
                 self.print("[委托] 无在途委托")
@@ -108,38 +108,60 @@ class PositionSyncManagerSync:
                 # 不再扣减 pending_close（未成交的平仓委托不应该提前减少有效持仓）
                 pending_close = 0  # pending_map.get((contract.upper(), direction, False), 0)
                 effective_actual[key] = a_vol + pending_open - pending_close
+                if pending_open > 0:
+                    self.print(f"[有效持仓] {contract} {'多' if direction == 2 else '空'}: 实际{a_vol} + 在途开仓{pending_open} = {effective_actual[key]}")
+
+            # 调试：打印 pending_map 中所有开仓委托
+            for pm_key, pm_vol in pending_map.items():
+                if pm_vol > 0 and len(pm_key) >= 3 and pm_key[2]:  # is_open = True
+                    self.print(f"[pending_map] {pm_key[0]} {'多' if pm_key[1] == 2 else '空'} 开仓 {pm_vol} 手")
 
             # 8. 计算缺额/超额
             missing_orders = []
             excess_orders = []
 
-            # 检查合约/方向是否完全一致
-            all_keys = set(target.keys()) | set(actual_agg.keys())
-            contract_mismatch = []
-            for key in all_keys:
-                t_vol = target.get(key, 0)
-                a_vol = actual_agg.get(key, 0)
-                if t_vol != a_vol:
-                    contract, direction = key
-                    d_str = "多" if direction == 2 else "空"
-                    contract_mismatch.append(f"{contract} {d_str}: 标准{t_vol} vs 实际{a_vol}")
+            # 检查是否有合约在1009冷却期
+            current_time = time.time()
+            cooling_contracts = []
+            if hasattr(self, '_last_1009_reject'):
+                for contract_upper, reject_time in list(self._last_1009_reject.items()):
+                    if current_time - reject_time < 30:
+                        cooling_contracts.append(contract_upper)
 
+            # 8. 计算缺额/超额
+            missing_orders = []
+            excess_orders = []
+
+            # 检查是否有合约在1009冷却期
+            current_time = time.time()
+            cooling_contracts = []
+            if hasattr(self, '_last_1009_reject'):
+                for contract_upper, reject_time in list(self._last_1009_reject.items()):
+                    if current_time - reject_time < 30:
+                        cooling_contracts.append(contract_upper)
+
+            # 计算缺额
             for key, t_vol in target.items():
-                eff_vol = effective_actual.get(key, 0)
-                if t_vol > eff_vol:
+                a_vol = actual_agg.get(key, 0)
+                if t_vol > a_vol:
                     contract, direction = key
+                    self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 实际{a_vol}, 缺额{t_vol - a_vol}")
                     missing_orders.append({
                         "contract": contract,
                         "direction": "buy" if direction == 2 else "sell",
-                        "volume": t_vol - eff_vol,
+                        "volume": t_vol - a_vol,
                     })
 
+            # 计算超额
             for key, a_vol in actual_agg.items():
                 t_vol = target.get(key, 0)
-                eff_vol = effective_actual.get(key, 0)
-                vol_to_close = eff_vol - t_vol
+                vol_to_close = a_vol - t_vol
                 if vol_to_close > 0:
                     contract, direction = key
+                    # 跳过1009冷却期内的合约
+                    if contract.upper() in cooling_contracts:
+                        self.print(f"[平] {contract} 在1009冷却期内（30秒），跳过本次平仓")
+                        continue
                     excess_orders.append({
                         "contract": contract,
                         "direction": direction,
@@ -175,16 +197,8 @@ class PositionSyncManagerSync:
             total_target = sum(t for t in target.values())
             total_actual = sum(a for a in actual_agg.values())
 
-            # 如果有合约/方向手数不一致但没有缺额/超额列表，说明是合约不一致导致的
-            if contract_mismatch:
-                diff_lines.append(f"⚠️ 合约/方向不一致 ({len(contract_mismatch)} 个):")
-                for cm in contract_mismatch[:10]:  # 最多显示10个
-                    diff_lines.append(f"  {cm}")
-                if len(contract_mismatch) > 10:
-                    diff_lines.append(f"  ... 等共 {len(contract_mismatch)} 个")
-
             # 判断是否有差异
-            has_diff = bool(missing_orders) or bool(excess_orders) or bool(contract_mismatch)
+            has_diff = bool(missing_orders) or bool(excess_orders)
 
             if diff_lines:
                 self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
@@ -270,36 +284,40 @@ class PositionSyncManagerSync:
                 # 检查在途委托
                 mo_upper = contract.upper()
                 need_new_order = True
+                # 调试：打印所有 ctp_orders 中该合约的委托
+                for o in ctp_orders:
+                    if o.get("InstrumentID", "").upper() == mo_upper:
+                        self.print(f"[开调试] 找到委托: {o.get('InstrumentID')} Dir={o.get('Direction')} Offset={o.get('CombOffsetFlag')} Status={o.get('OrderStatus')}")
                 for o in ctp_orders:
                     if (o.get("InstrumentID", "").upper() == mo_upper
                         and str(o.get("Direction", "")).strip() == (tdapi.THOST_FTDC_D_Buy if mo["direction"] == "buy" else tdapi.THOST_FTDC_D_Sell).strip()
                         and str(o.get("CombOffsetFlag", "")).strip() == str(tdapi.THOST_FTDC_OF_Open).strip()
                         and str(o.get("OrderStatus", "")).strip() in ("1", "3")):
-                        pending_vol = o.get("VolumeTotalOriginal", 0) - o.get("VolumeTraded", 0)
-                        if pending_vol >= mo["volume"]:
-                            self.print(f"[开] {contract} 在途足够，保持等待")
-                            need_new_order = False
-                            skip_open[0] += 1
-                            break
+                        last_price = o.get("LimitPrice", 0)
+                        if mo["direction"] == "buy":
+                            current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
                         else:
-                            last_price = o.get("LimitPrice", 0)
-                            if mo["direction"] == "buy":
-                                current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
-                            else:
-                                current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
-                            info = self._get_contract_info(contract)
-                            price_tick = info.get("PriceTick", 1.0)
-                            if last_price > 0 and current_price > 0 and abs(current_price - last_price) < price_tick:
-                                self.print(f"[开] {contract} 手数不足，撤单重挂")
-                            else:
-                                self.print(f"[开] {contract} 价格变化，撤单重挂")
+                            current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                        info = self._get_contract_info(contract)
+                        price_tick = info.get("PriceTick", 1.0)
+
+                        # 检查是否需要撤单重挂：价格变化超过tick
+                        price_changed = last_price > 0 and current_price > 0 and abs(current_price - last_price) >= price_tick
+
+                        if price_changed:
+                            self.print(f"[开] {contract} 价格变化 {last_price}->{current_price}，撤单重挂")
                             order_sys_id = o.get("OrderSysID", "")
                             exchange_id = o.get("ExchangeID", "")
                             if order_sys_id:
                                 self._cancel_order_by_sysid(order_sys_id, exchange_id, contract)
                             else:
                                 self.cancel_order(o.get("OrderRef", ""))
-                            time.sleep(0.3)
+                            time.sleep(0.5)  # 等待撤单完成
+                        else:
+                            # 价格没变化，保持等待
+                            self.print(f"[开] {contract} 在途足够且价格未变，保持等待")
+                            need_new_order = False
+                            skip_open[0] += 1
                         break
 
                 if not need_new_order:
@@ -370,18 +388,21 @@ class PositionSyncManagerSync:
                 # 检查该合约+方向是否已有成功的平仓委托在处理中
                 # （避免重复提交导致 1009）
                 close_dir = "sell" if pos_dir == 2 else "buy"
+                pending_close_ref = None
+                pending_close_info = None
                 with self._order_lock:
-                    has_pending_close = False
                     for ref, info in self._orders.items():
                         if info.get("instr", "").upper() == contract.upper():
                             if info.get("direction") == close_dir:
                                 offset = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
                                 if offset != tdapi.THOST_FTDC_OF_Open:  # 是平仓委托
                                     if self._is_order_pending(info):
-                                        has_pending_close = True
+                                        pending_close_ref = ref
+                                        pending_close_info = info
                                         break
-                if has_pending_close:
-                    self.print(f"[平] {contract} 已有平仓委托在途，跳过")
+                if pending_close_ref:
+                    # 有平仓委托在途，等待45秒检查循环处理
+                    self.print(f"[平] {contract} 已有平仓委托在途，等待45秒检查循环处理")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -411,6 +432,14 @@ class PositionSyncManagerSync:
                 # 如果有多头超额（需要平多），先撤销所有空头委托
                 # 如果有空头超额（需要平空），先撤销所有多头委托
                 opposite_dir = "sell" if pos_dir == 2 else "buy"
+
+                # 检查该合约是否之前被 1009 拒绝过（冷却机制）
+                current_time = time.time()
+                last_rejected = getattr(self, '_last_1009_reject', {}).get(contract.upper(), 0)
+                if current_time - last_rejected < 30:  # 30秒内不重复尝试同一合约
+                    self.print(f"[平] {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
+                    skip_close[0] += 1
+                    continue
 
                 # 调试：检查所有未成交委托
                 with self._order_lock:
@@ -520,6 +549,10 @@ class PositionSyncManagerSync:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
                         self.print(f"[平] {contract} 平今报单被拒绝，跳过")
                         skip_close[0] += 1
+                        # 记录 1009 拒绝时间，用于冷却
+                        if not hasattr(self, '_last_1009_reject'):
+                            self._last_1009_reject = {}
+                        self._last_1009_reject[contract.upper()] = time.time()
                         time.sleep(0.2)
                         continue
                     close_vol_submitted += close_today
@@ -541,6 +574,10 @@ class PositionSyncManagerSync:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
                         self.print(f"[平] {contract} 平昨报单被拒绝，跳过")
                         skip_close[0] += 1
+                        # 记录 1009 拒绝时间，用于冷却
+                        if not hasattr(self, '_last_1009_reject'):
+                            self._last_1009_reject = {}
+                        self._last_1009_reject[contract.upper()] = time.time()
                         time.sleep(0.2)
                         continue
                     close_vol_submitted += diff
@@ -567,6 +604,11 @@ class PositionSyncManagerSync:
         # 发送详细通知
         total_submit = submitted_open[0] + submitted_close[0]
         total_skip = skip_open[0] + skip_close[0]
+
+        # 检查是否有平仓被拒绝（1009），如果有则发送警告并重置跳过计数
+        # 这可以防止程序"锁住"在不断提交被拒绝的委托上
+        if skip_close[0] > 0 and excess_orders:
+            self.print(f"[警告] 平仓跳过 {skip_close[0]} 个（可能是 1009 拒绝），下次同步将重新计算")
 
         # 计算标准仓和CTP持仓手数
         total_target = sum(t for t in target.values())

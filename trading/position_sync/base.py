@@ -55,7 +55,7 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         # 订单追踪
         self._orders: Dict[str, dict] = {}
-        self._order_lock = threading.Lock()
+        self._order_lock = threading.RLock()  # 使用递归锁，允许同一线程内嵌套获取
         self._order_ref_seq = 0
 
         # 合约信息缓存: InstrumentID -> dict
@@ -869,7 +869,8 @@ class PositionSyncManagerBase(CTdSpiBase):
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
 
-            # 计算差异
+            # 计算差异（使用实际持仓，不考虑在途委托）
+            # 在途委托由 _check_and_replace_pending_orders 单独处理
             missing = []
             excess = []
             for key, t_vol in target.items():
