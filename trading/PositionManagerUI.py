@@ -376,7 +376,7 @@ class PositionManagerUI(CTdSpiBase):
         exchange = self._product_exchange_map.get(product_id)
         if exchange:
             return exchange
-        # fallback 到硬编码前缀表
+        # fallback 到硬编码前缀表（覆盖所有常见交易所）
         prefix = instrument_id[:2].upper()
         mapping = {
             "IF": "CFFEX", "IC": "CFFEX", "IH": "CFFEX", "IM": "CFFEX",
@@ -387,6 +387,21 @@ class PositionManagerUI(CTdSpiBase):
             "RU": "SHFE", "SP": "SHFE", "AO": "SHFE", "BR": "SHFE",
             "NR": "SHFE", "SC": "INE", "LU": "INE", "BC": "INE",
             "EC": "INE",
+            "AP": "CZCE", "CF": "CZCE", "CY": "CZCE",
+            "FG": "CZCE", "MA": "CZCE", "OI": "CZCE", "RM": "CZCE",
+            "SA": "CZCE", "SF": "CZCE", "SM": "CZCE", "SR": "CZCE",
+            "TA": "CZCE", "UR": "CZCE", "PX": "CZCE", "PF": "CZCE",
+            "PK": "CZCE", "PR": "CZCE", "PL": "CZCE", "SH": "CZCE",
+            "CJ": "CZCE", "JR": "CZCE", "PM": "CZCE", "RS": "CZCE",
+            "WH": "CZCE", "ZC": "CZCE",
+            "A": "DCE", "B": "DCE", "C": "DCE", "CS": "DCE",
+            "EB": "DCE", "EG": "DCE", "I": "DCE", "J": "DCE",
+            "JD": "DCE", "JM": "DCE", "L": "DCE", "LH": "DCE",
+            "M": "DCE", "P": "DCE", "PG": "DCE", "PP": "DCE",
+            "RR": "DCE", "V": "DCE", "Y": "DCE", "FB": "DCE",
+            "BB": "DCE", "LG": "DCE",
+            "LC": "GFEX", "SI": "GFEX",
+            "PS": "GFEX", "PT": "GFEX", "PD": "GFEX",
         }
         return mapping.get(prefix, "SHFE")
 
@@ -997,6 +1012,9 @@ class PositionManagerUI(CTdSpiBase):
             if poll_count % 3 == 0:
                 try:
                     with self._refresh_lock:
+                        # 清空后再查询，避免重复累积
+                        with self._orders_lock:
+                            self._orders_raw = []
                         self.query_orders(timeout=10)
                         self.query_trades(timeout=10)
                         self._merge_submitted_orders()

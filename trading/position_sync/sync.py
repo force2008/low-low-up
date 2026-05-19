@@ -57,13 +57,36 @@ class PositionSyncManagerSync:
                 self.print("[错误] 加载合约信息失败")
                 return False
 
-            # 2. 查询持仓
+            # 2. 查询在途委托并撤销所有（避免"已有委托在途"导致跳过）
+            ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            if ctp_orders:
+                self.print(f"[撤销] 发现 {len(ctp_orders)} 条在途委托，先全部撤销...")
+                cancel_success = 0
+                for o in ctp_orders:
+                    order_sys_id = str(o.get("OrderSysID", "")).strip()
+                    exchange_id = str(o.get("ExchangeID", "")).strip()
+                    instrument_id = str(o.get("InstrumentID", "")).strip()
+                    if order_sys_id:
+                        if self._cancel_order_by_sysid(order_sys_id, exchange_id, instrument_id):
+                            cancel_success += 1
+                    else:
+                        order_ref = str(o.get("OrderRef", "")).strip()
+                        if self.cancel_order(order_ref):
+                            cancel_success += 1
+                    time.sleep(0.3)
+                self.print(f"[撤销] 已撤销 {cancel_success}/{len(ctp_orders)} 条委托")
+                # 等待撤单确认
+                time.sleep(2)
+            else:
+                self.print("[撤销] 无在途委托需要撤销")
+
+            # 3. 查询持仓
             positions = self.query_positions(timeout=15)
             if positions is None:
                 self.print("[错误] 持仓查询失败")
                 return False
 
-            # 3. 加载标准持仓
+            # 4. 加载标准持仓
             if not self._load_hold_std():
                 initial_path = os.path.join(PROJECT_ROOT, "data", "initial_positions.json")
                 if os.path.exists(initial_path):
@@ -82,22 +105,22 @@ class PositionSyncManagerSync:
                     return False
                 self._save_hold_std()
 
-            # 4. 聚合持仓
+            # 5. 聚合持仓
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
 
-            # 5. 查询在途委托（必须先查询，同步到 _orders）
+            # 6. 再次查询在途委托（撤销后的状态）
             ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
             if ctp_orders:
-                self.print(f"[委托] CTP 在途 {len(ctp_orders)} 条，已同步到内存")
+                self.print(f"[委托] 撤销后剩余 CTP 在途 {len(ctp_orders)} 条")
                 self._sync_ctp_orders_to_memory(ctp_orders)
             else:
-                self.print("[委托] 无在途委托")
+                self.print("[委托] 撤销后无在途委托")
 
-            # 6. 构建在途映射
+            # 7. 构建在途映射
             pending_map = self._build_pending_map(ctp_orders)
 
-            # 7. 计算有效持仓
+            # 8. 计算有效持仓
             # 修复：只在开仓方向扣减在途委托，不在平仓方向扣减
             # 因为未成交的平仓委托还没减少实际持仓，不应该提前扣减
             effective_actual = {}
@@ -116,7 +139,7 @@ class PositionSyncManagerSync:
                 if pm_vol > 0 and len(pm_key) >= 3 and pm_key[2]:  # is_open = True
                     self.print(f"[pending_map] {pm_key[0]} {'多' if pm_key[1] == 2 else '空'} 开仓 {pm_vol} 手")
 
-            # 8. 计算缺额/超额
+            # 9. 计算缺额/超额
             missing_orders = []
             excess_orders = []
 
@@ -140,24 +163,26 @@ class PositionSyncManagerSync:
                     if current_time - reject_time < 30:
                         cooling_contracts.append(contract_upper)
 
-            # 计算缺额
+            # 计算缺额（使用 effective_actual = actual_agg + pending_open）
+            # 避免在途开仓委托被错误判断为缺额
             for key, t_vol in target.items():
-                a_vol = actual_agg.get(key, 0)
-                if t_vol > a_vol:
+                effective_vol = effective_actual.get(key, 0)
+                if t_vol > effective_vol:
                     contract, direction = key
-                    self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 实际{a_vol}, 缺额{t_vol - a_vol}")
+                    self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 有效{effective_vol}, 缺额{t_vol - effective_vol}")
                     missing_orders.append({
                         "contract": contract,
                         "direction": "buy" if direction == 2 else "sell",
-                        "volume": t_vol - a_vol,
+                        "volume": t_vol - effective_vol,
                     })
 
-            # 计算超额
-            for key, a_vol in actual_agg.items():
+            # 计算超额（使用 effective_actual = actual_agg + pending_open）
+            # 避免在途开仓委托被错误判断为超额（平掉还没成交的持仓）
+            for key, effective_vol in effective_actual.items():
+                contract, direction = key
                 t_vol = target.get(key, 0)
-                vol_to_close = a_vol - t_vol
+                vol_to_close = effective_vol - t_vol
                 if vol_to_close > 0:
-                    contract, direction = key
                     # 跳过1009冷却期内的合约
                     if contract.upper() in cooling_contracts:
                         self.print(f"[平] {contract} 在1009冷却期内（30秒），跳过本次平仓")
@@ -172,7 +197,7 @@ class PositionSyncManagerSync:
             self._update_hold_json_file()
 
             # 10. 输出对比摘要
-            self.print(f"[对比] 标准:{len(target)} 实际:{len(actual_agg)} 缺额:{len(missing_orders)} 超额:{len(excess_orders)}")
+            self.print(f"[对比] 标准:{len(target)} 有效:{len(effective_actual)} 缺额:{len(missing_orders)} 超额:{len(excess_orders)}")
             if missing_orders:
                 self.print(f"[缺额] {[mo['contract'] for mo in missing_orders]}")
             if excess_orders:
@@ -204,7 +229,7 @@ class PositionSyncManagerSync:
                 self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
 
             if has_diff:
-                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg)
+                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
                 self.print("[结论] 同步完成（委托已提交）")
                 self._is_first_run = False
                 return success
@@ -224,12 +249,14 @@ class PositionSyncManagerSync:
             traceback.print_exc()
             return False
 
-    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None) -> bool:
+    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None) -> bool:
         """快速同步：并行查询 + 批量提交"""
         if target is None:
             target = {}
         if actual_agg is None:
             actual_agg = {}
+        if pending_map is None:
+            pending_map = {}
 
         self.print("=" * 50)
         self.print("【快速同步模式】")
@@ -439,7 +466,19 @@ class PositionSyncManagerSync:
                 if current_time - last_rejected < 30:  # 30秒内不重复尝试同一合约
                     self.print(f"[平] {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
                     skip_close[0] += 1
+                    time.sleep(0.2)
                     continue
+
+                # ========== 跳过有在途开仓委托的合约 ==========
+                # 如果该合约+方向有在途开仓委托，说明持仓正在变化中
+                # 不应该在这个时间点平仓，避免"开仓未成交但持仓已平"的错误
+                pending_open_vol = pending_map.get((contract.upper(), pos_dir, True), 0)
+                if pending_open_vol > 0:
+                    self.print(f"[平] {contract} 有在途开仓委托 {pending_open_vol} 手，跳过平仓（等待成交确认）")
+                    skip_close[0] += 1
+                    time.sleep(0.2)
+                    continue
+                # ========== 跳过有在途开仓委托的合约 ==========
 
                 # 调试：检查所有未成交委托
                 with self._order_lock:

@@ -865,32 +865,43 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self.print("[监控] 加载标准持仓失败")
                 return
 
+            # 查询在途委托，用于计算有效持仓
+            ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            pending_map = self._build_pending_map(ctp_orders)
+
             # 聚合持仓
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
 
-            # 计算差异（使用实际持仓，不考虑在途委托）
-            # 在途委托由 _check_and_replace_pending_orders 单独处理
+            # 计算有效持仓 = 实际持仓 + 在途开仓委托
+            effective_actual = {}
+            for key in set(actual_agg.keys()) | set(target.keys()):
+                contract, direction = key
+                a_vol = actual_agg.get(key, 0)
+                pending_open = pending_map.get((contract.upper(), direction, True), 0)
+                effective_actual[key] = a_vol + pending_open
+
+            # 计算差异（使用有效持仓，避免在途开仓被错误判断）
             missing = []
             excess = []
             for key, t_vol in target.items():
-                a_vol = actual_agg.get(key, 0)
-                if t_vol > a_vol:
+                effective_vol = effective_actual.get(key, 0)
+                if t_vol > effective_vol:
                     contract, direction = key
                     missing.append({
                         "contract": contract,
                         "direction": "buy" if direction == 2 else "sell",
-                        "volume": t_vol - a_vol,
+                        "volume": t_vol - effective_vol,
                     })
 
-            for key, a_vol in actual_agg.items():
+            for key, effective_vol in effective_actual.items():
                 t_vol = target.get(key, 0)
-                if a_vol > t_vol:
+                if effective_vol > t_vol:
                     contract, direction = key
                     excess.append({
                         "contract": contract,
                         "direction": direction,
-                        "volume": a_vol - t_vol,
+                        "volume": effective_vol - t_vol,
                     })
 
             if missing or excess:

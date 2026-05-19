@@ -653,7 +653,7 @@ class PositionSyncManagerOrderOps:
             if md:
                 market_data_map[contract.upper()] = md
 
-        # 检查每个委托
+        # 检查每个委托（所有委托都检查，包括开仓和平仓）
         cancel_list = []
 
         for ref, info in pending_orders:
@@ -664,6 +664,7 @@ class PositionSyncManagerOrderOps:
 
             last_price = info.get("limit_price", 0) or info.get("last_md_price", 0)
             direction = info.get("direction", "")
+            offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
 
             if direction == "buy":
                 current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
@@ -677,7 +678,7 @@ class PositionSyncManagerOrderOps:
             info_obj = self._get_contract_info(contract.lower())
             price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
 
-            # 只在价格变化超过tick时才撤单重挂
+            # 检查是否需要撤单重挂：价格变化超过tick
             if last_price > 0 and abs(current_price - last_price) >= price_tick:
                 replace_count = info.get("replace_count", 0)
                 if replace_count >= self.MAX_REPLACE_COUNT:
