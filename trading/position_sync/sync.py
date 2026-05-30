@@ -51,6 +51,15 @@ class PositionSyncManagerSync:
         self.print("【持仓同步开始】")
         self.print("=" * 60)
 
+        # 检查冷却期：上次同步后60秒内不再同步（避免CTP持仓数据滞后导致重复下单）
+        current_time = time.time()
+        last_sync = getattr(self, '_last_sync_time', 0)
+        SYNC_COOLDOWN = 60  # 60秒冷却
+        if current_time - last_sync < SYNC_COOLDOWN:
+            self.print(f"[跳过] 距离上次同步仅 {current_time - last_sync:.0f} 秒，冷却中（{SYNC_COOLDOWN}秒）")
+            return False
+        self._last_sync_time = current_time
+
         try:
             # 1. 加载合约信息
             if not self._load_contract_info():
@@ -80,7 +89,8 @@ class PositionSyncManagerSync:
             else:
                 self.print("[撤销] 无在途委托需要撤销")
 
-            # 3. 查询持仓
+            # 3. 查询持仓（同步前再次确认，基于最新数据）
+            time.sleep(1)  # 等待 CTP 更新
             positions = self.query_positions(timeout=15)
             if positions is None:
                 self.print("[错误] 持仓查询失败")

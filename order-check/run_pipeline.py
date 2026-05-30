@@ -78,16 +78,59 @@ CHECK_INTERVAL = 20  # 秒
 SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
 AUTO_EXIT_AFTER_DAILY_CLOSE = True
 DAILY_CLOSE_TIME = datetime.time(15, 15, 0)
+# 各时段结束时间（到达后退出）
+MORNING_CLOSE_TIME = datetime.time(11, 30, 0)   # 上午收盘
+AFTERNOON_CLOSE_TIME = datetime.time(15, 15, 0)  # 下午收盘
+NIGHT_CLOSE_TIME = datetime.time(2, 30, 0)        # 夜盘收盘（凌晨）
 
 # 关键时间点强制对齐（格式：HH:MM）
 KEY_ALIGN_TIMES = ["14:58", "14:59", "15:00"]
+
+# ==================== 单实例检测 ====================
+# 防止 Windows 任务计划程序多实例同时运行
+_INSTANCE_LOCK_FILE = os.path.join(_CURR_DIR, '.pipeline_instance.lock')
+
+def check_single_instance():
+    """检查是否已有实例在运行，防止多实例同时启动"""
+    if sys.platform == 'win32':
+        import msvcrt
+        try:
+            fd = os.open(_INSTANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            # 成功获取锁，写入 PID
+            os.write(fd, str(os.getpid()).encode())
+            # 保持文件句柄打开，维持锁
+            return fd
+        except (IOError, OSError):
+            # 已有实例在运行
+            return None
+    else:
+        import fcntl
+        try:
+            fd = os.open(_INSTANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.write(fd, str(os.getpid()).encode())
+            return fd
+        except (IOError, OSError):
+            return None
+
+def release_single_instance(fd):
+    """释放单实例锁"""
+    if fd is not None:
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            os.close(fd)
+        except Exception:
+            pass
+# =================================================
 
 # 尝试导入飞书 webhook
 try:
     from compare_orders import FEISHU_WEBHOOK_URL
 except ImportError:
     FEISHU_WEBHOOK_URL = ""
-# =================================================
 
 
 def send_feishu_text(text):
@@ -402,12 +445,31 @@ def export_loop():
                 now_time = datetime.datetime.now().time()
                 wait_sec = seconds_until_next_session()
                 logger.info("[导出线程] 非交易时间，距离下次开盘还有 %d 分 %d 秒", wait_sec // 60, wait_sec % 60)
-                if now_time >= DAILY_CLOSE_TIME:
-                    send_feishu_text("当日交易结束")
-                    if AUTO_EXIT_AFTER_DAILY_CLOSE and _CTP_ENV_NAME == "online":
-                        logger.info("[导出线程] 日盘已结束，准备退出")
-                        shutdown_event.set()
-                        break
+
+                # 检查是否应该退出（收盘后退出，夜盘02:30退出）
+                # 判断是否在夜盘交易时间内（21:00-02:30，跨午夜）
+                now_hour = now_time.hour
+                is_in_night_session = (now_hour >= 21) or (now_hour < 2)  # 21:00-02:30
+
+                # 午盘收盘后（11:30-13:00）退出
+                if now_time >= MORNING_CLOSE_TIME and now_time < datetime.time(13, 0, 0):
+                    logger.info("[导出线程] 午盘已结束，准备退出")
+                    send_feishu_text("午盘结束，流水线退出")
+                    shutdown_event.set()
+                    break
+                # 下午收盘后（15:15）退出
+                elif now_time >= DAILY_CLOSE_TIME:
+                    logger.info("[导出线程] 日盘已结束，准备退出")
+                    send_feishu_text("日盘结束，流水线退出")
+                    shutdown_event.set()
+                    break
+                # 夜盘收盘后（02:30）退出
+                elif is_in_night_session and now_time >= NIGHT_CLOSE_TIME:
+                    logger.info("[导出线程] 夜盘已结束，准备退出")
+                    send_feishu_text("夜盘结束，流水线退出")
+                    shutdown_event.set()
+                    break
+
                 last_heartbeat = time.time()
 
             # 等待下一个周期，定期输出心跳
@@ -427,6 +489,14 @@ def export_loop():
 
 
 def main():
+    # 检查单实例，防止多任务同时运行导致持仓加倍
+    instance_fd = check_single_instance()
+    if instance_fd is None:
+        logger.error("[错误] 已有实例在运行，本次启动被阻止")
+        print("[错误] 已有实例在运行，请先停止当前任务")
+        sys.exit(1)
+    logger.info("[检查] 单实例检查通过，PID=%d", os.getpid())
+
     import signal as _signal_module
     def _signal_handler(sig, frame):
         logger.info("收到中断信号，准备退出...")

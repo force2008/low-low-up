@@ -1004,12 +1004,10 @@ class PositionManagerUI(CTdSpiBase):
                     import traceback
                     self.print(traceback.format_exc())
                 try:
-                    self.query_trading_account(timeout=5)
+                    self.query_trading_account(timeout=10)
                     self.master.after(0, self._update_account_ui)
                 except Exception as e:
                     self.print(f"[_poll_loop] 资金刷新异常: {e}")
-            # 每 6 秒刷新委托（避免界面频繁闪烁）
-            if poll_count % 3 == 0:
                 try:
                     with self._refresh_lock:
                         # 清空后再查询，避免重复累积
