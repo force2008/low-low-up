@@ -44,7 +44,12 @@ class PositionSyncManagerBase(CTdSpiBase):
         main_contracts_path: str,
         conf=None,
         env_name: str = None,
+        position_ratio: float = 1.0,
     ):
+        if position_ratio <= 0:
+            raise ValueError(f"position_ratio 必须大于 0，当前值: {position_ratio}")
+        self._position_ratio = float(position_ratio)
+
         self.hold_std_path = hold_std_path
         self.main_contracts_path = main_contracts_path
         self.env_name = env_name
@@ -135,6 +140,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         print("[__init__] 准备调用 super().__init__...")
         super().__init__(conf=conf)
         print("[__init__] super().__init__ 完成，start_monitor")
+        self.print(f"[配置] 持仓同步比例: {self._position_ratio}")
 
         # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
         # 注意：必须在 super().__init__ 之后调用，因为后者会阻塞直到登录成功

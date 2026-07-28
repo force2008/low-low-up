@@ -48,6 +48,7 @@ kline_data/
 # Temp
 --help
 temp_*
+backtest/reports/charts/*
 
 order-check/coordinates.txt
 

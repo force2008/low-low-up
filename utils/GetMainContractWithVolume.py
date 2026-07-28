@@ -11,6 +11,16 @@ import atexit
 import logging
 from datetime import datetime
 from collections import defaultdict
+
+# 将项目根目录加入模块搜索路径，支持从 utils/ 子目录直接运行
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# 输出目录：项目根目录下的 data/contracts
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "contracts")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 from ctp.base_tdapi import CTdSpiBase, tdapi
 from ctp.base_mdapi import CMdSpiBase, mdapi
 
@@ -70,7 +80,7 @@ class CTdSpi(CTdSpiBase):
     
     def __init__(self, use_online=False):
         # 根据use_online参数获取配置
-        import config
+        from config import config
         conf = config.envs["online"] if use_online else config.envs["7x24"]
         super().__init__(conf)
         self.instruments = []
@@ -144,11 +154,11 @@ class CTdSpi(CTdSpiBase):
     
     def save_instruments_to_json(self):
         """ 保存合约信息到 JSON 文件 """
-        
-        filename = "instruments.json"
+
+        filename = os.path.join(OUTPUT_DIR, "instruments.json")
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(self.instruments, f, ensure_ascii=False, indent=2)
-        
+
         print_log(f"已保存 {len(self.instruments)} 个合约信息到 {filename}")
     
     def release(self):
@@ -164,7 +174,7 @@ class CMdSpi(CMdSpiBase):
     
     def __init__(self, instruments, use_online=False):
         # 根据use_online参数获取配置
-        import config
+        from config import config
         conf = config.envs["online"] if use_online else config.envs["7x24"]
         super().__init__(conf)
         self.instruments = instruments
@@ -239,12 +249,12 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
     for product_id, instruments in product_instruments.items():
         if not instruments:
             continue
-        
-        # 筛选正在交易的合约
-        trading_instruments = [inst for inst in instruments if inst["IsTrading"]]
-        
+
+        # 筛选正在交易的期货合约（ProductClass = "1"）
+        trading_instruments = [inst for inst in instruments if inst["IsTrading"] and inst.get("ProductClass") == "1"]
+
         if not trading_instruments:
-            print_log(f"产品 {product_id} 没有正在交易的合约")
+            print_log(f"产品 {product_id} 没有正在交易的期货合约")
             continue
         
         # 根据持仓量排序（持仓量最大的在前）
@@ -299,10 +309,10 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
         print_log(f"产品 {product_id} 的主力合约: {main_contract['InstrumentID']} 持仓量={main_contract['OpenInterest']} 成交量={main_contract['Volume']}")
     
     # 保存主力合约到 JSON 文件
-    filename = "main_contracts.json"
+    filename = os.path.join(OUTPUT_DIR, "main_contracts.json")
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(main_contracts, f, ensure_ascii=False, indent=2)
-    
+
     print_log(f"已保存 {len(main_contracts)} 个产品的主力合约到 {filename}")
     
     return main_contracts
@@ -310,17 +320,17 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
 
 if __name__ == '__main__':
     # 解析命令行参数
-    use_online = False
+    env_name = None
     for arg in sys.argv[1:]:
-        if arg == "online":
-            use_online = True
-            print_log("使用线上配置")
+        if arg in ("online", "7x24", "simu"):
+            env_name = arg
+            print_log(f"使用 {arg} 配置")
         elif arg == "test":
-            use_online = False
-            print_log("使用测试配置")
-    
+            print_log("使用测试配置 (7x24)")
+    env_name = env_name or "7x24"
+
     # 输出当前配置状态
-    print_log(f"当前配置模式: {'线上' if use_online else '测试'}")
+    print_log(f"当前配置模式: {env_name}")
     
     # 步骤1：获取合约信息（优先从文件读取）
     print_log("=" * 70)
@@ -328,8 +338,8 @@ if __name__ == '__main__':
     print_log("=" * 70)
     
     instruments = []
-    instruments_file = "instruments.json"
-    
+    instruments_file = os.path.join(OUTPUT_DIR, "instruments.json")
+
     # 检查 instruments.json 是否存在
     if os.path.exists(instruments_file):
         print_log(f"发现 {instruments_file} 文件，直接读取...")
@@ -346,7 +356,7 @@ if __name__ == '__main__':
     if not instruments:
         print_log(f"{instruments_file} 不存在或读取失败，开始查询合约信息...")
         
-        td_spi = CTdSpi(use_online=use_online)
+        td_spi = CTdSpi(env_name=env_name)
         td_spi_instance = td_spi  # 保存到全局变量
         td_spi.req()
         
@@ -390,7 +400,7 @@ if __name__ == '__main__':
     print_log("步骤2：订阅行情数据")
     print_log("=" * 70)
     
-    md_spi = CMdSpi(instruments, use_online=use_online)
+    md_spi = CMdSpi(instruments, env_name=env_name)
     md_spi_instance = md_spi  # 保存到全局变量
     md_spi.subscribe_market_data()
     

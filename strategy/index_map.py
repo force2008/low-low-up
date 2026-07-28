@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict
 class IndexMapper:
     @staticmethod
     def precompute_60m_index(df_5m: List[tuple], df_60m: List[tuple]) -> List[int]:
+        """预计算5m到60m的索引映射（与回测一致）"""
         if not df_5m or not df_60m:
             return []
 
