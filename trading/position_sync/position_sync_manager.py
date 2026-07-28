@@ -71,6 +71,7 @@ def run_position_sync(
     conf=None,
     env_name: str = None,
     logger=None,
+    position_ratio: float = 1.0,
 ) -> bool:
     """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
@@ -78,17 +79,19 @@ def run_position_sync(
         print(f"[run_position_sync] 创建 PositionSyncManager...")
         print(f"  hold_std_path={hold_std_path}")
         print(f"  main_contracts_path={main_contracts_path}")
+        print(f"  position_ratio={position_ratio}")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
             conf=conf,
             env_name=env_name,
+            position_ratio=position_ratio,
         )
         if logger:
             mgr.set_logger(logger)
         print(f"[run_position_sync] PositionSyncManager 创建成功，调用 sync_and_trade...")
         result = mgr.sync_and_trade(
-            trade_volume=trade_volume, timeout=timeout
+            trade_volume=trade_volume, timeout=timeout, position_ratio=position_ratio
         )
         print(f"[run_position_sync] sync_and_trade 返回: {result}")
         return result
@@ -117,6 +120,7 @@ def run_position_sync_loop(
     env_name: str = None,
     logger=None,
     stop_event=None,
+    position_ratio: float = 1.0,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -133,6 +137,7 @@ def run_position_sync_loop(
         env_name: 环境名称
         logger: 日志记录器
         stop_event: 停止事件（threading.Event），设为 None 则一直运行
+        position_ratio: 持仓同步比例
 
     Returns:
         bool: 是否正常结束
@@ -151,12 +156,14 @@ def run_position_sync_loop(
         _log(f"[同步] 创建 PositionSyncManager...")
         _log(f"  hold_std_path={hold_std_path}")
         _log(f"  main_contracts_path={main_contracts_path}")
+        _log(f"  position_ratio={position_ratio}")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
             conf=conf,
             env_name=env_name,
+            position_ratio=position_ratio,
         )
         if logger:
             mgr.set_logger(logger)
@@ -169,7 +176,7 @@ def run_position_sync_loop(
 
         # 首次同步
         _log("[同步] 首次同步...")
-        mgr.sync_and_trade(trade_volume=trade_volume)
+        mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
 
         # 持续监控循环
         while True:
@@ -184,7 +191,7 @@ def run_position_sync_loop(
                 if current_mtime > last_hold_std_mtime:
                     _log(f"[同步] 检测到 hold-std.json 更新，执行同步...")
                     last_hold_std_mtime = current_mtime
-                    mgr.sync_and_trade(trade_volume=trade_volume)
+                    mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
                 else:
                     # 文件没变，短暂等待后继续监控
                     threading.Event().wait(timeout=2)

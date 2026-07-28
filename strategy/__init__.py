@@ -14,6 +14,7 @@ from .macd import MACDCalculator, ATRCalculator
 from .stack import StackIdentifier
 from .signal_manager import StrategySignalManager
 from .index_map import IndexMapper
+from .boll import BOLLCalculator
 
 __all__ = [
     'MACDCalculator',
@@ -22,4 +23,5 @@ __all__ = [
     'Strategy',
     'StrategySignalManager',
     'IndexMapper',
+    'BOLLCalculator',
 ]

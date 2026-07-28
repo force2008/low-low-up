@@ -189,66 +189,79 @@ class FeishuNotifier:
     def send_strategy_signal(self, symbol: str, signal_data: dict) -> bool:
         """
         发送策略开仓信号
-        
+
         Args:
             symbol: 合约代码
             signal_data: 策略信号数据
-                - signal_type: 信号类型 (ENTRY_LONG/EXIT_LONG)
+                - signal_type: 信号类型 (ENTRY_LONG/EXIT_LONG/BOLL_...)
                 - price: 价格
                 - stop_loss: 止损价
                 - position_size: 手数
                 - reason: 信号原因
                 - time: 信号时间
-            
+                - message: 信号提示语（BOLL 策略使用）
+
         Returns:
             bool: 发送是否成功
         """
-        # 检查冷却时间（5 分钟内不重复发送同一合约的同类型信号）
+        # 检查冷却时间（2 小时内不重复发送同一合约的同类型信号）
         now = datetime.now()
         signal_key = f"{symbol}_{signal_data.get('signal_type', 'UNKNOWN')}"
         last_time = self.last_notify_time.get(signal_key)
         if last_time and (now - last_time).total_seconds() < 7200:
             print(f"[飞书通知] {signal_key} 在冷却期内，跳过发送")
             return False
-        
+
         # 构建消息
         signal_type = signal_data.get('signal_type', 'ENTRY_LONG')
+        message = signal_data.get('message', '')
+
         if signal_type == 'ENTRY_LONG':
             title = "📈 策略开仓信号 - 做多"
             signal_icon = "🟢"
         elif signal_type == 'EXIT_LONG':
             title = "📉 策略平仓信号 - 平多"
             signal_icon = "🔴"
+        elif signal_type in ('BOLL_REBOUND_DAY', 'BOLL_REBOUND_60MIN'):
+            title = "📊 BOLL中轨空头提示"
+            signal_icon = "🔵"
+        elif signal_type in ('BOLL_PULLBACK_DAY', 'BOLL_PULLBACK_60MIN'):
+            title = "📊 BOLL中轨多头提示"
+            signal_icon = "🟣"
         else:
             title = "📊 策略信号"
             signal_icon = "⚪"
-        
+
         # 获取数据
         price = signal_data.get('price', 0)
         stop_loss = signal_data.get('stop_loss', 0)
         position_size = signal_data.get('position_size', 1)
         reason = signal_data.get('reason', '')
         signal_time = signal_data.get('time', now.strftime('%Y-%m-%d %H:%M:%S'))
-        
+
         # 构建内容
-        content = [
-            {"tag": "text", "text": f"{signal_icon} 合约：{symbol}\n"},
-            {"tag": "text", "text": f"信号类型：{signal_type}\n"},
-            {"tag": "text", "text": f"入场价格：{price:.2f}\n"},
-            {"tag": "text", "text": f"止损价格：{stop_loss:.2f}\n"},
-            {"tag": "text", "text": f"开仓手数：{position_size} 手\n"},
-            {"tag": "text", "text": f"\n信号原因：{reason}\n"},
-            {"tag": "text", "text": f"\n信号时间：{signal_time}"},
-        ]
-        
+        content_lines = [f"{signal_icon} 合约：{symbol}\n"]
+        if message:
+            content_lines.append(f"💡 提示：{message}\n")
+        content_lines.append(f"信号类型：{signal_type}\n")
+        content_lines.append(f"参考价格：{price:.2f}\n")
+        if stop_loss:
+            content_lines.append(f"止损价格：{stop_loss:.2f}\n")
+        if position_size:
+            content_lines.append(f"开仓手数：{position_size} 手\n")
+        content_lines.append(f"\n信号原因：{reason}\n")
+        content_lines.append(f"\n信号时间：{signal_time}")
+
+        content = [{"tag": "text", "text": line} for line in content_lines]
+
         success = self.send_post(title, content)
-        
+
         if success:
             self.last_notify_time[signal_key] = now
             print(f"[飞书通知] {symbol} 策略信号已发送")
         else:
             print(f"[飞书通知] {symbol} 策略信号发送失败")
-        
+
         return success
 
     def send_breakout_signal(self, symbol: str, details: dict) -> bool:

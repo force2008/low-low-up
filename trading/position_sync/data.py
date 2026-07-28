@@ -284,6 +284,8 @@ class PositionSyncManagerData:
 
     def _parse_hold_std(self) -> Dict[Tuple[str, int], int]:
         result: Dict[Tuple[str, int], int] = {}
+        ratio = getattr(self, '_position_ratio', 1.0)
+        total_original = 0
         for i, row in enumerate(self._hold_std):
             raw_contract = self._extract_contract(row)
             contract = self._standardize_contract(raw_contract)
@@ -302,7 +304,11 @@ class PositionSyncManagerData:
             else:
                 self.print(f"[调试-hold] 第{i}条 {contract} 方向无法解析 '{direction_str}'")
                 continue
-            result[(contract, direction)] = result.get((contract, direction), 0) + volume
+            total_original += volume
+            scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
+            result[(contract, direction)] = result.get((contract, direction), 0) + scaled_volume
+        total_scaled = sum(result.values())
+        self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
         return result
 
     def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:

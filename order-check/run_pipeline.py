@@ -30,6 +30,20 @@ _FORCE_RUN = "--force" in sys.argv
 if _FORCE_RUN:
     sys.argv.remove("--force")  # 移除，避免影响后续参数解析
 
+# 解析持仓比例参数
+_POSITION_RATIO = 1.0
+if "--ratio" in sys.argv:
+    idx = sys.argv.index("--ratio")
+    if idx + 1 < len(sys.argv):
+        try:
+            _POSITION_RATIO = float(sys.argv[idx + 1])
+            sys.argv.pop(idx)      # 移除 --ratio
+            sys.argv.pop(idx)      # 移除值
+        except ValueError:
+            print("[警告] --ratio 参数值无效，使用默认值 1.0")
+    else:
+        print("[警告] --ratio 参数缺少值，使用默认值 1.0")
+
 
 def _is_trading_day() -> bool:
     """检查今天是否为交易日
@@ -124,6 +138,9 @@ TRADING_SESSIONS = [
 ]
 CHECK_INTERVAL = 20  # 秒
 SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
+
+# 持仓同步比例：1.0=全仓，0.5=半仓；可通过 --ratio 覆盖
+POSITION_RATIO = _POSITION_RATIO
 
 # 自动退出配置（仅 online 环境生效）
 AUTO_EXIT_AFTER_DAILY_CLOSE = True
@@ -296,6 +313,7 @@ def run_sync():
             timeout=60,
             conf=None,
             env_name=_CTP_ENV_NAME,
+            position_ratio=POSITION_RATIO,
         )
         logger.info(">>> 持仓同步返回: sync_ok=%s", sync_ok)
         _last_sync_time[0] = time.time()
@@ -368,6 +386,7 @@ def force_sync():
             conf=None,
             env_name=_CTP_ENV_NAME,
             logger=logger,
+            position_ratio=POSITION_RATIO,
         )
         if sync_ok:
             logger.info("强制同步完成")
@@ -502,6 +521,7 @@ def main():
     logger.info("  - 同步线程: 持续监控，发现差异立即处理")
     logger.info("  - 关键时间: %s 强制对齐", KEY_ALIGN_TIMES)
     logger.info("  - 当前CTP环境: %s", _CTP_ENV_NAME)
+    logger.info("  - 持仓同步比例: %s", POSITION_RATIO)
     if SKIP_TRADING_TIME_CHECK:
         logger.info("  - 跳过交易时段检查")
     logger.info("交易时间段: %s", TRADING_SESSIONS)
@@ -558,6 +578,7 @@ def main():
                 env_name=_CTP_ENV_NAME,
                 logger=logger,
                 stop_event=shutdown_event,
+                position_ratio=POSITION_RATIO,
             )
         except Exception as e:
             logger.error("[同步线程] 异常: %s", e)

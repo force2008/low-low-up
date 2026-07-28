@@ -11,6 +11,16 @@ import atexit
 import logging
 from datetime import datetime
 from collections import defaultdict
+
+# 将项目根目录加入模块搜索路径，支持从 utils/ 子目录直接运行
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# 输出目录：项目根目录下的 data/contracts
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "contracts")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 from ctp.base_tdapi import CTdSpiBase, tdapi
 from ctp.base_mdapi import CMdSpiBase, mdapi
 
@@ -70,7 +80,7 @@ class CTdSpi(CTdSpiBase):
     
     def __init__(self, use_online=False):
         # 根据use_online参数获取配置
-        import config
+        from config import config
         conf = config.envs["online"] if use_online else config.envs["7x24"]
         super().__init__(conf)
         self.instruments = []
@@ -144,11 +154,11 @@ class CTdSpi(CTdSpiBase):
     
     def save_instruments_to_json(self):
         """ 保存合约信息到 JSON 文件 """
-        
-        filename = "instruments.json"
+
+        filename = os.path.join(OUTPUT_DIR, "instruments.json")
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(self.instruments, f, ensure_ascii=False, indent=2)
-        
+
         print_log(f"已保存 {len(self.instruments)} 个合约信息到 {filename}")
     
     def release(self):
@@ -164,7 +174,7 @@ class CMdSpi(CMdSpiBase):
     
     def __init__(self, instruments, use_online=False):
         # 根据use_online参数获取配置
-        import config
+        from config import config
         conf = config.envs["online"] if use_online else config.envs["7x24"]
         super().__init__(conf)
         self.instruments = instruments
@@ -299,10 +309,10 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
         print_log(f"产品 {product_id} 的主力合约: {main_contract['InstrumentID']} 持仓量={main_contract['OpenInterest']} 成交量={main_contract['Volume']}")
     
     # 保存主力合约到 JSON 文件
-    filename = "main_contracts.json"
+    filename = os.path.join(OUTPUT_DIR, "main_contracts.json")
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(main_contracts, f, ensure_ascii=False, indent=2)
-    
+
     print_log(f"已保存 {len(main_contracts)} 个产品的主力合约到 {filename}")
     
     return main_contracts
@@ -328,8 +338,8 @@ if __name__ == '__main__':
     print_log("=" * 70)
     
     instruments = []
-    instruments_file = "instruments.json"
-    
+    instruments_file = os.path.join(OUTPUT_DIR, "instruments.json")
+
     # 检查 instruments.json 是否存在
     if os.path.exists(instruments_file):
         print_log(f"发现 {instruments_file} 文件，直接读取...")

@@ -32,6 +32,7 @@ class PositionSyncManagerSync:
         self,
         trade_volume: int = 1,
         timeout: int = 30,
+        position_ratio: float = 1.0,
     ) -> bool:
         # 获取线程锁，防止并发调用
         if not self._sync_lock.acquire(blocking=True, timeout=5):
@@ -40,15 +41,22 @@ class PositionSyncManagerSync:
 
         self._is_syncing = True
         try:
-            return self._do_sync(trade_volume, timeout, lock_held=True)
+            return self._do_sync(trade_volume, timeout, position_ratio=position_ratio, lock_held=True)
         finally:
             self._is_syncing = False
             self._sync_lock.release()
 
-    def _do_sync(self, trade_volume: int = 1, timeout: int = 30, lock_held: bool = False) -> bool:
+    def _do_sync(self, trade_volume: int = 1, timeout: int = 30, position_ratio: float = None, lock_held: bool = False) -> bool:
         """执行同步：加载数据 -> 对比 -> 快速同步"""
+        if position_ratio is not None:
+            if position_ratio <= 0:
+                self.print(f"[错误] position_ratio 必须大于 0，当前值: {position_ratio}")
+                return False
+            self._position_ratio = float(position_ratio)
+
         self.print("=" * 60)
         self.print("【持仓同步开始】")
+        self.print(f"【持仓比例】{self._position_ratio}")
         self.print("=" * 60)
 
         # 1. 加载合约信息
@@ -141,7 +149,7 @@ class PositionSyncManagerSync:
 
         # 11. 发送持仓差异通知
         if missing_orders or excess_orders:
-            diff_lines = ["🔄 持仓差异检测到，准备同步："]
+            diff_lines = [f"🔄 持仓差异检测到（比例={self._position_ratio}），准备同步："]
             if missing_orders:
                 total_missing = sum(mo["volume"] for mo in missing_orders)
                 diff_lines.append(f"📈 缺额开仓 ({len(missing_orders)} 个合约，共 {total_missing} 手):")
