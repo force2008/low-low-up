@@ -5,6 +5,8 @@
 
 from .strategy_config import Config, DataLoader
 from .strategy_models import Trade, SignalType, Position, Signal
+from .database_manager import DatabaseManager
+from .signal_manager import StrategySignalManager
 
 __all__ = [
     'Config',
@@ -13,4 +15,6 @@ __all__ = [
     'SignalType',
     'Position',
     'Signal',
+    'DatabaseManager',
+    'StrategySignalManager',
 ]

@@ -11,6 +11,11 @@ import atexit
 import logging
 from datetime import datetime
 from collections import defaultdict
+
+# 添加项目根目录到 Python 路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import config
 from ctp.base_tdapi import CTdSpiBase, tdapi
 from ctp.base_mdapi import CMdSpiBase, mdapi
 
@@ -67,11 +72,13 @@ atexit.register(cleanup)
 
 
 class CTdSpi(CTdSpiBase):
-    
-    def __init__(self, use_online=False):
-        # 根据use_online参数获取配置
-        import config
-        conf = config.envs["online"] if use_online else config.envs["7x24"]
+
+    def __init__(self, env_name=None):
+        # 获取配置
+        if env_name and env_name in config.envs:
+            conf = config.envs[env_name]
+        else:
+            conf = config.get_env_config()
         super().__init__(conf)
         self.instruments = []
         self.product_instruments = defaultdict(list)
@@ -161,11 +168,13 @@ class CTdSpi(CTdSpiBase):
 
 
 class CMdSpi(CMdSpiBase):
-    
-    def __init__(self, instruments, use_online=False):
-        # 根据use_online参数获取配置
-        import config
-        conf = config.envs["online"] if use_online else config.envs["7x24"]
+
+    def __init__(self, instruments, env_name=None):
+        # 获取配置
+        if env_name and env_name in config.envs:
+            conf = config.envs[env_name]
+        else:
+            conf = config.get_env_config()
         super().__init__(conf)
         self.instruments = instruments
         self.instrument_volume = {}
@@ -239,12 +248,12 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
     for product_id, instruments in product_instruments.items():
         if not instruments:
             continue
-        
-        # 筛选正在交易的合约
-        trading_instruments = [inst for inst in instruments if inst["IsTrading"]]
-        
+
+        # 筛选正在交易的期货合约（ProductClass = "1"）
+        trading_instruments = [inst for inst in instruments if inst["IsTrading"] and inst.get("ProductClass") == "1"]
+
         if not trading_instruments:
-            print_log(f"产品 {product_id} 没有正在交易的合约")
+            print_log(f"产品 {product_id} 没有正在交易的期货合约")
             continue
         
         # 根据持仓量排序（持仓量最大的在前）
@@ -310,17 +319,17 @@ def calculate_main_contracts(instruments, instrument_volume, instrument_open_int
 
 if __name__ == '__main__':
     # 解析命令行参数
-    use_online = False
+    env_name = None
     for arg in sys.argv[1:]:
-        if arg == "online":
-            use_online = True
-            print_log("使用线上配置")
+        if arg in ("online", "7x24", "simu"):
+            env_name = arg
+            print_log(f"使用 {arg} 配置")
         elif arg == "test":
-            use_online = False
-            print_log("使用测试配置")
-    
+            print_log("使用测试配置 (7x24)")
+    env_name = env_name or "7x24"
+
     # 输出当前配置状态
-    print_log(f"当前配置模式: {'线上' if use_online else '测试'}")
+    print_log(f"当前配置模式: {env_name}")
     
     # 步骤1：获取合约信息（优先从文件读取）
     print_log("=" * 70)
@@ -346,7 +355,7 @@ if __name__ == '__main__':
     if not instruments:
         print_log(f"{instruments_file} 不存在或读取失败，开始查询合约信息...")
         
-        td_spi = CTdSpi(use_online=use_online)
+        td_spi = CTdSpi(env_name=env_name)
         td_spi_instance = td_spi  # 保存到全局变量
         td_spi.req()
         
@@ -390,7 +399,7 @@ if __name__ == '__main__':
     print_log("步骤2：订阅行情数据")
     print_log("=" * 70)
     
-    md_spi = CMdSpi(instruments, use_online=use_online)
+    md_spi = CMdSpi(instruments, env_name=env_name)
     md_spi_instance = md_spi  # 保存到全局变量
     md_spi.subscribe_market_data()
     
