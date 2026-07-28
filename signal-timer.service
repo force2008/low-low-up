@@ -1,0 +1,19 @@
+[Unit]
+Description=Signal Timer Service (checks strategy signals every 5 minutes)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/low-low-up
+ExecStartPre=/home/ubuntu/quant/cp_online_lib.sh
+ExecStart=/home/ubuntu/miniconda3/envs/python310/bin/python /home/ubuntu/low-low-up/SignalTimer.py online
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+Environment="CTP_ENV=online"
+
+[Install]
+WantedBy=multi-user.target

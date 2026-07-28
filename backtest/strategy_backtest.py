@@ -371,7 +371,7 @@ def main():
                         cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
 
                         if cond_5m:
-                            initial_stop_loss, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m)
+                            initial_stop_loss, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m, df_60m, green_stacks_60m)
 
                             if initial_stop_loss is None:
                                 continue
@@ -425,7 +425,7 @@ def main():
                         cond_5m, reason_5m = strategy.check_5m_entry(df_5m, i, green_stacks_5m)
 
                         if cond_5m:
-                            initial_stop_loss, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m)
+                            initial_stop_loss, stop_reason = strategy.get_initial_stop_loss(df_5m, i, green_stacks_5m, green_gaps_5m, df_60m, green_stacks_60m)
 
                             if initial_stop_loss is None:
                                 continue

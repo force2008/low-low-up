@@ -56,9 +56,19 @@ class DataLoader:
         return self._contracts_cache
 
     def load_kline_fast(self, symbol: str, duration: int, limit: int = None) -> List[tuple]:
-        """快速加载 K 线数据（加载最近的数据）"""
+        """快速加载 K 线数据（加载最近的数据）
+
+        Args:
+            symbol: 合约符号，支持多种格式:
+                - CU.SHF -> shfe.cu2606 (根据main_contracts.json匹配)
+                - SHFE.CU2606 -> shfe.cu2606
+                - shfe.cu2606 -> shfe.cu2606
+        """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+
+        # 尝试用 main_contracts.json 匹配
+        db_symbol = self._convert_to_db_symbol(symbol, cursor)
 
         if limit:
             query = f"""SELECT datetime, open, high, low, close, volume
@@ -71,7 +81,7 @@ class DataLoader:
                        FROM kline_data WHERE symbol = ? AND duration = ?
                        ORDER BY datetime ASC"""
 
-        cursor.execute(query, [symbol, duration])
+        cursor.execute(query, [db_symbol, duration])
         rows = cursor.fetchall()
         conn.close()
 
@@ -79,6 +89,43 @@ class DataLoader:
         if limit:
             result.reverse()  # 反转为正序
         return result
+
+    def _convert_to_db_symbol(self, symbol: str, cursor) -> str:
+        """将符号转换为数据库格式
+
+        从 main_contracts.json 匹配，找到对应的数据库 symbol
+        示例: CU.SHF -> shfe.cu2606, SHFE.CU2606 -> shfe.cu2606
+        """
+        # 先尝试直接转换
+        symbol_lower = symbol.lower()
+
+        # 如果已经是正确格式，直接返回
+        cursor.execute("SELECT 1 FROM kline_data WHERE symbol = ? LIMIT 1", [symbol_lower])
+        if cursor.fetchone():
+            return symbol_lower
+
+        # 尝试从 main_contracts.json 匹配
+        contracts = self.load_main_contracts()
+
+        if '.' in symbol:
+            # 处理格式如 CU.SHF, SHFE.CU2606
+            exchange = symbol.split('.')[0].lower()
+            code = symbol.split('.')[-1].lower()
+
+            # 查找匹配的合约
+            for product_id, contract in contracts.items():
+                if code.startswith(product_id.lower()):
+                    # 找到匹配的合约，构建数据库格式（保持大写）
+                    exchange_id = contract.get('ExchangeID', '').upper()
+                    main_contract = contract.get('MainContractID', '').upper()
+                    db_symbol = f"{exchange_id}.{main_contract}"
+
+                    # 验证是否存在
+                    cursor.execute("SELECT 1 FROM kline_data WHERE symbol = ? LIMIT 1", [db_symbol])
+                    if cursor.fetchone():
+                        return db_symbol
+
+        return symbol_lower
 
     def get_symbol_info(self, symbol: str) -> Optional[dict]:
         """获取合约信息"""

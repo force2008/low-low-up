@@ -586,15 +586,15 @@ class StrategyLowLowUp:
                         'created_time': current_60m_time,
                     }, f"60分钟绿柱堆内DIF拐头+底背离"
 
-        # 绿柱堆转红柱堆 + 底背离
-        elif hist_60m > 0 and hist_60m_prev < 0:
-            diver_ok, diver_reason, _, _ = self.check_60m_divergence(df_60m, idx_60m)
-            if diver_ok:
-                return {
-                    'type': 'green',
-                    'sub_type': 'green_to_red',
-                    'created_time': current_60m_time,
-                }, f"60分钟绿柱堆转红柱堆+底背离"
+        # 绿柱堆转红柱堆 + 底背离（回测中没有此信号，暂时禁用）
+        # elif hist_60m > 0 and hist_60m_prev < 0:
+        #     diver_ok, diver_reason, _, _ = self.check_60m_divergence(df_60m, idx_60m)
+        #     if diver_ok:
+        #         return {
+        #             'type': 'green',
+        #             'sub_type': 'green_to_red',
+        #             'created_time': current_60m_time,
+        #         }, f"60分钟绿柱堆转红柱堆+底背离"
 
         # 红柱堆内 DIF 拐头 + 底部抬升
         elif hist_60m > 0:
@@ -700,6 +700,11 @@ class StrategyLowLowUp:
             elif sig_type == 'red':
                 diver_ok, diver_reason, _, _ = self.check_60m_bottom_rise_in_red(df_60m, idx_60m)
                 if not diver_ok:
+                    continue
+
+                # 红柱堆信号需要检查5分钟绿柱堆底部是否抬升（与回测一致）
+                cond_filter, reason_filter = self.check_5m_green_stack_filter(df_5m, idx_5m, green_stacks_5m)
+                if not cond_filter:
                     continue
 
             # 计算止损价

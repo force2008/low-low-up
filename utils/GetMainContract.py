@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # @Project: https://github.com/Jedore/ctp.examples
 # @File:    GetMainContract.py
 # @Time:    17/02/2026
@@ -15,6 +16,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+
+# 添加项目根目录到 Python 路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import config
 from ctp.base_tdapi import CTdSpiBase, tdapi
 
 # 输出目录：项目根目录下的 data/contracts
@@ -26,6 +32,14 @@ class CTdSpi(CTdSpiBase):
 
     def __init__(self):
         super().__init__()
+
+    def __init__(self, env_name=None):
+        # 获取配置
+        if env_name and env_name in config.envs:
+            conf = config.envs[env_name]
+        else:
+            conf = config.get_env_config()
+        super().__init__(conf)
         self.instruments = []
         self.product_instruments = defaultdict(list)
 
@@ -141,7 +155,9 @@ class CTdSpi(CTdSpiBase):
 
 
 if __name__ == '__main__':
-    spi = CTdSpi()
+    # 从命令行参数获取环境名称
+    env_name = sys.argv[1] if len(sys.argv) > 1 else None
+    spi = CTdSpi(env_name)
     spi.req()
 
     # 带超时的等待，避免 bIsLast 一直收不到时死循环
