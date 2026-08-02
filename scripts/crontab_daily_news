@@ -1,0 +1,15 @@
+# 期货日报定时任务示例
+# 使用前请先：
+#   1. 配置环境变量 LLM_API_KEY 和 FEISHU_WEBHOOK（建议写入 ~/.bashrc 或 systemd service）
+#   2. 确认 /home/ubuntu/miniconda3/envs/python310/bin/python 路径正确
+#   3. 确认当前用户对 /home/ubuntu/web/trades-analysis-web/static/news 有写权限
+#   4. 执行 `crontab -e` 粘贴以下内容
+
+SHELL=/bin/bash
+PATH=/home/ubuntu/miniconda3/envs/python310/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 日盘收盘后 15:35 生成日报
+35 15 * * * cd /home/ubuntu/low-low-up && /home/ubuntu/miniconda3/envs/python310/bin/python -m news_collector.daily_news_runner --session day >> /home/ubuntu/low-low-up/logs/daily_news.log 2>&1
+
+# 夜盘收盘后 02:35 生成日报
+35 2 * * * cd /home/ubuntu/low-low-up && /home/ubuntu/miniconda3/envs/python310/bin/python -m news_collector.daily_news_runner --session night >> /home/ubuntu/low-low-up/logs/daily_news.log 2>&1
