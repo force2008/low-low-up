@@ -7,7 +7,13 @@
   - 持仓对齐由 PositionSyncManager.sync_and_trade() 处理，支持一次性挂出所有委托
 
 使用方式:
-    python run_pipeline.py [online|simu|7x24]
+    python run_pipeline.py [online|simu|7x24] [--skip-time-check] [--force] [--ratio RATIO]
+
+说明:
+    - 默认只在配置的交易时段内执行导出与同步
+    - --skip-time-check: 开发/测试时显式跳过交易时段检查，允许非交易时段运行
+    - --force: 非交易日也强制运行
+    - --ratio: 持仓同步比例，默认 1.0
 """
 
 import sys
@@ -29,6 +35,11 @@ _TRADE_DATE_FILE = os.path.join(
 _FORCE_RUN = "--force" in sys.argv
 if _FORCE_RUN:
     sys.argv.remove("--force")  # 移除，避免影响后续参数解析
+
+# 解析跳过交易时段检查参数（开发/测试环境可在非交易时段运行）
+_SKIP_TIME_CHECK = "--skip-time-check" in sys.argv
+if _SKIP_TIME_CHECK:
+    sys.argv.remove("--skip-time-check")  # 移除，避免影响后续参数解析
 
 # 解析持仓比例参数
 _POSITION_RATIO = 1.0
@@ -123,10 +134,12 @@ try:
         _CTP_ENV_NAME = sys.argv[1].lower()
     elif os.getenv("CTP_ENV") in _ctp_config.envs:
         _CTP_ENV_NAME = os.getenv("CTP_ENV")
-    SKIP_TRADING_TIME_CHECK = (_CTP_ENV_NAME != "online")
+    # 默认所有环境都检查交易时段，只有显式传入 --skip-time-check 才允许非交易时段运行
+    SKIP_TRADING_TIME_CHECK = _SKIP_TIME_CHECK
 except ImportError:
     _CTP_ENV_NAME = "7x24"
-    SKIP_TRADING_TIME_CHECK = True
+    # 默认所有环境都检查交易时段，只有显式传入 --skip-time-check 才允许非交易时段运行
+    SKIP_TRADING_TIME_CHECK = _SKIP_TIME_CHECK
 # =================================================
 
 # ==================== 交易时间段配置 ====================
@@ -141,15 +154,6 @@ SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
 
 # 持仓同步比例：1.0=全仓，0.5=半仓；可通过 --ratio 覆盖
 POSITION_RATIO = _POSITION_RATIO
-
-# 自动退出配置（仅 online 环境生效）
-AUTO_EXIT_AFTER_DAILY_CLOSE = True
-
-DAILY_CLOSE_TIME = datetime.time(15, 15, 0)
-# 各时段结束时间（到达后退出）
-MORNING_CLOSE_TIME = datetime.time(11, 30, 0)   # 上午收盘
-AFTERNOON_CLOSE_TIME = datetime.time(15, 15, 0)  # 下午收盘
-NIGHT_CLOSE_TIME = datetime.time(2, 30, 0)        # 夜盘收盘（凌晨）
 
 
 # 关键时间点强制对齐（格式：HH:MM）
@@ -246,6 +250,46 @@ def seconds_until_next_session():
         next_dt = min(candidates)
         return int((next_dt - now).total_seconds())
     return 3600
+
+
+def get_target_session_end(now_time):
+    """根据当前时间，返回本次任务应负责到的时段结束时间。
+
+    多时段定时任务模式：08:59/12:59/20:59 各启动一次，
+    每个任务实例只跑一个"任务窗口"，到该窗口结束即退出：
+      - 02:30 ~ 11:30  → 上午盘窗口，退出 11:30
+      - 11:30 ~ 15:15  → 下午盘窗口（含午间等待），退出 15:15
+      - 15:15 ~ 02:30  → 夜盘窗口（跨午夜），退出 02:30
+    """
+    morning_end = datetime.time(11, 30, 0)
+    afternoon_end = datetime.time(15, 15, 0)
+    night_end = datetime.time(2, 30, 0)
+
+    # 02:30 ~ 11:30：上午盘任务窗口（含早间等待）
+    if night_end <= now_time < morning_end:
+        return morning_end
+    # 11:30 ~ 15:15：下午盘任务窗口（含午间等待）
+    if morning_end <= now_time < afternoon_end:
+        return afternoon_end
+    # 15:15 ~ 02:30：夜盘任务窗口（跨午夜）
+    if afternoon_end <= now_time or now_time < night_end:
+        return night_end
+
+    return morning_end
+
+
+# 根据本实例启动时间确定负责的交易时段结束时间，避免运行中跨越时段边界后改变目标
+_RESPONSIBLE_SESSION_END = get_target_session_end(datetime.datetime.now().time())
+
+
+def is_after_session_end(now_time, session_end):
+    """判断当前时间是否已超过目标时段结束时间。
+
+    处理夜盘跨午夜的情况：结束时间 02:30 表示 02:30 之后到 09:00 之前都算结束后。
+    """
+    if session_end == datetime.time(2, 30, 0):
+        return datetime.time(2, 30, 0) <= now_time < datetime.time(9, 0, 0)
+    return now_time >= session_end
 
 
 # ==================== 线程间通信 ====================
@@ -517,31 +561,20 @@ def export_loop():
                 wait_sec = seconds_until_next_session()
                 logger.info("[导出线程] 非交易时间，距离下次开盘还有 %d 分 %d 秒", wait_sec // 60, wait_sec % 60)
 
-
-                # 检查是否应该退出（收盘后退出，夜盘02:30退出）
-                # 判断是否在夜盘交易时间内（21:00-02:30，跨午夜）
-                now_hour = now_time.hour
-                is_in_night_session = (now_hour >= 21) or (now_hour < 2)  # 21:00-02:30
-
-                # 午盘收盘后（11:30-13:00）退出
-                if now_time >= MORNING_CLOSE_TIME and now_time < datetime.time(13, 0, 0):
-                    logger.info("[导出线程] 午盘已结束，准备退出")
-                    send_feishu_text("午盘结束，流水线退出")
+                # 多时段定时任务模式：每个任务只跑启动时确定的负责时段，
+                # 到该时段结束时间后即退出，等待下一个定时任务启动。
+                if is_after_session_end(now_time, _RESPONSIBLE_SESSION_END):
+                    if _RESPONSIBLE_SESSION_END == datetime.time(15, 15, 0):
+                        logger.info("[导出线程] 日盘已结束，准备退出")
+                        send_feishu_text("日盘结束，流水线退出")
+                    elif _RESPONSIBLE_SESSION_END == datetime.time(2, 30, 0):
+                        logger.info("[导出线程] 夜盘已结束，准备退出")
+                        send_feishu_text("夜盘结束，流水线退出")
+                    else:
+                        logger.info("[导出线程] 上午盘已结束，准备退出")
+                        send_feishu_text("上午盘结束，流水线退出")
                     shutdown_event.set()
                     break
-                # 下午收盘后（15:15）退出
-                elif now_time >= DAILY_CLOSE_TIME:
-                    logger.info("[导出线程] 日盘已结束，准备退出")
-                    send_feishu_text("日盘结束，流水线退出")
-                    shutdown_event.set()
-                    break
-                # 夜盘收盘后（02:30）退出
-                elif is_in_night_session and now_time >= NIGHT_CLOSE_TIME:
-                    logger.info("[导出线程] 夜盘已结束，准备退出")
-                    send_feishu_text("夜盘结束，流水线退出")
-                    shutdown_event.set()
-                    break
-
 
                 last_heartbeat = time.time()
 

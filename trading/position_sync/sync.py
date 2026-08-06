@@ -169,18 +169,6 @@ class PositionSyncManagerSync:
                     if current_time - reject_time < 30:
                         cooling_contracts.append(contract_upper)
 
-            # 8. 计算缺额/超额
-            missing_orders = []
-            excess_orders = []
-
-            # 检查是否有合约在1009冷却期
-            current_time = time.time()
-            cooling_contracts = []
-            if hasattr(self, '_last_1009_reject'):
-                for contract_upper, reject_time in list(self._last_1009_reject.items()):
-                    if current_time - reject_time < 30:
-                        cooling_contracts.append(contract_upper)
-
             # 计算缺额（使用 effective_actual = actual_agg + pending_open）
             # 避免在途开仓委托被错误判断为缺额
             for key, t_vol in target.items():
@@ -211,10 +199,10 @@ class PositionSyncManagerSync:
                         "volume": vol_to_close,
                     })
 
-            # 9. 更新 hold.json
+            # 10. 更新 hold.json
             self._update_hold_json_file()
 
-            # 10. 输出对比摘要
+            # 11. 输出对比摘要
             self.print(f"[对比] 标准:{len(target)} 有效:{len(effective_actual)} 缺额:{len(missing_orders)} 超额:{len(excess_orders)}")
             if missing_orders:
                 self.print(f"[缺额] {[mo['contract'] for mo in missing_orders]}")
@@ -222,48 +210,48 @@ class PositionSyncManagerSync:
                 self.print(f"[超额] {[eo['contract'] for eo in excess_orders]}")
 
 
-        # 11. 发送持仓差异通知
-        if missing_orders or excess_orders:
-            diff_lines = [f"🔄 持仓差异检测到（比例={self._position_ratio}），准备同步："]
+            # 12. 发送持仓差异通知
+            if missing_orders or excess_orders:
+                diff_lines = [f"🔄 持仓差异检测到（比例={self._position_ratio}），准备同步："]
 
-            if missing_orders:
-                total_missing = sum(mo["volume"] for mo in missing_orders)
-                diff_lines.append(f"📈 缺额开仓 ({len(missing_orders)} 个合约，共 {total_missing} 手):")
-                for mo in missing_orders:
-                    d = "买" if mo["direction"] == "buy" else "卖"
-                    diff_lines.append(f"  {mo['contract']} {d} {mo['volume']}手")
-            if excess_orders:
-                total_excess = sum(eo["volume"] for eo in excess_orders)
-                diff_lines.append(f"📉 超额平仓 ({len(excess_orders)} 个合约，共 {total_excess} 手):")
-                for eo in excess_orders:
-                    d = "多" if eo["direction"] == 2 else "空"
-                    diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
+                if missing_orders:
+                    total_missing = sum(mo["volume"] for mo in missing_orders)
+                    diff_lines.append(f"📈 缺额开仓 ({len(missing_orders)} 个合约，共 {total_missing} 手):")
+                    for mo in missing_orders:
+                        d = "买" if mo["direction"] == "buy" else "卖"
+                        diff_lines.append(f"  {mo['contract']} {d} {mo['volume']}手")
+                if excess_orders:
+                    total_excess = sum(eo["volume"] for eo in excess_orders)
+                    diff_lines.append(f"📉 超额平仓 ({len(excess_orders)} 个合约，共 {total_excess} 手):")
+                    for eo in excess_orders:
+                        d = "多" if eo["direction"] == 2 else "空"
+                        diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
 
-            # 12. 执行快速同步
-            total_target = sum(t for t in target.values())
-            total_actual = sum(a for a in actual_agg.values())
+                # 13. 执行快速同步
+                total_target = sum(t for t in target.values())
+                total_actual = sum(a for a in actual_agg.values())
 
-            # 判断是否有差异
-            has_diff = bool(missing_orders) or bool(excess_orders)
+                # 判断是否有差异
+                has_diff = bool(missing_orders) or bool(excess_orders)
 
-            if diff_lines:
-                self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
+                if diff_lines:
+                    self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
 
-            if has_diff:
-                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
-                self.print("[结论] 同步完成（委托已提交）")
-                self._is_first_run = False
-                return success
-            else:
-                self.print("[结论] 持仓一致，无需操作")
-                self._notify_async(
-                    f"✅ 启动持仓检测\n"
-                    f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
-                    f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
-                    f"状态: 仓位一致 ✓"
-                )
-                self._is_first_run = False
-                return True
+                if has_diff:
+                    success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
+                    self.print("[结论] 同步完成（委托已提交）")
+                    self._is_first_run = False
+                    return success
+                else:
+                    self.print("[结论] 持仓一致，无需操作")
+                    self._notify_async(
+                        f"✅ 启动持仓检测\n"
+                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
+                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
+                        f"状态: 仓位一致 ✓"
+                    )
+                    self._is_first_run = False
+                    return True
         except Exception as e:
             import traceback
             self.print(f"[异常] _do_sync 出错: {e}")

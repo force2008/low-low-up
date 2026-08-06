@@ -145,17 +145,17 @@ def save_exported_data():
     pyautogui.click()
     time.sleep(2)  # 等待保存完成
 
-    # 处理导出完成确认弹框（循环等待，导出完成后才会弹出）
+    # 处理导出完成确认弹框（最多等待 4 秒，超时则跳过，直接进行后续同步）
     print("等待导出完成确认弹框...")
     try:
-        wait_for_window("融航风控", timeout=15)
+        wait_for_window("融航风控", timeout=4)
         print("检测到导出完成弹框，点击确认按钮...")
         pyautogui.moveTo(OK_BUTTON_POSITION)
         pyautogui.click()
         time.sleep(1)
         print("已确认导出完成弹框")
     except Exception:
-        print("未检测到导出完成弹框，继续...")
+        print("4 秒内未检测到导出完成弹框，跳过确认，继续后续同步...")
 
 
 def main():

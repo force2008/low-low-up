@@ -125,8 +125,21 @@ class PositionManagerUI(CTdSpiBase):
         self._account_data: dict = {}
 
         self._build_ui()
-        super().__init__(conf=conf)
-        threading.Thread(target=self._bootstrap, daemon=True).start()
+        # CTP 初始化与登录在后台线程进行，避免阻塞 tkinter 主线程，
+        # 否则窗口创建后无法进入 mainloop，界面永远不会显示。
+        threading.Thread(target=self._init_ctp_and_bootstrap, args=(conf,), daemon=True).start()
+
+    def _init_ctp_and_bootstrap(self, conf):
+        """后台线程：初始化 CTP API、等待登录、启动业务轮询。"""
+        try:
+            super().__init__(conf=conf)
+            self._bootstrap()
+        except Exception as e:
+            self.print(f"[CTP初始化] 异常: {e}")
+            import traceback
+            self.print(traceback.format_exc())
+            if hasattr(self, "master") and self.master:
+                self.master.after(0, lambda: self._update_status(f"CTP初始化失败: {e}"))
 
     def _notify_async(self, text: str):
         """异步发送飞书通知，避免 HTTP 阻塞报单流程"""

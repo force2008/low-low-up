@@ -47,7 +47,7 @@ openctp-ctp2tts/
 
 ```bash
 pip install openctp-ctp==6.7.2.*
-pip install openctp-ctp-channels
+pip install openctp-ctp-channels pyautogui
 pip install numpy pandas matplotlib
 ```
 
