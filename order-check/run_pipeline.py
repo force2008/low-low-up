@@ -332,6 +332,36 @@ def build_target_conf(target: dict) -> dict:
     return conf
 
 
+def _get_target_ratio(target: dict) -> float:
+    """获取目标账户的持仓同步比例。
+
+    支持字段名：ratio / ration / position_ratio，优先使用 ratio。
+    如果都没有配置，则回退到全局 POSITION_RATIO（命令行 --ratio，默认 1.0）。
+    """
+    for key in ("ratio", "ration", "position_ratio"):
+        if key in target:
+            try:
+                value = float(target[key])
+                if value <= 0:
+                    logger.warning(
+                        "[ratio] 目标账户 %s 的 %s=%s 必须大于 0，使用默认值 1.0",
+                        target.get("user_id", "unknown"),
+                        key,
+                        target[key],
+                    )
+                    return 1.0
+                return value
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[ratio] 目标账户 %s 的 %s=%s 不是有效数字，使用默认值 1.0",
+                    target.get("user_id", "unknown"),
+                    key,
+                    target[key],
+                )
+                return 1.0
+    return float(POSITION_RATIO)
+
+
 # ==================== 线程间通信 ====================
 shutdown_event = threading.Event()
 _last_sync_time = [0]
@@ -740,7 +770,7 @@ def main():
             if user_id:
                 env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
                 conf = build_target_conf(target)
-                ratio = target.get("position_ratio", POSITION_RATIO)
+                ratio = _get_target_ratio(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
                 logger.info("[同步][%s -> %s] 启动目标账户同步", source_account, user_id)
             else:
