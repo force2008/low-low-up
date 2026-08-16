@@ -32,6 +32,6 @@ class CMdSpi(CMdSpiBase):
 
 if __name__ == '__main__':
     spi = CMdSpi()
-    spi.req(['lc2605', 'lc2609', 'lc2607'])
+    spi.req(['m2609'])
 
     spi.wait_last()

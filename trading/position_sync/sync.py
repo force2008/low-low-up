@@ -313,7 +313,8 @@ class PositionSyncManagerSync:
                 contract = mo["contract"]
                 md = market_data_map.get(contract)
                 if not md:
-                    self.print(f"[开] {contract} 无行情，跳过")
+                    exact = self._standardize_contract(contract)
+                    self.print(f"[开] {contract}({exact}) 无行情，跳过")
                     skip_open[0] += 1
                     continue
 
@@ -437,8 +438,8 @@ class PositionSyncManagerSync:
                                         pending_close_info = info
                                         break
                 if pending_close_ref:
-                    # 有平仓委托在途，等待45秒检查循环处理
-                    self.print(f"[平] {contract} 已有平仓委托在途，等待45秒检查循环处理")
+                    # 有平仓委托在途，等待30秒检查循环处理
+                    self.print(f"[平] {contract} 已有平仓委托在途，等待30秒检查循环处理")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue

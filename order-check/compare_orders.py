@@ -232,18 +232,20 @@ def send_feishu_hold_notification(rows):
     _send_feishu("\n".join(lines))
 
 
-def generate_hold_std():
+def generate_hold_std(account=None, output_path=None):
     """从最新的持仓明细 CSV 生成 hold-std.json（只保留最新一次）"""
+    if account is None:
+        account = ACCOUNT
     # 兼容不同命名习惯：如 "jm0310当前持仓 *.csv" 或 "jm0310 持仓明细 *.csv"
     patterns = [
-        os.path.join(DATA_DIR, f"{ACCOUNT}*持仓*.csv"),
-        os.path.join(DATA_DIR, f"{ACCOUNT} 持仓明细 *.csv"),
+        os.path.join(DATA_DIR, f"{account}*持仓*.csv"),
+        os.path.join(DATA_DIR, f"{account} 持仓明细 *.csv"),
     ]
     files = []
     for pattern in patterns:
         files.extend(glob.glob(pattern))
     if not files:
-        print(f"未找到 '{ACCOUNT}' 持仓明细文件")
+        print(f"未找到 '{account}' 持仓明细文件")
         return False
 
     files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
@@ -280,10 +282,11 @@ def generate_hold_std():
     if filtered:
         print(f"[过滤] 已剔除 {filtered} 条无效记录（表头/空合约/零持仓）")
 
-    hold_std_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
-    with open(hold_std_path, 'w', encoding='utf-8') as f:
+    if output_path is None:
+        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
-    print(f"标准持仓文件已写入: {hold_std_path}（共 {len(rows)} 条）")
+    print(f"标准持仓文件已写入: {output_path}（共 {len(rows)} 条）")
 
     return True
 

@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一键流水线：自动导出 -> 持仓同步
-使用单线程架构：
-  - 导出线程：每20秒执行导出+持仓同步
-  - 持仓对齐由 PositionSyncManager.sync_and_trade() 处理，支持一次性挂出所有委托
+一键流水线：自动导出 -> 多账户持仓同步
 
 使用方式:
     python run_pipeline.py [online|simu|7x24] [--skip-time-check] [--force] [--ratio RATIO]
@@ -14,6 +11,7 @@
     - --skip-time-check: 开发/测试时显式跳过交易时段检查，允许非交易时段运行
     - --force: 非交易日也强制运行
     - --ratio: 持仓同步比例，默认 1.0
+    - 多账户同步：在 order-check/account_targets.py 中配置源账户到目标CTP账户的映射
 """
 
 import sys
@@ -99,6 +97,18 @@ sys.path.insert(0, _CURR_DIR)
 # 项目根目录
 PROJECT_ROOT = os.path.dirname(_CURR_DIR)
 sys.path.insert(0, PROJECT_ROOT)
+
+# 导入本地配置（源账户名称、坐标等）
+try:
+    from local_config import ACCOUNT
+except ImportError:
+    ACCOUNT = ""
+
+# 导入源账户到目标账户的映射配置（多账户仓位同步）
+try:
+    from account_targets import ACCOUNT_TARGETS
+except ImportError:
+    ACCOUNT_TARGETS = {}
 
 # ==================== 日志配置 ====================
 LOG_DIR = os.path.join(_CURR_DIR, "logs")
@@ -292,6 +302,36 @@ def is_after_session_end(now_time, session_end):
     return now_time >= session_end
 
 
+def get_source_accounts() -> list:
+    """获取所有配置的源账户名称及其目标账户列表。
+
+    返回 [(source_account, targets_list), ...] 元组列表。
+    如果 account_targets.py 未配置任何源账户，返回空列表。
+    """
+    if not ACCOUNT_TARGETS:
+        return []
+    return [(src, list(tgts)) for src, tgts in ACCOUNT_TARGETS.items()]
+
+
+def build_target_conf(target: dict) -> dict:
+    """根据目标账户配置构造 CTP 登录配置。
+
+    以 config.envs[env_name] 为基座，覆盖 user_id/password 等字段。
+    """
+    from config import config as _ctp_config
+
+    env_name = target.get("env_name") or _CTP_ENV_NAME
+    if env_name not in _ctp_config.envs:
+        raise ValueError(f"未知环境: {env_name}")
+
+    conf = dict(_ctp_config.envs[env_name])
+    # 覆盖目标账户特定字段
+    for key in ("user_id", "password", "broker_id", "authcode", "appid", "user_product_info"):
+        if key in target and target[key]:
+            conf[key] = target[key]
+    return conf
+
+
 # ==================== 线程间通信 ====================
 shutdown_event = threading.Event()
 _last_sync_time = [0]
@@ -365,7 +405,7 @@ def run_sync():
     try:
         # 重新生成 hold-std.json（从导出的持仓明细 CSV）
         import compare_orders
-        gen_ok = compare_orders.generate_hold_std()
+        gen_ok = compare_orders.generate_hold_std(account=_CURRENT_ACCOUNT)
         if not gen_ok:
             logger.warning("生成 hold-std.json 失败")
         hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
@@ -456,7 +496,7 @@ def force_sync():
 
     try:
         import compare_orders
-        compare_orders.generate_hold_std()
+        compare_orders.generate_hold_std(account=_CURRENT_ACCOUNT)
         hold_std_path = os.path.join(_CURR_DIR_SYNC, 'hold-std.json')
 
         from trading.position_sync.position_sync_manager import run_position_sync
@@ -492,7 +532,7 @@ def force_sync():
 
 
 def run_once():
-    """单次执行：导出 -> 持仓差异对比"""
+    """单次执行：导出 -> 为所有配置源账户生成持仓文件"""
     logger.info("=" * 50)
     logger.info("开始执行: 导出 -> 持仓差异对比")
     logger.info(">>> 步骤 1/3: 执行自动导出...")
@@ -513,17 +553,29 @@ def run_once():
     logger.info(">>> 步骤 2/3: 生成持仓文件...")
     try:
         import compare_orders
-        # 生成标准持仓 hold-std.json（从 CSV 持仓明细）
-        gen_std_ok = compare_orders.generate_hold_std()
+
+        if ACCOUNT_TARGETS:
+            # 多源账户模式：为每个源账户生成独立的 hold-std 文件
+            for source_account in ACCOUNT_TARGETS.keys():
+                output_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
+                gen_ok = compare_orders.generate_hold_std(
+                    account=source_account, output_path=output_path
+                )
+                if gen_ok:
+                    logger.info("标准持仓 %s 生成完成", os.path.basename(output_path))
+                else:
+                    logger.warning("标准持仓 %s 生成失败", os.path.basename(output_path))
+        else:
+            # 兼容旧模式：生成单个 hold-std.json
+            gen_ok = compare_orders.generate_hold_std(account=ACCOUNT)
+            if gen_ok:
+                logger.info("标准持仓 hold-std.json 生成完成")
+            else:
+                logger.warning("标准持仓 hold-std.json 生成失败")
 
         # 初始化 hold.json 占位文件
         # 实际数据由 PositionSyncManager 从 CTP 持仓查询后更新
         compare_orders.generate_hold()
-
-        if gen_std_ok:
-            logger.info("标准持仓 hold-std.json 生成完成")
-        else:
-            logger.warning("标准持仓 hold-std.json 生成失败")
 
     except Exception as e:
         logger.error("生成持仓文件异常: %s", e)
@@ -608,7 +660,6 @@ def main():
         sys.exit(1)
     logger.info("[检查] 单实例检查通过，PID=%d", os.getpid())
 
-
     import signal as _signal_module
     def _signal_handler(sig, frame):
         logger.info("收到中断信号，准备退出...")
@@ -647,17 +698,31 @@ def main():
         logger.error("启动导出异常: %s", e)
         export_ok = False
 
-    # 生成持仓文件
-    hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
+    # 根据配置确定要处理的源账户及其目标账户
+    source_account_jobs = get_source_accounts()
+    if not source_account_jobs:
+        # 没有配置任何映射，回退到旧模式
+        logger.info("未配置多账户映射，将使用默认单账户模式 (ACCOUNT=%s)", ACCOUNT)
+        source_account_jobs = [(ACCOUNT, [{}])]
+
+    # 生成每个源账户的 hold-std 文件
     if export_ok:
         try:
             import compare_orders
-            compare_orders.generate_hold_std()
-            if os.path.exists(hold_std_path):
-                with open(hold_std_path, 'r', encoding='utf-8') as f:
-                    hold_rows = json.load(f)
-                compare_orders.send_feishu_hold_notification(hold_rows)
-                logger.info("hold-std.json 共 %d 条记录", len(hold_rows))
+            for source_account, targets in source_account_jobs:
+                if not targets or (len(targets) == 1 and not targets[0].get("user_id")):
+                    # 默认单账户模式：使用原来的 hold-std.json
+                    output_path = os.path.join(_CURR_DIR, "hold-std.json")
+                else:
+                    output_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
+                gen_ok = compare_orders.generate_hold_std(
+                    account=source_account, output_path=output_path
+                )
+                if gen_ok and os.path.exists(output_path):
+                    with open(output_path, 'r', encoding='utf-8') as f:
+                        hold_rows = json.load(f)
+                    compare_orders.send_feishu_hold_notification(hold_rows)
+                    logger.info("%s 共 %d 条记录", os.path.basename(output_path), len(hold_rows))
         except Exception as e:
             logger.error("生成持仓文件失败: %s", e)
 
@@ -666,46 +731,101 @@ def main():
     logger.info("启动持仓同步线程（持续运行模式）...")
     logger.info("=" * 60)
 
-    def sync_loop():
-        """同步线程：持续同步持仓"""
+    MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, "data", "contracts", "main_contracts.json")
+
+    def _run_single_target_sync(source_account, target):
+        """单个目标账户的同步循环"""
+        user_id = target.get("user_id")
         try:
+            if user_id:
+                env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
+                conf = build_target_conf(target)
+                ratio = target.get("position_ratio", POSITION_RATIO)
+                hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
+                logger.info("[同步][%s -> %s] 启动目标账户同步", source_account, user_id)
+            else:
+                # 回退到默认单账户模式
+                user_id = "default"
+                env_label = _CTP_ENV_NAME
+                conf = None
+                ratio = POSITION_RATIO
+                hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
+                logger.info("[同步-default] 启动默认账户同步")
+
             from trading.position_sync.position_sync_manager import run_position_sync_loop
-            MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
-            hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
+
             run_position_sync_loop(
                 hold_std_path=hold_std_path,
                 main_contracts_path=MAIN_CONTRACTS_PATH,
                 trade_volume=1,
-                conf=None,
-                env_name=_CTP_ENV_NAME,
+                conf=conf,
+                env_name=env_label,
                 logger=logger,
                 stop_event=shutdown_event,
-                position_ratio=POSITION_RATIO,
+                position_ratio=ratio,
             )
         except Exception as e:
-            logger.error("[同步线程] 异常: %s", e)
+            logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)
             import traceback
             logger.error(traceback.format_exc())
 
-    # 启动同步线程
-    sync_thread = threading.Thread(target=sync_loop, name="SyncThread", daemon=True)
-    sync_thread.start()
+    # 构建所有同步任务：每个源账户的每个目标账户作为一个任务
+    sync_jobs = []
+    for source_account, targets in source_account_jobs:
+        for target in targets:
+            sync_jobs.append((source_account, target))
+
+    # 预创建所有同步线程对象
+    sync_threads = []
+    for idx, (source_account, target) in enumerate(sync_jobs):
+        user_id = target.get("user_id", "default")
+        thread_name = f"SyncThread-{source_account}-{user_id}"
+        t = threading.Thread(
+            target=_run_single_target_sync,
+            args=(source_account, target),
+            daemon=True,
+            name=thread_name,
+        )
+        sync_threads.append(t)
+
+    def sync_loop():
+        """同步线程：为每个目标账户启动一个持仓同步循环并等待全部结束"""
+        for t in sync_threads:
+            t.start()
+        for t in sync_threads:
+            t.join()
+
+    # 启动同步总控线程
+    sync_controller = threading.Thread(target=sync_loop, name="SyncController", daemon=True)
+    sync_controller.start()
 
     # 主线程监控，等待退出信号
-    logger.info("两个工作线程已启动：导出线程 + 同步线程")
+    target_desc = ", ".join([
+        f"{src}->{t.get('user_id', 'default')}" for src, t in sync_jobs
+    ])
+    logger.info("工作线程已启动：导出线程 + %d个同步线程", len(sync_threads))
+    logger.info("同步任务: %s", target_desc)
     logger.info("按 Ctrl+C 停止")
     while not shutdown_event.is_set():
         time.sleep(1)
+        alive_sync = sum(1 for t in sync_threads if t.is_alive())
         if export_thread.is_alive():
-            logger.info("[主线程] 心跳 - 导出线程: 运行 | 同步线程: 运行")
+            logger.info(
+                "[主线程] 心跳 - 导出线程: 运行 | 同步线程: %d/%d 运行",
+                alive_sync,
+                len(sync_threads),
+            )
         else:
             logger.warning("[主线程] 导出线程已停止")
 
     # 等待同步线程退出
     logger.info("[主线程] 收到退出信号，等待同步线程退出...")
-    sync_thread.join(timeout=10)
-    if sync_thread.is_alive():
-        logger.warning("[主线程] 同步线程未能正常退出")
+    sync_controller.join(timeout=10)
+    if sync_controller.is_alive():
+        logger.warning("[主线程] 同步总控线程未能正常退出")
+    # 再等待各个目标账户同步线程（外层总控结束后，子线程可能仍在收尾）
+    for t in sync_threads:
+        t.join(timeout=5)
 
     logger.info("流水线已退出")
 

@@ -8,10 +8,14 @@
     - 委托单列表（含状态），实时刷新
     - 平仓选中合约 / 全部平仓
     - 飞书通知
+    - 支持多账户模式：一次启动可同时打开多个目标账户的独立窗口
 
 用法:
     cd /c/projects/low-low-up
     python trading/PositionManagerUI.py [env]
+
+多账户模式（读取 order-check/account_targets.py）:
+    python trading/PositionManagerUI.py --multi
 """
 
 import json
@@ -65,9 +69,14 @@ if not _ui_logger.handlers:
 
 class PositionManagerUI(CTdSpiBase):
 
-    def __init__(self, conf=None, master=None):
+    def __init__(self, conf=None, master=None, standalone=True, env_name=None, window_title=None):
         self.master = master or tk.Tk()
-        self.master.title("持仓管理")
+        self._standalone = standalone
+        self.env_name = env_name or "default"
+        if window_title:
+            self.master.title(window_title)
+        else:
+            self.master.title("持仓管理")
         self.master.geometry("1200x750")
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -133,6 +142,9 @@ class PositionManagerUI(CTdSpiBase):
         """后台线程：初始化 CTP API、等待登录、启动业务轮询。"""
         try:
             super().__init__(conf=conf)
+            # 如果未显式指定 env_name，用 user_id 作为标识，方便多账户区分
+            if not getattr(self, "env_name", None) or self.env_name == "default":
+                self.env_name = (conf or {}).get("user_id", "default")
             self._bootstrap()
         except Exception as e:
             self.print(f"[CTP初始化] 异常: {e}")
@@ -2283,6 +2295,11 @@ class PositionManagerUI(CTdSpiBase):
             self._stop_poll.set()
         self._stop_replace_monitor()
         try:
+            if hasattr(self, "_api") and self._api:
+                self._api.Release()
+        except Exception:
+            pass
+        try:
             self.master.destroy()
         except Exception:
             pass
@@ -2290,20 +2307,107 @@ class PositionManagerUI(CTdSpiBase):
             del self
         except Exception:
             pass
-        os._exit(0)
+        # 只有独立运行时（单窗口模式）才退出整个进程；
+        # 多窗口模式下只关闭当前账户窗口，避免把所有账户一起关掉。
+        if getattr(self, "_standalone", True):
+            os._exit(0)
 
     def run(self):
         self.master.mainloop()
 
 
 def main():
-    env_name = sys.argv[1].lower() if len(sys.argv) > 1 else "7x24"
+    args = [a for a in sys.argv[1:]]
+    multi_mode = "--multi" in args
+    if multi_mode:
+        args.remove("--multi")
+
+    # 多账户模式：读取 order-check/account_targets.py，为每个目标账户开一个独立窗口
+    if multi_mode:
+        try:
+            import account_targets
+            account_map = account_targets.ACCOUNT_TARGETS
+        except Exception as e:
+            print(f"读取 account_targets.py 失败: {e}")
+            account_map = {}
+
+        target_jobs = []
+        for src, targets in account_map.items():
+            for t in targets:
+                target_jobs.append((src, t))
+
+        if not target_jobs:
+            print("未在 account_targets.py 中配置任何目标账户，无法启动多账户模式")
+            return
+
+        root = tk.Tk()
+        root.withdraw()  # 隐藏主窗口，每个账户使用独立 Toplevel 窗口
+        root.title("持仓管理 - 多账户")
+
+        def _build_target_conf(target: dict) -> dict:
+            env = target.get("env_name") or "simu"
+            base_conf = config.envs.get(env)
+            if not base_conf:
+                raise ValueError(f"未知环境: {env}")
+            conf = dict(base_conf)
+            for key in ("user_id", "password", "broker_id", "authcode", "appid", "user_product_info"):
+                if key in target and target[key]:
+                    conf[key] = target[key]
+            return conf
+
+        instances = []
+        for src, target in target_jobs:
+            env_label = target.get("env_name", "simu")
+            user_id = target.get("user_id", "default")
+            window_title = f"持仓管理 - {src} -> {env_label}_{user_id}"
+            toplevel = tk.Toplevel(root)
+            toplevel.geometry("1200x750")
+            toplevel.title(window_title)
+            try:
+                conf = _build_target_conf(target)
+            except Exception as e:
+                print(f"构建 {user_id} 配置失败: {e}")
+                continue
+            ui = PositionManagerUI(
+                conf=conf,
+                master=toplevel,
+                standalone=False,
+                env_name=f"{env_label}_{user_id}",
+                window_title=window_title,
+            )
+            instances.append(ui)
+            print(f"[多账户UI] 已创建窗口: {window_title}")
+
+        if not instances:
+            print("没有成功创建任何账户窗口")
+            root.destroy()
+            return
+
+        # 当所有 Toplevel 窗口都关闭后，自动退出 root mainloop
+        def _check_all_closed():
+            # 过滤掉已经被销毁的窗口
+            alive = [w for w in instances if w.master.winfo_exists()]
+            if not alive:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            else:
+                root.after(1000, _check_all_closed)
+
+        root.after(1000, _check_all_closed)
+        print(f"[多账户UI] 共启动 {len(instances)} 个账户窗口，关闭全部窗口后程序退出")
+        root.mainloop()
+        return
+
+    # 单账户模式（保持原有用法）
+    env_name = args[0].lower() if args else "7x24"
     conf = config.envs.get(env_name)
     if not conf:
         print(f"未知环境: {env_name}，可用: {list(config.envs.keys())}")
         return
     root = tk.Tk()
-    app = PositionManagerUI(conf=conf, master=root)
+    app = PositionManagerUI(conf=conf, master=root, env_name=env_name)
     app.run()
 
 

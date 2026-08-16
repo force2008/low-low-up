@@ -7,6 +7,7 @@
 
 import inspect
 import os.path
+import shutil
 import sys
 import time
 from datetime import datetime as dt
@@ -42,10 +43,17 @@ class CTdSpiBase(tdapi.CThostFtdcTraderSpi):
         self._front_id = None
         self._session_id = None
 
-        flat_dir = self._user_id + "_td"
-        if not os.path.exists(flat_dir):
-            os.mkdir(flat_dir)
+        # 使用带进程 ID 的唯一流文件目录，避免同用户多实例或上次未正常退出时文件锁冲突
+        pid = os.getpid()
+        flat_dir = f"{self._user_id}_td_{pid}"
+        if os.path.exists(flat_dir):
+            try:
+                shutil.rmtree(flat_dir)
+            except Exception as e:
+                self.print(f"[base_tdapi] 清理旧流目录失败: {e}")
+        os.makedirs(flat_dir, exist_ok=True)
         flat_path = os.path.join(flat_dir, self._user_id)
+        self.print(f" 流文件目录: {flat_dir}")
 
         self._api: tdapi.CThostFtdcTraderApi = tdapi.CThostFtdcTraderApi.CreateFtdcTraderApi(flat_path)
 

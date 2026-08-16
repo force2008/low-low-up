@@ -25,6 +25,9 @@ if PROJECT_ROOT not in __import__('sys').path:
 
 from ctp.base_tdapi import CTdSpiBase, tdapi
 
+# 行情 API 订阅提供者（交易 API 查不到行情时回退使用）
+from .md_provider import MdQuoteProvider
+
 # 飞书通知
 from utils.feishu_notifier import FeishuNotifier
 
@@ -137,6 +140,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._replace_monitor_thread: Optional[threading.Thread] = None
         self._replace_stop_event = threading.Event()
 
+        self._ctp_conf = conf
+
         print("[__init__] 准备调用 super().__init__...")
         super().__init__(conf=conf)
         print("[__init__] super().__init__ 完成，start_monitor")
@@ -147,8 +152,38 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._start_replace_monitor()
         print("[__init__] 监控线程启动完成")
 
+        # 启动行情 API 订阅提供者作为行情查询回退
+        # 部分生产柜台（如融航）不支持通过交易 API 查询深度行情，需要通过行情前置订阅
+        self._md_provider: Optional[MdQuoteProvider] = None
+        md_front = (conf or {}).get("md")
+        if md_front:
+            try:
+                self.print(f"[行情] 尝试启动行情API提供者: {md_front}")
+                self._md_provider = MdQuoteProvider(conf=conf)
+                # 让行情提供者的打印也走 PositionSyncManager 的日志
+                self._md_provider.print = self.print
+                if self._md_provider._login_ok:
+                    self.print("[行情] 行情API提供者启动成功")
+                else:
+                    self.print(f"[行情] 行情API提供者登录未成功: {self._md_provider._login_error}")
+            except Exception as e:
+                self.print(f"[行情] 启动行情API提供者异常: {e}")
+                import traceback
+                self.print(traceback.format_exc())
+        else:
+            self.print("[行情] 配置中无行情前置地址，跳过行情API提供者")
+
     def _notify_async(self, text: str):
-        """异步发送飞书通知，完全不阻塞"""
+        """异步发送飞书通知，完全不阻塞
+
+        多账户同步时，自动在消息头部加上当前实例的环境标识（env_name），
+        以便在飞书消息中区分不同目标账户的同步情况。
+        """
+        account_label = getattr(self, "env_name", None) or "default"
+        # 如果消息本身没有以账户标识开头，则自动加上
+        if not text.startswith(f"[{account_label}]"):
+            text = f"[{account_label}]\n{text}"
+
         def _send():
             try:
                 success = self._feishu.send_text(text)
@@ -632,6 +667,12 @@ class PositionSyncManagerBase(CTdSpiBase):
                     "UpperLimitPrice": pDepthMarketData.UpperLimitPrice,
                     "LowerLimitPrice": pDepthMarketData.LowerLimitPrice,
                 }
+            else:
+                # 增加诊断日志：CTP 返回空行情时，把错误码打出来
+                err_msg = ""
+                if pRspInfo and pRspInfo.ErrorID != 0:
+                    err_msg = f" ErrorID={pRspInfo.ErrorID} {pRspInfo.ErrorMsg}"
+                self.print(f"[行情] 查询返回空: req_id={nRequestID}{err_msg}")
             # 必须等最后一条数据返回，避免 simu 环境返回多条约行情时拿到错误合约
             if bIsLast:
                 pending["event"].set()
@@ -805,6 +846,12 @@ class PositionSyncManagerBase(CTdSpiBase):
     def shutdown(self):
         """关闭管理器，停止后台监控线程"""
         self._stop_replace_monitor()
+        if getattr(self, "_md_provider", None):
+            try:
+                self._md_provider.shutdown()
+            except Exception as e:
+                self.print(f"[行情] 关闭行情API提供者异常: {e}")
+            self._md_provider = None
 
     def _start_replace_monitor(self):
         """启动自动撤单重挂监控线程"""
@@ -828,9 +875,9 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.print("[监控] 自动撤单重挂监控线程已停止")
 
     def _replace_monitor_loop(self):
-        """监控循环：每 45 秒做一次仓位对比，发现差异则同步"""
+        """监控循环：每 30 秒做一次仓位对比，发现差异则同步"""
         self.print("[监控] 监控线程启动，等待首次检查...")
-        CHECK_INTERVAL = 45  # 检查间隔
+        CHECK_INTERVAL = 30  # 检查间隔
         while not self._replace_stop_event.is_set():
             self._replace_stop_event.wait(CHECK_INTERVAL)
             if self._replace_stop_event.is_set():
@@ -912,7 +959,7 @@ class PositionSyncManagerBase(CTdSpiBase):
 
             if missing or excess:
                 # 有差异，发送通知并执行同步
-                lines = ["🔄 45秒检测到仓位差异，准备同步："]
+                lines = ["🔄 30秒检测到仓位差异，准备同步："]
                 if missing:
                     total_missing = sum(mo["volume"] for mo in missing)
                     lines.append(f"📈 缺额开仓 ({len(missing)} 个合约，共 {total_missing} 手):")
@@ -942,20 +989,20 @@ class PositionSyncManagerBase(CTdSpiBase):
                 # 检查总手数是否一致
                 if total_target != total_actual:
                     self._notify_async(
-                        f"⚠️ 45秒持仓检测\n"
+                        f"⚠️ 30秒持仓检测\n"
                         f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
                         f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
                         f"状态: 手数不一致 ⚠️"
                     )
-                    self.print(f"[监控] 45秒检测: 手数不一致 (标准:{total_target} vs 实际:{total_actual})")
+                    self.print(f"[监控] 30秒检测: 手数不一致 (标准:{total_target} vs 实际:{total_actual})")
                 else:
                     self._notify_async(
-                        f"✅ 45秒持仓检测\n"
+                        f"✅ 30秒持仓检测\n"
                         f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
                         f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
                         f"状态: 仓位一致 ✓"
                     )
-                    self.print("[监控] 45秒检测: 仓位一致")
+                    self.print("[监控] 30秒检测: 仓位一致")
 
         except Exception as e:
             import traceback

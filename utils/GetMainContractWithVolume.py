@@ -400,7 +400,7 @@ if __name__ == '__main__':
     print_log("步骤2：订阅行情数据")
     print_log("=" * 70)
     
-    md_spi = CMdSpi(instruments, env_name=env_name)
+    md_spi = CMdSpi(instruments, use_online=env_name=='online')
     md_spi_instance = md_spi  # 保存到全局变量
     md_spi.subscribe_market_data()
     
