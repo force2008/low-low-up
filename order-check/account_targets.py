@@ -47,11 +47,13 @@ ACCOUNT_TARGETS = {
     # ],
     "wangxy0617": [
         {"env_name": "online", "user_id": "yqj0929", "password": "041354","ratio":2},
+        {"env_name": "online", "user_id": "fy0228", "password": "fy123456","ratio":2},
     ],
     "wangk0402": [
         {"env_name": "online", "user_id": "sxk0812", "password": "sxk123456","ratio":1},
+        {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":1}
     ],
     "WQ1017":[
-        {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":1},
+        {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456","ratio":1},
     ]
 }

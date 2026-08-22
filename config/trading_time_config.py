@@ -4,6 +4,10 @@
 # @Author:  Assistant
 # @Description: 各期货品种交易时间配置
 
+import re
+from datetime import datetime, time
+from typing import Dict, List, Optional
+
 # ==================== 交易时间配置 ====================
 # 各品种每日交易分钟数（用于计算年化因子）
 # 格式：{产品代码：每日交易分钟数}
@@ -16,48 +20,56 @@
 
 PRODUCT_TRADING_MINUTES = {
     # ===== 中金所 (无夜盘) =====
-    "IF": 240,  # 股指期货
-    "IC": 240,  # 中证 500
-    "IM": 240,  # 中证 1000
-    "IH": 240,  # 上证 50
-    "T": 240,   # 10 年期国债
-    "TF": 240,  # 5 年期国债
-    "TS": 240,  # 2 年期国债
-    "TL": 240,  # 30 年期国债
-    
+    # 股指期货：09:30-11:30, 13:00-15:00 = 240 分钟
+    "IF": 240,
+    "IC": 240,
+    "IM": 240,
+    "IH": 240,
+    # 国债期货：09:15-11:30, 13:00-15:15 = 255 分钟
+    "T": 255,
+    "TF": 255,
+    "TS": 255,
+    "TL": 255,
+
     # ===== 上期所 - 夜盘到 23:00 (225+120=345 分钟) =====
     "bu": 345,  # 沥青
     "ru": 345,  # 橡胶
-    "zn": 345,  # 锌
-    "pb": 345,  # 铅
-    "al": 345,  # 铝
-    "cu": 345,  # 铜
-    
-    # ===== 上期所 - 夜盘到 次日 1:00 (225+240=465 分钟) =====
-    "ni": 465,  # 镍
-    "sn": 465,  # 锡
-    
-    # ===== 上期所 - 夜盘到 次日 2:30 (225+330=555 分钟) =====
-    "au": 555,  # 黄金
-    "ag": 555,  # 白银
-    "ss": 555,  # 不锈钢
-    
-    # 其他上期所品种 (默认 345 分钟)
     "rb": 345,  # 螺纹钢
     "hc": 345,  # 热卷
     "fu": 345,  # 燃油
     "sp": 345,  # 纸浆
-    "br": 345,  # 氧化铝
-    "ao": 345,  # 原油 (上期所)
-    "op": 345,  # 期权相关
-    
-    # ===== 能源中心 - 同上期所 =====
-    "sc": 345,  # 原油
+    "br": 345,  # 丁二烯橡胶
+
+    # ===== 上期所 - 夜盘到 次日 1:00 (225+240=465 分钟) =====
+    "cu": 465,  # 铜
+    "al": 465,  # 铝
+    "zn": 465,  # 锌
+    "pb": 465,  # 铅
+    "ni": 465,  # 镍
+    "sn": 465,  # 锡
+    "ss": 465,  # 不锈钢
+    "ao": 465,  # 氧化铝
+
+    # ===== 上期所 - 夜盘到 次日 2:30 (225+330=555 分钟) =====
+    "au": 555,  # 黄金
+    "ag": 555,  # 白银
+
+    # ===== 上期所 - 无夜盘 (225 分钟) =====
+    "wr": 225,  # 线材
+
+    # ===== 能源中心 - 夜盘到 23:00 (225+120=345 分钟) =====
     "lu": 345,  # 低硫燃油
-    "bc": 345,  # 国际铜
-    "ec": 345,  # 集运欧线
     "nr": 345,  # 20 号胶
-    
+
+    # ===== 能源中心 - 夜盘到 次日 1:00 (225+240=465 分钟) =====
+    "bc": 465,  # 国际铜
+
+    # ===== 能源中心 - 夜盘到 次日 2:30 (225+330=555 分钟) =====
+    "sc": 555,  # 原油
+
+    # ===== 能源中心 - 无夜盘 (225 分钟) =====
+    "ec": 225,  # 集运欧线
+
     # ===== 大商所 - 夜盘到 23:00 (225+120=345 分钟) =====
     "m": 345,   # 豆粕
     "a": 345,   # 豆一
@@ -69,25 +81,23 @@ PRODUCT_TRADING_MINUTES = {
     "v": 345,   # PVC
     "eg": 345,  # 乙二醇
     "eb": 345,  # 苯乙烯
-    
-    # 大商所 - 无夜盘
-    "c": 225,   # 玉米
-    "cs": 225,  # 玉米淀粉
-    "jd": 225,  # 鸡蛋
-    
-    # 大商所 - 夜盘到 次日 1:30 (225+270=495 分钟)
-    "i": 495,   # 铁矿石
-    "j": 495,   # 焦炭
-    "jm": 495,  # 焦煤
-    "lh": 495,  # 生猪
-    
-    # 其他大商所品种
+    "c": 345,   # 玉米
+    "cs": 345,  # 玉米淀粉
     "pg": 345,  # 液化气
     "rr": 345,  # 粳米
-    "fb": 345,  # 纤维板
-    "bb": 345,  # 胶合板
-    "lg": 345,  # 原木
-    
+    "i": 345,   # 铁矿石
+    "j": 345,   # 焦炭
+    "jm": 345,  # 焦煤
+    "bz": 345,  # 纯苯
+
+    # ===== 大商所 - 无夜盘 (225 分钟) =====
+    "jd": 225,  # 鸡蛋
+    "lh": 225,  # 生猪
+    "fb": 225,  # 纤维板
+    "bb": 225,  # 胶合板
+    "lg": 225,  # 原木
+    "pk": 225,  # 花生
+
     # ===== 郑商所 - 夜盘到 23:00 (225+120=345 分钟) =====
     "CF": 345,  # 棉花
     "RM": 345,  # 菜粕
@@ -97,9 +107,15 @@ PRODUCT_TRADING_MINUTES = {
     "OI": 345,  # 菜油
     "FG": 345,  # 玻璃
     "SA": 345,  # 纯碱
-    "AP": 345,  # 苹果
-    
-    # 郑商所 - 无夜盘
+    "PX": 345,  # 对二甲苯
+    "PF": 345,  # 短纤
+    "PR": 345,  # 瓶片
+    "PL": 345,  # 丙烯
+    "SH": 345,  # 烧碱
+
+    # ===== 郑商所 - 无夜盘 (225 分钟) =====
+    "AP": 225,  # 苹果
+    "UR": 225,  # 尿素
     "CJ": 225,  # 红枣
     "CY": 225,  # 棉纱
     "JR": 225,  # 粳稻
@@ -107,27 +123,19 @@ PRODUCT_TRADING_MINUTES = {
     "RS": 225,  # 菜籽
     "WH": 225,  # 强麦
     "ZC": 225,  # 动力煤
-    
-    # 郑商所 - 夜盘到 次日 1:30 (225+270=495 分钟)
-    "SM": 495,  # 硅锰
-    "SF": 495,  # 硅铁
-    "PX": 495,  # 对二甲苯
-    "PR": 495,  # 早籼稻
-    "PF": 495,  # 短纤
-    "PK": 495,  # 花生
-    "PL": 495,  # 烧碱
-    "SH": 495,  # 尿素
-    "UR": 495,  # 尿素
-    
-    # ===== 广期所 - 夜盘到 23:00 (225+120=345 分钟) =====
-    "lc": 345,  # 碳酸锂
-    "si": 345,  # 工业硅
-    
-    # 广期所 - 新品种
-    "ps": 345,  # 多晶硅
-    "pt": 345,  # 铂
-    "pd": 345,  # 钯
-    
+    "SM": 225,  # 硅锰
+    "SF": 225,  # 硅铁
+
+    # ===== 广期所 - 无夜盘 (225 分钟) =====
+    "lc": 225,  # 碳酸锂
+    "si": 225,  # 工业硅
+    "ps": 225,  # 多晶硅
+    "pt": 225,  # 铂
+    "pd": 225,  # 钯
+
+    # ===== 上期所新品种 =====
+    "ad": 465,  # 铸造铝合金，夜盘到次日 01:00
+
     # 默认值（无夜盘品种）
     "DEFAULT": 240,
 }
@@ -194,6 +202,13 @@ def get_trading_hours_info(product_id: str) -> dict:
             "night_end_time": None,
             "description": "无夜盘"
         }
+    elif daily_minutes == 255:
+        return {
+            "daily_minutes": daily_minutes,
+            "has_night": False,
+            "night_end_time": None,
+            "description": "中金所国债期货（无夜盘）"
+        }
     elif daily_minutes == 345:
         return {
             "daily_minutes": daily_minutes,
@@ -236,3 +251,106 @@ try:
     import numpy as np
 except ImportError:
     print("警告：numpy 未安装，请运行 pip install numpy")
+
+
+# ==================== 实时交易时段判断 ====================
+# 中金所股指期货日盘时段
+_CFFEX_STOCK_INDEX_DAY_SESSIONS = [
+    (time(9, 30), time(11, 30)),
+    (time(13, 0), time(15, 0)),
+]
+
+# 中金所国债期货日盘时段
+_CFFEX_TREASURY_DAY_SESSIONS = [
+    (time(9, 15), time(11, 30)),
+    (time(13, 0), time(15, 15)),
+]
+
+# 商品期货（除中金所外）默认日盘时段
+_COMMODITY_DAY_SESSIONS = [
+    (time(9, 0), time(10, 15)),
+    (time(10, 30), time(11, 30)),
+    (time(13, 30), time(15, 0)),
+]
+
+# 夜盘统一开始时间
+_NIGHT_START = time(21, 0)
+
+# 中金所产品代码
+_CFFEX_STOCK_INDEX_PRODUCTS = {"IF", "IC", "IM", "IH"}
+_CFFEX_TREASURY_PRODUCTS = {"T", "TF", "TS", "TL"}
+
+
+def _extract_product_id(instrument_id: str) -> str:
+    """从合约代码中提取产品代码。
+
+    例如：m2609 -> m, zn2610 -> zn, CF509 -> CF, IF2609 -> IF
+    """
+    if not instrument_id:
+        return ""
+    m = re.match(r"^([A-Za-z]+)", instrument_id.strip())
+    return m.group(1) if m else ""
+
+
+def _is_in_sessions(t: time, sessions: List[tuple]) -> bool:
+    """判断当前时间是否落在任一交易时段内（闭区间）"""
+    for start, end in sessions:
+        if start <= t <= end:
+            return True
+    return False
+
+
+def is_contract_trading_now(instrument_id: str, now: Optional[datetime] = None) -> bool:
+    """判断指定合约在当前时刻是否处于可交易时段。
+
+    Args:
+        instrument_id: 合约代码，如 "m2609", "zn2610", "IF2609"
+        now: 可选，指定判断的时间点；默认使用 datetime.now()
+
+    Returns:
+        bool: 可交易返回 True，否则返回 False
+    """
+    product = _extract_product_id(instrument_id)
+    if not product:
+        return False
+
+    info = get_trading_hours_info(product)
+    if now is None:
+        now = datetime.now()
+    t = now.time()
+
+    # 日盘判断
+    if product in _CFFEX_STOCK_INDEX_PRODUCTS:
+        day_sessions = _CFFEX_STOCK_INDEX_DAY_SESSIONS
+    elif product in _CFFEX_TREASURY_PRODUCTS:
+        day_sessions = _CFFEX_TREASURY_DAY_SESSIONS
+    else:
+        day_sessions = _COMMODITY_DAY_SESSIONS
+    if _is_in_sessions(t, day_sessions):
+        return True
+
+    # 夜盘判断（跨午夜处理）
+    if info.get("has_night") and info.get("night_end_time"):
+        try:
+            end_h, end_m = map(int, info["night_end_time"].split(":"))
+            night_end = time(end_h, end_m)
+        except Exception:
+            return False
+
+        if _NIGHT_START <= night_end:
+            # 不跨午夜（实际所有夜盘都跨午夜，保留兼容）
+            return _NIGHT_START <= t <= night_end
+        else:
+            # 跨午夜：21:00 之后 或 结束时间之前都算
+            return t >= _NIGHT_START or t <= night_end
+
+    return False
+
+
+def get_contracts_trading_status(instrument_ids: List[str], now: Optional[datetime] = None) -> Dict[str, bool]:
+    """批量判断多个合约当前是否可交易。
+
+    Returns:
+        {instrument_id: True/False}
+    """
+    return {inst: is_contract_trading_now(inst, now) for inst in instrument_ids}

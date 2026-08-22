@@ -153,11 +153,14 @@ except ImportError:
 # =================================================
 
 # ==================== 交易时间段配置 ====================
+# 注意：这里控制的是流水线是否允许执行导出/同步。
+# 不同品种的具体交易时段由 config/trading_time_config.py 控制，
+# 非当前交易时段的合约会在同步时被跳过。
 TRADING_SESSIONS = [
-    ("09:00:15", "11:30:00"),
-    ("13:30:15", "15:15:00"),
-    ("21:00:15", "23:59:00"),
-    ("00:00:15", "02:30:00"),
+    ("09:00:15", "11:30:00"),    # 日盘上午（商品 09:00 起，中金所 09:15/09:30 起，由品种过滤处理）
+    ("13:00:15", "15:15:00"),    # 日盘下午（中金所 13:00 起，商品 13:30 起，由品种过滤处理）
+    ("21:00:15", "23:59:00"),    # 夜盘（跨午夜）
+    ("00:00:15", "02:30:00"),    # 夜盘（跨午夜续）
 ]
 CHECK_INTERVAL = 20  # 秒
 SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
@@ -227,6 +230,70 @@ def send_feishu_text(text):
         logger.info("飞书通知发送状态: %s", resp.status_code)
     except Exception as e:
         logger.error("飞书通知发送失败: %s", e)
+
+
+def _dismiss_startup_popup():
+    """20:59 启动时，点击 local_config 配置窗口上的启动弹框。
+
+    仅在启动时间接近 20:59:00（前后 90 秒内）执行一次，
+    避免其他时段启动时误点。
+    """
+    try:
+        now = datetime.datetime.now()
+        target = now.replace(hour=20, minute=59, second=0, microsecond=0)
+        diff = abs((now - target).total_seconds())
+        if diff > 90:
+            return
+
+        from local_config import APP_TITLE
+        import pyautogui
+
+        logger.info("[启动弹框] 20:59 启动，准备点击弹框 (1365, 935)")
+        windows = pyautogui.getWindowsWithTitle(APP_TITLE)
+        if not windows:
+            logger.warning("[启动弹框] 未找到窗口: %s", APP_TITLE)
+            return
+        window = windows[0]
+        if window.isMinimized:
+            window.restore()
+            time.sleep(0.3)
+        if not window.isActive:
+            window.activate()
+            time.sleep(0.5)
+        pyautogui.click(1080, 746)
+        logger.info("[启动弹框] 已点击 (1365, 935)")
+        time.sleep(0.5)
+    except Exception as e:
+        logger.warning("[启动弹框] 点击失败或无需点击: %s", e)
+
+
+def _cleanup_export_files():
+    """删除 DEFAULT_SAVE_PATH 目录下的导出文件，防止文件夹无限增长。
+
+    仅在夜盘结束（02:30）退出时调用一次。
+    """
+    try:
+        from local_config import DEFAULT_SAVE_PATH
+        if not DEFAULT_SAVE_PATH or not os.path.isdir(DEFAULT_SAVE_PATH):
+            logger.warning("[清理] DEFAULT_SAVE_PATH 不存在或不是目录: %s", DEFAULT_SAVE_PATH)
+            return
+
+        removed_count = 0
+        failed_paths = []
+        for entry in os.scandir(DEFAULT_SAVE_PATH):
+            if entry.is_file():
+                try:
+                    os.remove(entry.path)
+                    removed_count += 1
+                except Exception as e:
+                    failed_paths.append((entry.path, str(e)))
+
+        logger.info("[清理] 已删除 %d 个导出文件: %s", removed_count, DEFAULT_SAVE_PATH)
+        if failed_paths:
+            for path, err in failed_paths[:5]:
+                logger.warning("[清理] 删除失败: %s - %s", path, err)
+    except Exception as e:
+        logger.warning("[清理] 清理导出文件失败: %s", e)
 
 
 def is_in_trading_time():
@@ -652,6 +719,7 @@ def export_loop():
                     elif _RESPONSIBLE_SESSION_END == datetime.time(2, 30, 0):
                         logger.info("[导出线程] 夜盘已结束，准备退出")
                         send_feishu_text("夜盘结束，流水线退出")
+                        _cleanup_export_files()
                     else:
                         logger.info("[导出线程] 上午盘已结束，准备退出")
                         send_feishu_text("上午盘结束，流水线退出")
@@ -710,6 +778,9 @@ def main():
     logger.info("交易时间段: %s", TRADING_SESSIONS)
     logger.info("按 Ctrl+C 停止")
     logger.info("=" * 60)
+
+    # 20:59 启动时，先点击 local_config 窗口上的启动弹框
+    _dismiss_startup_popup()
 
     # 启动导出线程（持仓对齐完全由 PositionSyncManager 处理，无报单线程）
     export_thread = threading.Thread(target=export_loop, name="ExportThread", daemon=True)

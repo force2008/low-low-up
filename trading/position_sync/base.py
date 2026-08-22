@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from .constants import PRODUCT_TRADING_SESSIONS, DAY_3SEG
+from config.trading_time_config import get_contracts_trading_status
 
 # 把项目根目录加入路径，以便导入 ctp 模块
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -935,12 +936,19 @@ class PositionSyncManagerBase(CTdSpiBase):
                 effective_actual[key] = a_vol + pending_open
 
             # 计算差异（使用有效持仓，避免在途开仓被错误判断）
+            # 同时过滤当前非交易时段的合约，避免无法交易的品种触发误报
+            all_contracts = set(contract for contract, _ in set(target.keys()) | set(effective_actual.keys()))
+            trading_status = get_contracts_trading_status(list(all_contracts))
+            non_trading_contracts = {c.upper() for c, trading in trading_status.items() if not trading}
+
             missing = []
             excess = []
             for key, t_vol in target.items():
+                contract, direction = key
+                if contract.upper() in non_trading_contracts:
+                    continue
                 effective_vol = effective_actual.get(key, 0)
                 if t_vol > effective_vol:
-                    contract, direction = key
                     missing.append({
                         "contract": contract,
                         "direction": "buy" if direction == 2 else "sell",
@@ -948,14 +956,18 @@ class PositionSyncManagerBase(CTdSpiBase):
                     })
 
             for key, effective_vol in effective_actual.items():
+                contract, direction = key
+                if contract.upper() in non_trading_contracts:
+                    continue
                 t_vol = target.get(key, 0)
                 if effective_vol > t_vol:
-                    contract, direction = key
                     excess.append({
                         "contract": contract,
                         "direction": direction,
                         "volume": effective_vol - t_vol,
                     })
+
+            skipped_sorted = sorted(non_trading_contracts)
 
             if missing or excess:
                 # 有差异，发送通知并执行同步
@@ -976,33 +988,49 @@ class PositionSyncManagerBase(CTdSpiBase):
                         lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
                     if len(excess) > 5:
                         lines.append(f"  ... 等共 {len(excess)} 个")
+                if skipped_sorted:
+                    lines.append(f"⏸️ 以下 {len(skipped_sorted)} 个合约当前非交易时段，已跳过对齐：")
+                    lines.append(f"  {', '.join(skipped_sorted)}")
 
                 self._notify_async("\n".join(lines))
-                self.print(f"[监控] 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个")
+                self.print(f"[监控] 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个")
 
                 # 执行同步（已持有锁，传入 lock_held=True）
                 self._do_sync(trade_volume=1, lock_held=True)
             else:
                 # 无差异也要发送定期通知，让用户知道系统一直在检查
-                total_target = sum(t for t in target.values())
-                total_actual = sum(a for a in actual_agg.values())
-                # 检查总手数是否一致
+                # 只统计当前可交易合约的手数，避免非交易时段合约导致误报不一致
+                total_target = sum(
+                    t for (contract, _), t in target.items()
+                    if contract.upper() not in non_trading_contracts
+                )
+                total_actual = sum(
+                    a for (contract, _), a in actual_agg.items()
+                    if contract.upper() not in non_trading_contracts
+                )
+                all_total_target = sum(t for t in target.values())
+                all_total_actual = sum(a for a in actual_agg.values())
+
                 if total_target != total_actual:
                     self._notify_async(
                         f"⚠️ 30秒持仓检测\n"
-                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
-                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
+                        f"可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手\n"
+                        f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手\n"
                         f"状态: 手数不一致 ⚠️"
                     )
-                    self.print(f"[监控] 30秒检测: 手数不一致 (标准:{total_target} vs 实际:{total_actual})")
+                    self.print(f"[监控] 30秒检测: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual})")
                 else:
-                    self._notify_async(
-                        f"✅ 30秒持仓检测\n"
-                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
-                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
-                        f"状态: 仓位一致 ✓"
-                    )
-                    self.print("[监控] 30秒检测: 仓位一致")
+                    lines = [
+                        f"✅ 30秒持仓检测",
+                        f"当前可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手",
+                        f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手",
+                        f"状态: 当前交易时段内仓位一致 ✓",
+                    ]
+                    if skipped_sorted:
+                        lines.append(f"⏸️ 以下 {len(skipped_sorted)} 个合约当前非交易时段，已跳过对齐：")
+                        lines.append(f"  {', '.join(skipped_sorted)}")
+                    self._notify_async("\n".join(lines))
+                    self.print("[监控] 30秒检测: 当前交易时段内仓位一致")
 
         except Exception as e:
             import traceback

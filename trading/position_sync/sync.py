@@ -20,6 +20,7 @@ if PROJECT_ROOT not in __import__('sys').path:
     __import__('sys').path.insert(0, PROJECT_ROOT)
 
 from ctp.base_tdapi import tdapi
+from config.trading_time_config import get_contracts_trading_status
 
 
 class PositionSyncManagerSync:
@@ -157,7 +158,16 @@ class PositionSyncManagerSync:
                 if pm_vol > 0 and len(pm_key) >= 3 and pm_key[2]:  # is_open = True
                     self.print(f"[pending_map] {pm_key[0]} {'多' if pm_key[1] == 2 else '空'} 开仓 {pm_vol} 手")
 
-            # 9. 计算缺额/超额
+            # 9. 过滤当前非交易时段的合约
+            all_contracts = set(contract for contract, _ in set(target.keys()) | set(effective_actual.keys()))
+            trading_status = get_contracts_trading_status(list(all_contracts))
+            non_trading_contracts = set()
+            for contract in all_contracts:
+                if not trading_status.get(contract, False):
+                    non_trading_contracts.add(contract.upper())
+                    self.print(f"[非交易时段] {contract} 当前不可交易，跳过对齐")
+
+            # 10. 计算缺额/超额
             missing_orders = []
             excess_orders = []
 
@@ -172,9 +182,11 @@ class PositionSyncManagerSync:
             # 计算缺额（使用 effective_actual = actual_agg + pending_open）
             # 避免在途开仓委托被错误判断为缺额
             for key, t_vol in target.items():
+                contract, direction = key
+                if contract.upper() in non_trading_contracts:
+                    continue
                 effective_vol = effective_actual.get(key, 0)
                 if t_vol > effective_vol:
-                    contract, direction = key
                     self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 有效{effective_vol}, 缺额{t_vol - effective_vol}")
                     missing_orders.append({
                         "contract": contract,
@@ -186,6 +198,8 @@ class PositionSyncManagerSync:
             # 避免在途开仓委托被错误判断为超额（平掉还没成交的持仓）
             for key, effective_vol in effective_actual.items():
                 contract, direction = key
+                if contract.upper() in non_trading_contracts:
+                    continue
                 t_vol = target.get(key, 0)
                 vol_to_close = effective_vol - t_vol
                 if vol_to_close > 0:
@@ -203,15 +217,21 @@ class PositionSyncManagerSync:
             self._update_hold_json_file()
 
             # 11. 输出对比摘要
-            self.print(f"[对比] 标准:{len(target)} 有效:{len(effective_actual)} 缺额:{len(missing_orders)} 超额:{len(excess_orders)}")
+            skipped_contracts = sorted(non_trading_contracts)
+            self.print(f"[对比] 标准:{len(target)} 有效:{len(effective_actual)} 缺额:{len(missing_orders)} 超额:{len(excess_orders)} 非交易时段跳过:{len(skipped_contracts)}")
             if missing_orders:
                 self.print(f"[缺额] {[mo['contract'] for mo in missing_orders]}")
             if excess_orders:
                 self.print(f"[超额] {[eo['contract'] for eo in excess_orders]}")
+            if skipped_contracts:
+                self.print(f"[跳过] {skipped_contracts}")
 
+            total_target = sum(t for t in target.values())
+            total_actual = sum(a for a in actual_agg.values())
+            has_diff = bool(missing_orders) or bool(excess_orders)
 
             # 12. 发送持仓差异通知
-            if missing_orders or excess_orders:
+            if has_diff:
                 diff_lines = [f"🔄 持仓差异检测到（比例={self._position_ratio}），准备同步："]
 
                 if missing_orders:
@@ -227,31 +247,30 @@ class PositionSyncManagerSync:
                         d = "多" if eo["direction"] == 2 else "空"
                         diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
 
-                # 13. 执行快速同步
-                total_target = sum(t for t in target.values())
-                total_actual = sum(a for a in actual_agg.values())
+                if skipped_contracts:
+                    diff_lines.append(f"⏸️ 以下 {len(skipped_contracts)} 个合约当前非交易时段，已跳过对齐：")
+                    diff_lines.append(f"  {', '.join(skipped_contracts)}")
 
-                # 判断是否有差异
-                has_diff = bool(missing_orders) or bool(excess_orders)
+                self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
 
-                if diff_lines:
-                    self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
-
-                if has_diff:
-                    success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
-                    self.print("[结论] 同步完成（委托已提交）")
-                    self._is_first_run = False
-                    return success
-                else:
-                    self.print("[结论] 持仓一致，无需操作")
-                    self._notify_async(
-                        f"✅ 启动持仓检测\n"
-                        f"标准持仓: {len(target)} 个合约, {total_target} 手\n"
-                        f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手\n"
-                        f"状态: 仓位一致 ✓"
-                    )
-                    self._is_first_run = False
-                    return True
+                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
+                self.print("[结论] 同步完成（委托已提交）")
+                self._is_first_run = False
+                return success
+            else:
+                self.print("[结论] 当前交易时段内持仓一致，无需操作")
+                aligned_lines = [
+                    f"✅ 启动持仓检测",
+                    f"标准持仓: {len(target)} 个合约, {total_target} 手",
+                    f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手",
+                    f"状态: 当前交易时段内仓位一致 ✓",
+                ]
+                if skipped_contracts:
+                    aligned_lines.append(f"⏸️ 以下 {len(skipped_contracts)} 个合约当前非交易时段，已跳过对齐：")
+                    aligned_lines.append(f"  {', '.join(skipped_contracts)}")
+                self._notify_async("\n".join(aligned_lines))
+                self._is_first_run = False
+                return True
         except Exception as e:
             import traceback
             self.print(f"[异常] _do_sync 出错: {e}")
