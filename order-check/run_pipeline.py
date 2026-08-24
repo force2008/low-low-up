@@ -21,7 +21,21 @@ import datetime
 import json
 import logging
 import threading
+import faulthandler
+import atexit
 from logging.handlers import RotatingFileHandler
+
+# 启用 C 级崩溃转储：在 SIGSEGV / access violation 时把 Python 栈写到 stderr / 日志
+faulthandler.enable()
+try:
+    # 部分版本支持把 faulthandler 输出重定向到文件，失败也不影响其它功能
+    _crash_dump_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "logs", "pipeline_crash.dump"
+    )
+    os.makedirs(os.path.dirname(_crash_dump_path), exist_ok=True)
+    faulthandler.dump_traceback_later(30, repeat=True, file=open(_crash_dump_path, "a", encoding="utf-8"))
+except Exception:
+    pass
 
 # ==================== 交易日检查 ====================
 # 交易日列表文件路径
@@ -172,8 +186,45 @@ POSITION_RATIO = _POSITION_RATIO
 # 关键时间点强制对齐（格式：HH:MM）
 KEY_ALIGN_TIMES = ["14:58", "14:59", "15:00"]
 
+# 心跳文件：用于外部判断进程是存活还是僵死
+_HEARTBEAT_FILE = os.path.join(_CURR_DIR, "logs", ".pipeline_heartbeat")
+
+
+def _write_heartbeat(status: str = "running"):
+    """写入心跳文件，包含 PID、时间戳和当前状态。"""
+    try:
+        with open(_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                f"pid={os.getpid()}\n"
+                f"timestamp={datetime.datetime.now().isoformat()}\n"
+                f"status={status}\n"
+            )
+    except Exception as e:
+        logger.warning("[心跳] 写入心跳文件失败: %s", e)
+
+
+def _mark_exiting(reason: str = "unknown"):
+    """标记进程正在退出。"""
+    try:
+        with open(_HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                f"pid={os.getpid()}\n"
+                f"timestamp={datetime.datetime.now().isoformat()}\n"
+                f"status=exiting\n"
+                f"reason={reason}\n"
+            )
+    except Exception:
+        pass
+
+
+def _heartbeat_loop():
+    """后台心跳线程：每 10 秒更新一次心跳文件。"""
+    while not shutdown_event.is_set():
+        _write_heartbeat()
+        shutdown_event.wait(timeout=10)
+
+
 # ==================== 单实例检测 ====================
-# 防止 Windows 任务计划程序多实例同时运行
 _INSTANCE_LOCK_FILE = os.path.join(_CURR_DIR, '.pipeline_instance.lock')
 
 def check_single_instance():
@@ -235,20 +286,22 @@ def send_feishu_text(text):
 def _dismiss_startup_popup():
     """20:59 启动时，点击 local_config 配置窗口上的启动弹框。
 
-    仅在启动时间接近 20:59:00（前后 90 秒内）执行一次，
+    仅在启动时间接近 20:59:00（前后 90 秒内）执行一次，在早盘8:59启动时也做一下这个窗口的点击操作
     避免其他时段启动时误点。
     """
     try:
         now = datetime.datetime.now()
         target = now.replace(hour=20, minute=59, second=0, microsecond=0)
+        morningStart = now.replace(hour=8, minute=59, second=0, microsecond=0)
         diff = abs((now - target).total_seconds())
-        if diff > 90:
+        morningDiff = abs((now-morningStart).total_seconds())
+        if diff > 90 or morningDiff>90:
             return
 
         from local_config import APP_TITLE
         import pyautogui
 
-        logger.info("[启动弹框] 20:59 启动，准备点击弹框 (1365, 935)")
+        logger.info("[启动弹框] 20:59 启动，准备点击弹框")
         windows = pyautogui.getWindowsWithTitle(APP_TITLE)
         if not windows:
             logger.warning("[启动弹框] 未找到窗口: %s", APP_TITLE)
@@ -260,8 +313,8 @@ def _dismiss_startup_popup():
         if not window.isActive:
             window.activate()
             time.sleep(0.5)
-        pyautogui.click(1080, 746)
-        logger.info("[启动弹框] 已点击 (1365, 935)")
+        pyautogui.click(1082, 752)
+        logger.info("[启动弹框] 已点击")
         time.sleep(0.5)
     except Exception as e:
         logger.warning("[启动弹框] 点击失败或无需点击: %s", e)
@@ -758,6 +811,13 @@ def main():
         sys.exit(1)
     logger.info("[检查] 单实例检查通过，PID=%d", os.getpid())
 
+    # 启动时立即发送飞书通知并写入心跳，方便判断进程是否成功启动
+    _write_heartbeat("starting")
+    send_feishu_text(
+        f"🚀 流水线已启动\n环境: {_CTP_ENV_NAME}\nPID: {os.getpid()}\n"
+        f"时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
     import signal as _signal_module
     def _signal_handler(sig, frame):
         logger.info("收到中断信号，准备退出...")
@@ -785,6 +845,10 @@ def main():
     # 启动导出线程（持仓对齐完全由 PositionSyncManager 处理，无报单线程）
     export_thread = threading.Thread(target=export_loop, name="ExportThread", daemon=True)
     export_thread.start()
+
+    # 启动后台心跳线程
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, name="HeartbeatThread", daemon=True)
+    heartbeat_thread.start()
 
     # 启动时先执行导出，获取最新持仓数据
     logger.info(">>> 启动时先执行导出...")
@@ -907,29 +971,45 @@ def main():
     logger.info("工作线程已启动：导出线程 + %d个同步线程", len(sync_threads))
     logger.info("同步任务: %s", target_desc)
     logger.info("按 Ctrl+C 停止")
-    while not shutdown_event.is_set():
-        time.sleep(1)
-        alive_sync = sum(1 for t in sync_threads if t.is_alive())
-        if export_thread.is_alive():
-            logger.info(
-                "[主线程] 心跳 - 导出线程: 运行 | 同步线程: %d/%d 运行",
-                alive_sync,
-                len(sync_threads),
-            )
-        else:
-            logger.warning("[主线程] 导出线程已停止")
 
-    # 等待同步线程退出
-    logger.info("[主线程] 收到退出信号，等待同步线程退出...")
-    sync_controller.join(timeout=10)
-    if sync_controller.is_alive():
-        logger.warning("[主线程] 同步总控线程未能正常退出")
-    # 再等待各个目标账户同步线程（外层总控结束后，子线程可能仍在收尾）
-    for t in sync_threads:
-        t.join(timeout=5)
+    try:
+        while not shutdown_event.is_set():
+            time.sleep(1)
+            alive_sync = sum(1 for t in sync_threads if t.is_alive())
+            if export_thread.is_alive():
+                logger.info(
+                    "[主线程] 心跳 - 导出线程: 运行 | 同步线程: %d/%d 运行",
+                    alive_sync,
+                    len(sync_threads),
+                )
+            else:
+                logger.warning("[主线程] 导出线程已停止")
 
+        # 等待同步线程退出
+        logger.info("[主线程] 收到退出信号，等待同步线程退出...")
+        _mark_exiting("shutdown_event")
+        sync_controller.join(timeout=10)
+        if sync_controller.is_alive():
+            logger.warning("[主线程] 同步总控线程未能正常退出")
+        # 再等待各个目标账户同步线程（外层总控结束后，子线程可能仍在收尾）
+        for t in sync_threads:
+            t.join(timeout=5)
+
+    except Exception as e:
+        logger.exception("[主线程] 运行异常: %s", e)
+        _mark_exiting(f"exception: {e}")
+        send_feishu_text(f"❌ 流水线异常退出: {e}")
+        raise
+
+    _mark_exiting("normal")
     logger.info("流水线已退出")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("[顶层] 未捕获异常，程序退出: %s", e)
+        _mark_exiting(f"uncaught: {e}")
+        send_feishu_text(f"❌ 流水线未捕获异常退出: {e}")
+        sys.exit(1)
