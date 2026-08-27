@@ -69,10 +69,11 @@ if not _ui_logger.handlers:
 
 class PositionManagerUI(CTdSpiBase):
 
-    def __init__(self, conf=None, master=None, standalone=True, env_name=None, window_title=None):
+    def __init__(self, conf=None, master=None, standalone=True, env_name=None, window_title=None, source_account=None):
         self.master = master or tk.Tk()
         self._standalone = standalone
         self.env_name = env_name or "default"
+        self._source_account = source_account or (conf or {}).get("user_id", "default")
         if window_title:
             self.master.title(window_title)
         else:
@@ -118,6 +119,10 @@ class PositionManagerUI(CTdSpiBase):
         self._stop_poll = threading.Event()
         self._selected_instrument: str = ""
 
+        # CTP 请求 ID 计数器（持仓/委托/成交等查询使用自增 ID）
+        self._ctp_request_id_lock = threading.Lock()
+        self._ctp_request_id = 0
+
         # 委托列表变化检测（避免无意义重绘）
         self._last_order_digest: str = ""
 
@@ -138,6 +143,11 @@ class PositionManagerUI(CTdSpiBase):
         # 否则窗口创建后无法进入 mainloop，界面永远不会显示。
         threading.Thread(target=self._init_ctp_and_bootstrap, args=(conf,), daemon=True).start()
 
+    def _next_request_id(self) -> int:
+        with self._ctp_request_id_lock:
+            self._ctp_request_id += 1
+            return self._ctp_request_id
+
     def _init_ctp_and_bootstrap(self, conf):
         """后台线程：初始化 CTP API、等待登录、启动业务轮询。"""
         try:
@@ -145,6 +155,9 @@ class PositionManagerUI(CTdSpiBase):
             # 如果未显式指定 env_name，用 user_id 作为标识，方便多账户区分
             if not getattr(self, "env_name", None) or self.env_name == "default":
                 self.env_name = (conf or {}).get("user_id", "default")
+            # 如果外部没有传 source_account，尝试用 conf 里的 user_id 兜底
+            if not getattr(self, "_source_account", None):
+                self._source_account = (conf or {}).get("user_id", "default")
             self._bootstrap()
         except Exception as e:
             self.print(f"[CTP初始化] 异常: {e}")
@@ -443,11 +456,26 @@ class PositionManagerUI(CTdSpiBase):
             req = tdapi.CThostFtdcQryInvestorPositionField()
             req.BrokerID = self._broker_id
             req.InvestorID = self._user_id
-            self._api.ReqQryInvestorPosition(req, 0)
+            req_id = self._next_request_id()
+            ret = self._api.ReqQryInvestorPosition(req, req_id)
+            if ret != 0:
+                err_msg = f"持仓查询发送失败，返回码={ret}"
+                self.print(f"[query_positions] {err_msg}")
+                self._update_status(err_msg)
+                self._pos_done.set()
+                return list(self._positions_raw)
             self._pos_done.wait(timeout=timeout)
             return list(self._positions_raw)
 
     def OnRspQryInvestorPosition(self, p, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            err_msg = f"查询持仓错误 ErrorID={pRspInfo.ErrorID} Msg={pRspInfo.ErrorMsg}"
+            self.print(f"[OnRspQryInvestorPosition] {err_msg}")
+            self._update_status(err_msg)
+            if bIsLast:
+                self._pos_done.set()
+            return
+
         if p and p.Position > 0:
             pos_dir = int(p.PosiDirection or 0)
             # 过滤净持仓记录(1)，只保留多头(2)/空头(3)，避免重复
@@ -784,6 +812,19 @@ class PositionManagerUI(CTdSpiBase):
             })
         return result
 
+    def _refresh_summary_label(self):
+        """根据当前聚合持仓刷新顶部汇总标签"""
+        if not self._positions_agg:
+            self._pos_summary_var.set("总手数: 0 | 今仓: 0 | 昨仓: 0 | 保证金: 0.00")
+            return
+        total_pos = sum(p["Position"] for p in self._positions_agg)
+        total_today = sum(p["TodayPosition"] for p in self._positions_agg)
+        total_yd = sum(p["YdPosition"] for p in self._positions_agg)
+        total_margin = sum(p.get("UseMargin", 0) for p in self._positions_agg)
+        self._pos_summary_var.set(
+            f"总手数: {total_pos} | 今仓: {total_today} | 昨仓: {total_yd} | 保证金: {total_margin:,.2f}"
+        )
+
     def _refresh_in_thread(self):
         try:
             self._update_status("正在查询持仓...")
@@ -795,14 +836,8 @@ class PositionManagerUI(CTdSpiBase):
                 return
             self._positions_agg = self._aggregate_positions()
             self._update_tree_pos()
-            total_pos = sum(p["Position"] for p in self._positions_agg)
-            total_today = sum(p["TodayPosition"] for p in self._positions_agg)
-            total_yd = sum(p["YdPosition"] for p in self._positions_agg)
+            self._refresh_summary_label()
             total_profit = sum(p["PositionProfit"] for p in self._positions_agg)
-            total_margin = sum(p.get("UseMargin", 0) for p in self._positions_agg)
-            self._pos_summary_var.set(
-                f"总手数: {total_pos} | 今仓: {total_today} | 昨仓: {total_yd} | 保证金: {total_margin:,.2f}"
-            )
             self._update_status(f"持仓查询完成 | 合约数: {len(self._positions_agg)} | 总盈亏: {total_profit:,.2f}")
         except Exception as e:
             self.print(f"[_refresh_in_thread] 异常: {e}")
@@ -1024,6 +1059,10 @@ class PositionManagerUI(CTdSpiBase):
                         if self._positions_raw:
                             self._positions_agg = self._aggregate_positions()
                             self._update_tree_pos()
+                            # 同步刷新顶部持仓汇总标签
+                            self._refresh_summary_label()
+                        else:
+                            self._pos_summary_var.set("总手数: 0 | 今仓: 0 | 昨仓: 0 | 保证金: 0.00")
                 except Exception as e:
                     self.print(f"[_poll_loop] 持仓刷新异常: {e}")
                     import traceback
@@ -1168,8 +1207,8 @@ class PositionManagerUI(CTdSpiBase):
                 key = (p["InstrumentID"], p["PosiDirection"])
                 actual[key] = actual.get(key, 0) + p["Position"]
 
-            # 2) 读取 hold-std.json
-            hold_std_path = os.path.join(PROJECT_ROOT, "order-check", "hold-std.json")
+            # 2) 读取 per-source 标准持仓文件
+            hold_std_path = os.path.join(PROJECT_ROOT, "order-check", f"hold-std-{self._source_account}.json")
             target: dict = {}
             if os.path.exists(hold_std_path):
                 try:
@@ -1289,8 +1328,8 @@ class PositionManagerUI(CTdSpiBase):
                 key = (p["InstrumentID"], p["PosiDirection"])
                 actual[key] = actual.get(key, 0) + p["Position"]
 
-            # 2) 读取 hold-std.json
-            hold_std_path = os.path.join(PROJECT_ROOT, "order-check", "hold-std.json")
+            # 2) 读取 per-source 标准持仓文件
+            hold_std_path = os.path.join(PROJECT_ROOT, "order-check", f"hold-std-{self._source_account}.json")
             target: dict = {}
             if os.path.exists(hold_std_path):
                 try:
@@ -2291,26 +2330,24 @@ class PositionManagerUI(CTdSpiBase):
     # 退出
     # ------------------------------------------------------------------
     def _on_close(self):
-        if hasattr(self, "_stop_poll"):
-            self._stop_poll.set()
-        self._stop_replace_monitor()
         try:
-            if hasattr(self, "_api") and self._api:
-                self._api.Release()
-        except Exception:
-            pass
-        try:
-            self.master.destroy()
-        except Exception:
-            pass
-        try:
-            del self
-        except Exception:
-            pass
-        # 只有独立运行时（单窗口模式）才退出整个进程；
-        # 多窗口模式下只关闭当前账户窗口，避免把所有账户一起关掉。
-        if getattr(self, "_standalone", True):
-            os._exit(0)
+            if hasattr(self, "_stop_poll"):
+                self._stop_poll.set()
+            self._stop_replace_monitor()
+            try:
+                if hasattr(self, "_api") and self._api:
+                    self._api.Release()
+            except Exception:
+                pass
+            try:
+                self.master.destroy()
+            except Exception:
+                pass
+        finally:
+            # 只有独立运行时（单窗口模式）才退出整个进程；
+            # 多窗口模式下只关闭当前账户窗口，避免把所有账户一起关掉。
+            if getattr(self, "_standalone", True):
+                os._exit(0)
 
     def run(self):
         self.master.mainloop()
