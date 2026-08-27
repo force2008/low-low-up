@@ -1024,6 +1024,7 @@ def main():
 
     _mark_exiting("normal")
     logger.info("流水线已退出")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
