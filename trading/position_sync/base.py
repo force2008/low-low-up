@@ -141,6 +141,12 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._replace_monitor_thread: Optional[threading.Thread] = None
         self._replace_stop_event = threading.Event()
 
+        # CTP 查询健康度：连续超时时主动断线重连
+        self._query_health_lock = threading.Lock()
+        self._consecutive_query_timeouts = 0
+        self._MAX_CONSECUTIVE_QUERY_TIMEOUTS = 3
+        self._last_query_timeout_alert = 0.0
+
         self._ctp_conf = conf
 
         print("[__init__] 准备调用 super().__init__...")
@@ -840,6 +846,96 @@ class PositionSyncManagerBase(CTdSpiBase):
                 json.dump(orders, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # CTP 查询健康度：连续超时后主动断线重连
+    # ------------------------------------------------------------------
+    def _on_query_timeout(self, source: str = "查询"):
+        """查询超时计数器递增，达到阈值后触发 CTP 断线重连
+
+        由 query_positions / query_orders 在检测到 Event.wait 超时时调用。
+        线程安全。
+        """
+        with self._query_health_lock:
+            self._consecutive_query_timeouts += 1
+            count = self._consecutive_query_timeouts
+
+        msg = f"[警告] {source} 连续超时次数: {count}/{self._MAX_CONSECUTIVE_QUERY_TIMEOUTS}"
+        self.print(msg)
+
+        # 第 2 次及以后发送飞书告警，避免首次抖动误报
+        now = time.time()
+        if count >= 2 and now - self._last_query_timeout_alert > 120:
+            self._notify_async(f"⚠️ CTP 查询连续超时 {count} 次，准备断线重连")
+            self._last_query_timeout_alert = now
+
+        if count >= self._MAX_CONSECUTIVE_QUERY_TIMEOUTS:
+            self.print(f"[错误] CTP 查询连续超时 {count} 次，触发断线重连")
+            self._notify_async(f"🚨 CTP 查询连续超时 {count} 次，立即断线重连")
+            self._reconnect_ctp()
+
+    def _reset_query_health(self):
+        """查询成功后重置超时计数器"""
+        with self._query_health_lock:
+            if self._consecutive_query_timeouts > 0:
+                self.print(f"[恢复] CTP 查询恢复，重置连续超时计数（原 {self._consecutive_query_timeouts}）")
+                self._consecutive_query_timeouts = 0
+
+    def _reconnect_ctp(self):
+        """主动关闭当前 CTP 连接，等待 5 秒后重建实例
+
+        注意：
+        1. 调用方必须先释放 _pos_query_lock 等外部锁，避免死锁。
+        2. 旧实例的 shutdown 只停止内部线程；底层 Api.Release 由基类析构完成。
+        3. 新实例创建后，通过外部 holder 替换 self。
+        """
+        self.print("[重连] 开始 CTP 断线重连流程...")
+        try:
+            self.shutdown()
+        except Exception as e:
+            self.print(f"[重连] 关闭旧实例异常（继续重连）: {e}")
+
+        try:
+            self._api.Release()
+        except Exception as e:
+            self.print(f"[重连] Release 旧 API 异常（忽略）: {e}")
+
+        self.print("[重连] 等待 5 秒后重建连接...")
+        time.sleep(5)
+
+        # 通过同一配置重新初始化，保持当前对象身份以便外部 holder 引用不变
+        try:
+            self.print("[重连] 重新初始化 CTP...")
+            super().__init__(conf=self._ctp_conf)
+            # 重新启动监控线程
+            self._start_replace_monitor()
+            # 重新启动行情提供者
+            if getattr(self, "_md_provider", None):
+                try:
+                    self._md_provider.shutdown()
+                except Exception:
+                    pass
+                self._md_provider = None
+            md_front = (self._ctp_conf or {}).get("md")
+            if md_front:
+                try:
+                    self.print(f"[行情] 重连后尝试启动行情API提供者: {md_front}")
+                    self._md_provider = MdQuoteProvider(conf=self._ctp_conf)
+                    self._md_provider.print = self.print
+                    if self._md_provider._login_ok:
+                        self.print("[行情] 重连后行情API提供者启动成功")
+                    else:
+                        self.print(f"[行情] 重连后行情API提供者登录未成功: {getattr(self._md_provider, '_login_error', '')}")
+                except Exception as e:
+                    self.print(f"[行情] 重连后启动行情API提供者异常: {e}")
+            self.print("[重连] CTP 断线重连完成")
+            self._notify_async("✅ CTP 断线重连完成")
+        except Exception as e:
+            import traceback
+            self.print(f"[重连异常] 重建 CTP 实例失败: {e}")
+            self.print(traceback.format_exc())
+            self._notify_async(f"❌ CTP 断线重连失败: {e}")
+            raise
 
     # ------------------------------------------------------------------
     # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）

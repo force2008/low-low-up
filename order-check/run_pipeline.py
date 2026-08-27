@@ -27,13 +27,34 @@ from logging.handlers import RotatingFileHandler
 
 # 启用 C 级崩溃转储：在 SIGSEGV / access violation 时把 Python 栈写到 stderr / 日志
 faulthandler.enable()
+# 每 30 秒把各线程栈覆写到 crash dump（覆盖写，防止文件无限膨胀）
 try:
-    # 部分版本支持把 faulthandler 输出重定向到文件，失败也不影响其它功能
     _crash_dump_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "logs", "pipeline_crash.dump"
     )
     os.makedirs(os.path.dirname(_crash_dump_path), exist_ok=True)
-    faulthandler.dump_traceback_later(30, repeat=True, file=open(_crash_dump_path, "a", encoding="utf-8"))
+    _crash_timer_running = [True]
+    def _write_crash_dump():
+        if not _crash_timer_running[0]:
+            return
+        try:
+            with open(_crash_dump_path, "w", encoding="utf-8") as f:
+                faulthandler.dump_traceback_all(f)
+        except Exception:
+            pass
+        # 最多写 5MB，超出则清空
+        try:
+            if os.path.getsize(_crash_dump_path) > 5 * 1024 * 1024:
+                with open(_crash_dump_path, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception:
+            pass
+    def _schedule_next_dump():
+        if not _crash_timer_running[0]:
+            return
+        _write_crash_dump()
+        threading.Timer(30, _schedule_next_dump).start()
+    _schedule_next_dump()
 except Exception:
     pass
 

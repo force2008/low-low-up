@@ -118,11 +118,13 @@ class PositionSyncManagerMarket:
                 ok = self._pos_query_event.wait(timeout=timeout)
                 if ok:
                     self.print(f"[持仓查询] 成功，返回 {len(self._actual_positions)} 条记录")
+                    self._reset_query_health()
                     return list(self._actual_positions)
                 if attempt < retries:
                     self.print(f"[警告] 持仓查询超时，第 {attempt + 1} 次重试...")
                     time.sleep(1)
             self.print(f"[错误] 持仓查询连续 {retries + 1} 次超时，返回 None")
+            self._on_query_timeout(source="持仓查询")
             return None
 
     def query_orders(
@@ -140,7 +142,9 @@ class PositionSyncManagerMarket:
         ok = event.wait(timeout=timeout)
         if not ok:
             self.print("[警告] 委托查询超时")
+            self._on_query_timeout(source="委托查询")
             return None
+        self._reset_query_health()
         result = list(self._orders_raw_query)
         if today_only:
             today_str = time.strftime("%Y%m%d")

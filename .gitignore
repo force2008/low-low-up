@@ -56,3 +56,14 @@ order-check/coordinates.txt
 order-check/export/*
 order-check/logs
 .hold_notify_date
+
+# Sensitive account files generated at runtime
+*yuqj0821_*
+*fy0228_*
+*yqj0929_*
+*wangxy0617_*
+*wangk0402_*
+*sxk0812_*
+*yq02_*
+*WQ1017_*
+
