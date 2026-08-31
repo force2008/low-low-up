@@ -194,11 +194,13 @@ def run_position_sync_loop(
                     last_hold_std_mtime = current_mtime
                     mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
                 else:
-                    # 文件没变，短暂等待后继续监控
-                    threading.Event().wait(timeout=2)
+                    # 文件没变，使用 stop_event 等待以便能及时响应退出信号
+                    _wait_event = stop_event if stop_event is not None else threading.Event()
+                    _wait_event.wait(timeout=2)
             else:
-                # 文件不存在，短暂等待
-                threading.Event().wait(timeout=2)
+                # 文件不存在，使用 stop_event 等待以便能及时响应退出信号
+                _wait_event = stop_event if stop_event is not None else threading.Event()
+                _wait_event.wait(timeout=2)
 
     except Exception as e:
         import traceback

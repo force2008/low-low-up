@@ -334,7 +334,7 @@ def _dismiss_startup_popup():
         if not window.isActive:
             window.activate()
             time.sleep(0.5)
-        pyautogui.click(1082, 752)
+        pyautogui.click(1091, 744)
         logger.info("[启动弹框] 已点击")
         time.sleep(0.5)
     except Exception as e:
@@ -1024,7 +1024,8 @@ def main():
 
     _mark_exiting("normal")
     logger.info("流水线已退出")
-    sys.exit(0)
+    # 使用 os._exit(0) 立即终止进程，避免 CTP API 等非守护线程阻塞退出
+    os._exit(0)
 
 
 if __name__ == "__main__":
