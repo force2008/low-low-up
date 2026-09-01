@@ -1024,8 +1024,17 @@ def main():
 
     _mark_exiting("normal")
     logger.info("流水线已退出")
-    # 使用 os._exit(0) 立即终止进程，避免 CTP API 等非守护线程阻塞退出
-    os._exit(0)
+    # 退出前刷新所有日志 handler，确保日志写入磁盘
+    for h in logger.handlers:
+        h.flush()
+    # 等待子线程最多 3 秒优雅退出，然后强制终止
+    def _force_exit():
+        time.sleep(3)
+        logger.warning("[主线程] 优雅退出超时，强制终止")
+        os._exit(0)
+    force_thread = threading.Thread(target=_force_exit, daemon=True)
+    force_thread.start()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
