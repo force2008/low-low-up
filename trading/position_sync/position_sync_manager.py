@@ -27,6 +27,7 @@
 
 import os
 import sys
+import traceback
 
 # 把项目根目录加入路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -96,7 +97,6 @@ def run_position_sync(
         print(f"[run_position_sync] sync_and_trade 返回: {result}")
         return result
     except Exception as e:
-        import traceback
         print(f"[异常] 持仓同步过程中出错: {e}")
         traceback.print_exc()
         return False
@@ -177,7 +177,12 @@ def run_position_sync_loop(
 
         # 首次同步
         _log("[同步] 首次同步...")
-        mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+        try:
+            mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+        except Exception as e:
+            _log(f"[同步] 首次同步异常: {e}")
+            traceback.print_exc()
+            return False
 
         # 持续监控循环（永不关闭连接）
         while True:
@@ -192,7 +197,11 @@ def run_position_sync_loop(
                 if current_mtime > last_hold_std_mtime:
                     _log(f"[同步] 检测到 hold-std.json 更新，执行同步...")
                     last_hold_std_mtime = current_mtime
-                    mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+                    try:
+                        mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+                    except Exception as e:
+                        _log(f"[同步] 同步执行异常: {e}")
+                        traceback.print_exc()
                 else:
                     # 文件没变，使用 stop_event 等待以便能及时响应退出信号
                     _wait_event = stop_event if stop_event is not None else threading.Event()
@@ -203,7 +212,6 @@ def run_position_sync_loop(
                 _wait_event.wait(timeout=2)
 
     except Exception as e:
-        import traceback
         _log(f"[异常] 同步循环出错: {e}")
         traceback.print_exc()
         return False

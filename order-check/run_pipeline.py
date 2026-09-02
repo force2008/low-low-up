@@ -342,27 +342,47 @@ def _dismiss_startup_popup():
 
 
 def _cleanup_export_files():
-    """删除 DEFAULT_SAVE_PATH 目录下的导出文件，防止文件夹无限增长。
+    """清理 DEFAULT_SAVE_PATH 目录下的旧导出文件，防止文件夹无限增长。
 
+    保留今天的文件（今天日期开头的），删除昨天及更早的文件。
     仅在夜盘结束（02:30）退出时调用一次。
     """
+    import re
     try:
         from local_config import DEFAULT_SAVE_PATH
         if not DEFAULT_SAVE_PATH or not os.path.isdir(DEFAULT_SAVE_PATH):
             logger.warning("[清理] DEFAULT_SAVE_PATH 不存在或不是目录: %s", DEFAULT_SAVE_PATH)
             return
 
+        # 获取今天和昨天的日期字符串（格式：YYYY-MM-DD）
+        today = datetime.date.today().isoformat()  # e.g. "2026-09-02"
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()  # e.g. "2026-09-01"
+
         removed_count = 0
+        kept_count = 0
         failed_paths = []
+
         for entry in os.scandir(DEFAULT_SAVE_PATH):
             if entry.is_file():
-                try:
-                    os.remove(entry.path)
-                    removed_count += 1
-                except Exception as e:
-                    failed_paths.append((entry.path, str(e)))
+                # 文件名格式："资金账户申报费监控 2026-09-02 09-35-59"
+                # 提取文件名中的日期部分
+                match = re.search(r'(\d{4}-\d{2}-\d{2})', entry.name)
+                if not match:
+                    # 没有日期格式，保留
+                    kept_count += 1
+                    continue
+                file_date = match.group(1)
+                # 只删除昨天及更早的文件，保留今天的
+                if file_date < today:
+                    try:
+                        os.remove(entry.path)
+                        removed_count += 1
+                    except Exception as e:
+                        failed_paths.append((entry.path, str(e)))
+                else:
+                    kept_count += 1
 
-        logger.info("[清理] 已删除 %d 个导出文件: %s", removed_count, DEFAULT_SAVE_PATH)
+        logger.info("[清理] 已删除 %d 个旧导出文件，保留 %d 个: %s", removed_count, kept_count, DEFAULT_SAVE_PATH)
         if failed_paths:
             for path, err in failed_paths[:5]:
                 logger.warning("[清理] 删除失败: %s - %s", path, err)
