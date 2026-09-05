@@ -28,12 +28,27 @@ from logging.handlers import RotatingFileHandler
 # 启用 C 级崩溃转储：在 SIGSEGV / access violation 时把 Python 栈写到 stderr / 日志
 faulthandler.enable()
 # 每 30 秒把各线程栈覆写到 crash dump（覆盖写，防止文件无限膨胀）
+_crash_timer_running = [False]
+_crash_dump_timer_ref = [None]
+
+def _stop_crash_dump_timer():
+    """停止 crash dump 递归调度，确保进程能真正退出。"""
+    _crash_timer_running[0] = False
+    try:
+        t = _crash_dump_timer_ref[0]
+        if t is not None:
+            t.cancel()
+            _crash_dump_timer_ref[0] = None
+    except Exception:
+        pass
+
 try:
     _crash_dump_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "logs", "pipeline_crash.dump"
     )
     os.makedirs(os.path.dirname(_crash_dump_path), exist_ok=True)
     _crash_timer_running = [True]
+
     def _write_crash_dump():
         if not _crash_timer_running[0]:
             return
@@ -49,12 +64,25 @@ try:
                     f.write("")
         except Exception:
             pass
+
     def _schedule_next_dump():
         if not _crash_timer_running[0]:
             return
         _write_crash_dump()
-        threading.Timer(30, _schedule_next_dump).start()
-    _schedule_next_dump()
+        if not _crash_timer_running[0]:
+            return
+        t = threading.Timer(30, _schedule_next_dump)
+        t.daemon = True
+        _crash_dump_timer_ref[0] = t
+        t.start()
+
+    _initial_timer = threading.Timer(30, _schedule_next_dump)
+    _initial_timer.daemon = True
+    _crash_dump_timer_ref[0] = _initial_timer
+    _initial_timer.start()
+
+    # 进程正常退出前（非交易日、sys.exit、atexit），主动取消调度链，避免 Python 因非 daemon Timer 存活而不退出
+    atexit.register(_stop_crash_dump_timer)
 except Exception:
     pass
 
@@ -197,8 +225,10 @@ TRADING_SESSIONS = [
     ("21:00:15", "23:59:00"),    # 夜盘（跨午夜）
     ("00:00:15", "02:30:00"),    # 夜盘（跨午夜续）
 ]
-CHECK_INTERVAL = 20  # 秒
-SYNC_INTERVAL = 30    # 持仓同步间隔（秒）
+CHECK_INTERVAL = 20  # 秒（导出线程轮询间隔）
+# 注意：真正的同步冷却在 trading/position_sync/sync.py sync_and_trade() 里 SYNC_COOLDOWN=25 秒；
+# 此处常量仅作注释参考，同步循环实际按 hold-std.json 文件变更事件触发（约 2 秒扫描一次）。
+SYNC_INTERVAL = 25    # 持仓同步冷却参考值（秒）
 
 # 持仓同步比例：1.0=全仓，0.5=半仓；可通过 --ratio 覆盖
 POSITION_RATIO = _POSITION_RATIO
@@ -842,7 +872,17 @@ def main():
 
     # 交易日检查
     if not _is_trading_day():
-        return  # 非交易日，直接退出
+        # 非交易日立即退出：显式停掉 crash dump Timer 链 + 刷日志，保证 cmd 窗口能关闭
+        try:
+            _stop_crash_dump_timer()
+        except Exception:
+            pass
+        try:
+            for h in logger.handlers:
+                h.flush()
+        except Exception:
+            pass
+        return
 
     # 检查单实例，防止多任务同时运行导致持仓加倍
     instance_fd = check_single_instance()
