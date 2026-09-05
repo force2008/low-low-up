@@ -171,12 +171,12 @@ class PositionSyncManagerSync:
             missing_orders = []
             excess_orders = []
 
-            # 检查是否有合约在1009冷却期
+            # 检查是否有合约在 1009 冷却期（与入口 SYNC_COOLDOWN=25 一致：避免"昨仓/今仓"划分未更新时重复报持仓不足）
             current_time = time.time()
             cooling_contracts = []
             if hasattr(self, '_last_1009_reject'):
                 for contract_upper, reject_time in list(self._last_1009_reject.items()):
-                    if current_time - reject_time < 30:
+                    if current_time - reject_time < SYNC_COOLDOWN:
                         cooling_contracts.append(contract_upper)
 
             # 计算缺额（使用 effective_actual = actual_agg + pending_open）

@@ -76,11 +76,13 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._cancel_events: Dict[str, threading.Event] = {}
         self._cancel_result: Optional[List] = None
 
-        # 持仓对齐冷却：防止 CTP 持仓查询滞后导致重复下单
-        self._last_align_time: Dict[Tuple[str, int, str], float] = {}
-
-        # 完整仓位对齐冷却（2分钟）
-        self._last_full_sync_time: float = 0.0
+        # 说明：
+        #  - 历史遗留的"_last_align_time（合约级对齐冷却）"与"_last_full_sync_time（2分钟完整对齐冷却）"
+        #    从未被读取/更新，已移除避免误读。
+        #  - 当前真实的冷却实现：
+        #     1. 入口级 SYNC_COOLDOWN=25 秒 (sync.py _do_sync L63)，距上次同步<25秒直接跳过
+        #     2. 1009 拒绝级合约冷却=25 秒 (sync.py _do_sync L174)，单合约报持仓不足后25秒内不平仓
+        #     3. 关键时点(14:58/14:59/15:00) force_sync 无条件跳过所有冷却
 
         # 首次运行标志：只在第一次执行同步时为 True
         self._is_first_run: bool = True
