@@ -36,26 +36,26 @@
 """
 
 ACCOUNT_TARGETS = {
-     "wangk0402": [
-         {"env_name": "simu", "user_id": "16599", "password": "123456"},
-     ],
-    # "zhouzhou": [
-    #    {"env_name": "simu", "user_id": "17872", "password": "123456"},
-    # ],
-     "wangxy0617": [
-         {"env_name": "simu", "user_id": "17882", "password": "123456"},
-     ],
-    # "wangxy0617": [
-    #     {"env_name": "online", "user_id": "yqj0929", "password": "041354","ratio":2},
-    #     {"env_name": "online", "user_id": "fy0228", "password": "fy123456","ratio":2},
-    #     {"env_name": "online", "user_id": "sxk0812", "password": "sxk123456","ratio":2},
-    #     {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":2}
-    # ],
     # "wangk0402": [
-    #     # {"env_name": "online", "user_id": "sxk0812", "password": "sxk123456","ratio":1},
-    #     # {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":1}
+    #     {"env_name": "simu", "user_id": "16599", "password": "123456"},
     # ],
-    # "WQ1017":[
-    #     {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456","ratio":1},
-    # ]
+    # "zhouzhou": [
+    #     {"env_name": "simu", "user_id": "17872", "password": "123456"},
+    # ],
+    # "wangxy0617": [
+    #     {"env_name": "simu", "user_id": "17882", "password": "123456"},
+    # ],
+    "wangxy0617": [
+        {"env_name": "online", "user_id": "yqj0929", "password": "041354","ratio":2},
+        {"env_name": "online", "user_id": "fy0228", "password": "fy123456","ratio":2},
+        {"env_name": "online", "user_id": "sxk0812", "password": "sxk123456","ratio":2},
+        {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":2}
+    ],
+    "wangk0402": [
+        # {"env_name": "online", "user_id": "sxk0812", "password": "sxk123456","ratio":1},
+        # {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":1}
+    ],
+    "WQ1017":[
+        {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456","ratio":1},
+    ]
 }
