@@ -262,10 +262,19 @@ def format_account_message(accounts_data):
     total_row = None  # CSV 原始的「合 计」行（中间一个半角空格）
 
     def _is_total_account(account_name):
-        """精确匹配 CSV 的「合 计」行：先去掉所有空白后等于『合计』即命中"""
+        """匹配 CSV 的合计行：
+
+        实测 CSV 里账号形如『合 计:』（中间一个半角空格、尾部带冒号）。
+        兼容：前后空白、中间半角/全角空格、尾部冒号、TAB —— 规整后等于『合计』即命中。
+        """
         if not account_name:
             return False
         s = account_name.strip()
+        # 先去掉尾部冒号（全角/半角），再去掉所有空白字符
+        if s.endswith(':'):
+            s = s[:-1].rstrip()
+        if s.endswith('\uff1a'):  # 全角冒号
+            s = s[:-1].rstrip()
         s = (s.replace(' ', '')
               .replace('\u3000', '')
               .replace('\t', ''))
