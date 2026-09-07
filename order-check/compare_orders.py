@@ -19,6 +19,7 @@ PREFIX = f"{ACCOUNT} 所有委托"
 
 # 飞书机器人 webhook（请替换为实际的 webhook 地址）
 FEISHU_WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/6afaaa96-9685-4de8-8136-4de3b7eb4b42"
+FEISHU_WEBHOOK_ACCOUNT_MONITOR_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/e6d2f2aa-9d44-4846-8b76-de5e08953695"
 # 示例: FEISHU_WEBHOOK_URL = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxx"
 # ==================================================
 
