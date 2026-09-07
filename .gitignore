@@ -67,3 +67,4 @@ order-check/logs
 *yq02_*
 *WQ1017_*
 order-check/.pipeline_instance.lock
+order-check/account_targets.py
