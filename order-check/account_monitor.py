@@ -245,19 +245,31 @@ def format_account_message(accounts_data):
     """格式化账户数据为飞书消息
 
     - 只显示持盈和平盈不都为0的账号
-    - 汇总放在最前面
+    - 头部优先展示 CSV 末尾自带的「合 计」行（精确匹配，中间一个空格），
+      找不到该行则 fallback 到代码自己累加的汇总
     """
     if not accounts_data:
         return "未读取到账户数据"
 
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
 
-    # 先计算汇总
+    # fallback 用的手动累加汇总（只有当 CSV 不带合计行时才展示）
     total_equity = 0
     total_margin = 0
     total_position_profit = 0
     total_close_profit = 0
     valid_accounts = []
+    total_row = None  # CSV 原始的「合 计」行（中间一个半角空格）
+
+    def _is_total_account(account_name):
+        """精确匹配 CSV 的「合 计」行：先去掉所有空白后等于『合计』即命中"""
+        if not account_name:
+            return False
+        s = account_name.strip()
+        s = (s.replace(' ', '')
+              .replace('\u3000', '')
+              .replace('\t', ''))
+        return s == '合计'
 
     for acc in accounts_data:
         try:
@@ -267,6 +279,20 @@ def format_account_message(accounts_data):
             close_profit = float(acc['平盈'].replace(',', '')) if acc['平盈'] else 0
         except (ValueError, AttributeError):
             equity = margin = pos_profit = close_profit = 0
+
+        # 识别 CSV 原始合计行：精确匹配「合 计」(去掉空白 == '合计')
+        if _is_total_account(acc.get('账号', '')):
+            total_row = {
+                **acc,
+                '_pos_profit': pos_profit,
+                '_close_profit': close_profit,
+            }
+            # 合计行仍然累加到 fallback 总计数里，保持 fallback 一致
+            total_equity += equity
+            total_margin += margin
+            total_position_profit += pos_profit
+            total_close_profit += close_profit
+            continue
 
         total_equity += equity
         total_margin += margin
@@ -281,16 +307,25 @@ def format_account_message(accounts_data):
                 '_close_profit': close_profit
             })
 
-    # 汇总放在最前面
+    # 头部：优先用 CSV 原始合计行；找不到才 fallback 到代码自己累加的
     lines = [f"📊 账户资金监控 ({now_str})", ""]
-    total_profit = total_position_profit + total_close_profit
-    total_icon = "📈" if total_profit >= 0 else "📉"
-    lines.append("📋 汇总")
-    lines.append(f"  权益: {total_equity:,.2f} | 保证金: {total_margin:,.2f}")
-    lines.append(f"  持盈: {total_icon} {total_position_profit:,.2f} | 平盈: {total_icon} {total_close_profit:,.2f}")
-    lines.append("")
+    if total_row is not None:
+        # 持盈、平盈各自独立判断盈亏图标（用户关注点：合计行两项不一定同向）
+        pos_icon = "📈" if total_row['_pos_profit'] >= 0 else "📉"
+        close_icon = "📈" if total_row['_close_profit'] >= 0 else "📉"
+        lines.append("📋 合 计")
+        lines.append(f"  权益: {total_row['动态权益']} | 保证金: {total_row['保证金']}")
+        lines.append(f"  持盈: {pos_icon} {total_row['持盈']} | 平盈: {close_icon} {total_row['平盈']}")
+        lines.append("")
+    else:
+        total_profit = total_position_profit + total_close_profit
+        total_icon = "📈" if total_profit >= 0 else "📉"
+        lines.append("📋 汇总（合计）")
+        lines.append(f"  权益: {total_equity:,.2f} | 保证金: {total_margin:,.2f}")
+        lines.append(f"  持盈: {total_icon} {total_position_profit:,.2f} | 平盈: {total_icon} {total_close_profit:,.2f}")
+        lines.append("")
 
-    # 各账号详情
+    # 各账号详情（注意：合计行已经在头部展示过，这里不再重复）
     if valid_accounts:
         lines.append("─" * 20)
         for acc in valid_accounts:
