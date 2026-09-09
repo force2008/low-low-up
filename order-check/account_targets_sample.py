@@ -15,6 +15,12 @@
   - ratio / ration / position_ratio: 该目标账户的持仓同步比例，可选。
     默认为 1.0（即标准仓位）。例如 ration=2 表示该账户同步两倍标准仓位。
     字段优先级：ratio > ration > position_ratio；都没有则使用命令行 --ratio（默认 1.0）。
+  - exclude / exclude_products / exclude_symbols: 该目标账户**不跟单**的品种列表，可选。
+    可以写列表或逗号分隔字符串，例：exclude=["SC","FG"] 或 exclude="sc, FG"。
+    命中规则：合约代码**前缀**匹配即跳过。
+    效果：① hold-std 里的该品种目标持仓不会开仓；
+          ② CTP 端已有的该品种老持仓也不参与对比（不会被当成"超额"触发强制平仓）。
+    这意味着这些品种完全由用户自己手工管理，跟单系统对它们"既不买也不卖"。
 
 示例：
     ACCOUNT_TARGETS = {
@@ -23,6 +29,10 @@
         ],
         "zhouzhou": [
             {"env_name": "simu", "user_id": "17883", "password": "123456", "ratio": 0.5},
+        ],
+        "WQ1017": [
+            {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456",
+             "ratio": 1, "exclude": ["SC", "FG"]},
         ],
     }
 
@@ -56,6 +66,6 @@ ACCOUNT_TARGETS = {
         # {"env_name": "online", "user_id": "yq02", "password": "yq123456","ratio":1}
     ],
     "WQ1017":[
-        {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456","ratio":1},
+        {"env_name": "online", "user_id": "yuqj0821", "password": "yqj123456","ratio":1, "exclude": ["sc","FG"]},
     ]
 }

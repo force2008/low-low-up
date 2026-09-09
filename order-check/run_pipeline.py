@@ -553,6 +553,46 @@ def _get_target_ratio(target: dict) -> float:
     return float(POSITION_RATIO)
 
 
+def _get_target_exclude(target: dict) -> list:
+    """获取目标账户的排除品种列表（已规范化，全大写）。
+
+    支持：exclude / exclude_products / exclude_symbols，任意一种均可；
+    值可以是逗号分隔字符串（如 "sc, FG"）或列表（如 ["sc","FG"]）；
+    空值或无法识别时返回空 list，表示不排除任何品种。
+    """
+    raw = None
+    for key in ("exclude", "exclude_products", "exclude_symbols"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    if raw is None:
+        return []
+
+    # 支持 str："sc, FG" / "SC FG" / "sc;FG"
+    if isinstance(raw, str):
+        items = []
+        for chunk in raw.replace(',', ' ').replace(';', ' ').split():
+            chunk = chunk.strip()
+            if chunk:
+                items.append(chunk.upper())
+        return items
+
+    # 支持 list / tuple / set
+    try:
+        items = []
+        for x in list(raw):
+            s = str(x).strip()
+            if s:
+                items.append(s.upper())
+        return items
+    except Exception as e:
+        logger.warning(
+            "[exclude] 目标账户 %s 的 exclude 配置解析失败: %s （原始值=%s），忽略排除",
+            target.get("user_id", "unknown"), e, raw,
+        )
+        return []
+
+
 # ==================== 线程间通信 ====================
 shutdown_event = threading.Event()
 _last_sync_time = [0]
@@ -987,14 +1027,17 @@ def main():
                 env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
                 conf = build_target_conf(target)
                 ratio = _get_target_ratio(target)
+                exclude = _get_target_exclude(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
-                logger.info("[同步][%s -> %s] 启动目标账户同步", source_account, user_id)
+                logger.info("[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s)",
+                            source_account, user_id, ratio, exclude or '[]')
             else:
                 # 回退到默认单账户模式
                 user_id = "default"
                 env_label = _CTP_ENV_NAME
                 conf = None
                 ratio = POSITION_RATIO
+                exclude = []
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 logger.info("[同步-default] 启动默认账户同步")
 
@@ -1009,6 +1052,7 @@ def main():
                 logger=logger,
                 stop_event=shutdown_event,
                 position_ratio=ratio,
+                exclude_products=exclude,
             )
         except Exception as e:
             logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)

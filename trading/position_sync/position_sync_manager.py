@@ -73,6 +73,7 @@ def run_position_sync(
     env_name: str = None,
     logger=None,
     position_ratio: float = 1.0,
+    exclude_products=None,
 ) -> bool:
     """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
@@ -81,12 +82,15 @@ def run_position_sync(
         print(f"  hold_std_path={hold_std_path}")
         print(f"  main_contracts_path={main_contracts_path}")
         print(f"  position_ratio={position_ratio}")
+        if exclude_products:
+            print(f"  exclude_products={list(exclude_products)}")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
             conf=conf,
             env_name=env_name,
             position_ratio=position_ratio,
+            exclude_products=exclude_products,
         )
         if logger:
             mgr.set_logger(logger)
@@ -121,6 +125,7 @@ def run_position_sync_loop(
     logger=None,
     stop_event=None,
     position_ratio: float = 1.0,
+    exclude_products=None,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -139,6 +144,7 @@ def run_position_sync_loop(
         logger: 日志记录器
         stop_event: 停止事件（threading.Event），设为 None 则一直运行
         position_ratio: 持仓同步比例
+        exclude_products: 排除品种列表/可迭代集合，例：["SC","FG"]，命中前缀的合约不参与对齐
 
     Returns:
         bool: 是否正常结束
@@ -157,6 +163,8 @@ def run_position_sync_loop(
         _log(f"  hold_std_path={hold_std_path}")
         _log(f"  main_contracts_path={main_contracts_path}")
         _log(f"  position_ratio={position_ratio}")
+        if exclude_products:
+            _log(f"  exclude_products={list(exclude_products)}")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -164,6 +172,7 @@ def run_position_sync_loop(
             conf=conf,
             env_name=env_name,
             position_ratio=position_ratio,
+            exclude_products=exclude_products,
         )
         if logger:
             mgr.set_logger(logger)
@@ -217,6 +226,8 @@ def run_position_sync_loop(
         return False
     finally:
         # 退出时关闭连接（只有收到停止信号或异常时才关闭）
+        # 注意：finally 里不要写 return，否则会吞掉异常/覆盖前面的 return False，
+        # 导致函数永远返回 True。finally 仅负责资源清理，返回值由外层 try/except 之后的语句决定。
         if mgr is not None:
             _log("[同步] 关闭 PositionSyncManager...")
             try:
@@ -228,7 +239,8 @@ def run_position_sync_loop(
             except Exception:
                 pass
         _log("[同步] 同步循环已退出")
-        return True
+    # 正常路径（stop_event 触发 break 跳出循环）才走到这里，返回 True
+    return True
 
 
 # 向后兼容：直接从 position_sync_manager 导入 PositionSyncManager

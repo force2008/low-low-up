@@ -49,10 +49,23 @@ class PositionSyncManagerBase(CTdSpiBase):
         conf=None,
         env_name: str = None,
         position_ratio: float = 1.0,
+        exclude_products=None,
     ):
         if position_ratio <= 0:
             raise ValueError(f"position_ratio 必须大于 0，当前值: {position_ratio}")
         self._position_ratio = float(position_ratio)
+
+        # 排除品种集合（全大写）：合约代码以前缀命中就不再参与目标持仓/实际持仓比对
+        # 用法：exclude_products = {"SC", "FG"} —— 对应合约 SC2501、FG501 等都被忽略
+        # 目的：当目标账户不对某些品种跟实时，既不把 hold-std 里的这些仓位当目标开仓，
+        #       也不把 CTP 端已有的这些老持仓当"超额"触发强制平仓（用户自己手动管理）。
+        def _norm(x):
+            return str(x).strip().upper() if x is not None and str(x).strip() else None
+        self._exclude_products: set = set()
+        if exclude_products:
+            normalized = [_norm(x) for x in exclude_products if _norm(x)]
+            if normalized:
+                self._exclude_products = set(normalized)
 
         self.hold_std_path = hold_std_path
         self.main_contracts_path = main_contracts_path
@@ -155,6 +168,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         super().__init__(conf=conf)
         print("[__init__] super().__init__ 完成，start_monitor")
         self.print(f"[配置] 持仓同步比例: {self._position_ratio}")
+        if self._exclude_products:
+            self.print(f"[配置] 排除品种（不跟单/不比对）: {sorted(self._exclude_products)}")
 
         # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
         # 注意：必须在 super().__init__ 之后调用，因为后者会阻塞直到登录成功

@@ -27,6 +27,26 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class PositionSyncManagerData:
     """持仓同步管理器 - 数据加载部分"""
 
+    # ------------------------------------------------------------------
+    # 排除品种工具：由 Base.__init__ 写入 self._exclude_products（全大写 set）
+    # ------------------------------------------------------------------
+    def _is_contract_excluded(self, instrument_id_upper: str) -> bool:
+        """合约代码前缀命中任一排除品种即返回 True。
+
+        例：排除 {"SC", "FG"} → 合约 SC2501 / SC2503 / FG501 / FG509 均命中并跳过；
+        未配置排除时 self._exclude_products 为空 set，全部返回 False。
+        """
+        excludes = getattr(self, '_exclude_products', None)
+        if not excludes:
+            return False
+        s = (instrument_id_upper or '').upper()
+        if not s:
+            return False
+        for prefix in excludes:
+            if s.startswith(prefix):
+                return True
+        return False
+
     def _load_contract_info(self) -> bool:
         """从 main_contracts.json / instruments.json 加载合约信息（交易所、PriceTick、ProductID）"""
         self._contract_info: Dict[str, dict] = {}
@@ -286,6 +306,7 @@ class PositionSyncManagerData:
         result: Dict[Tuple[str, int], int] = {}
         ratio = getattr(self, '_position_ratio', 1.0)
         total_original = 0
+        excluded_original = 0
         for i, row in enumerate(self._hold_std):
             raw_contract = self._extract_contract(row)
             contract = self._standardize_contract(raw_contract)
@@ -296,6 +317,11 @@ class PositionSyncManagerData:
                 continue
             if volume <= 0:
                 self.print(f"[调试-hold] 第{i}条 {contract} volume={volume}")
+                continue
+            # 排除品种过滤：目标持仓侧直接跳过
+            if self._is_contract_excluded(contract):
+                excluded_original += volume
+                self.print(f"[exclude] 目标持仓跳过（{contract} 命中排除品种）: {direction_str} {volume}手")
                 continue
             if direction_str in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
                 direction = 2
@@ -308,15 +334,25 @@ class PositionSyncManagerData:
             scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
             result[(contract, direction)] = result.get((contract, direction), 0) + scaled_volume
         total_scaled = sum(result.values())
-        self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
+        if excluded_original > 0:
+            self.print(f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, 缩放后: {total_scaled} 手 (ratio={ratio})")
+        else:
+            self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
         return result
 
     def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:
         result: Dict[Tuple[str, int], int] = {}
+        excluded_actual = 0
         for pos in self._actual_positions:
             contract = self._standardize_contract(pos["InstrumentID"])
+            # 排除品种过滤：实际持仓侧直接跳过，避免当成"超额"触发平仓
+            if self._is_contract_excluded(contract):
+                excluded_actual += int(pos.get("Position", 0) or 0)
+                continue
             key = (contract, pos["PosiDirection"])
             result[key] = result.get(key, 0) + pos["Position"]
+        if excluded_actual > 0:
+            self.print(f"[exclude] 实际持仓跳过 {excluded_actual} 手（命中排除品种，不参与对齐比较）")
         return result
 
     def _get_position_detail(self, contract: str, direction: int) -> dict:
