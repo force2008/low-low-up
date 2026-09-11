@@ -25,6 +25,7 @@ import faulthandler
 import atexit
 import importlib
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 # 启用 C 级崩溃转储：在 SIGSEGV / access violation 时把 Python 栈写到 stderr / 日志
 faulthandler.enable()
