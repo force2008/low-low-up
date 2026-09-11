@@ -302,8 +302,162 @@ class PositionSyncManagerData:
                     continue
         return 0
 
+    def _load_main_by_product(self) -> bool:
+        """加载 main_contracts_by_product.json，构建三个便捷缓存：
+        self._main_by_product          : {ProductID: {main,main2,main3,volume_multiple,price_tick,...}}
+        self._allowed_contracts_set    : {具体合约代码 UPPER}（仅在 allow_level 中的那些级别的具体合约）
+        self._product_volume_multiple  : {ProductID: volume_multiple}（算 notional 用）
+
+        懒加载：首次 _parse_hold_std 调一次；之后 allow_level 变更时把 self._main_by_product_loaded=False
+        下一次 _parse_hold_std 再重算。
+        """
+        path = getattr(self, '_main_by_product_path', None)
+        if not path:
+            path = os.path.join(PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json")
+            self._main_by_product_path = path
+        if not os.path.exists(path):
+            self.print(f"[错误] 找不到 main_contracts_by_product.json: {path}，将回退为「全部合约允许」")
+            self._main_by_product = {}
+            self._allowed_contracts_set = set()
+            self._product_volume_multiple = {}
+            self._main_by_product_loaded = True  # 避免每次 _parse_hold_std 都重试
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.print(f"[错误] 读取 main_contracts_by_product.json 失败: {e}，将回退为「全部合约允许」")
+            self._main_by_product = {}
+            self._allowed_contracts_set = set()
+            self._product_volume_multiple = {}
+            self._main_by_product_loaded = True
+            return False
+        if not isinstance(data, dict):
+            self.print(f"[错误] main_contracts_by_product.json 根节点类型错误 {type(data)}，应为 dict")
+            self._main_by_product_loaded = True
+            return False
+        allow_level = getattr(self, '_allow_contract_level', None) or {"main", "main2"}
+        allowed_set = set()
+        vm_map = {}
+        for product_id, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            # 1. 存储完整 info
+            self._main_by_product[product_id.upper()] = info
+            # 2. 缓存合约乘数
+            try:
+                vm = float(info.get("volume_multiple", 1))
+                if vm > 0:
+                    vm_map[product_id.upper()] = vm
+            except (TypeError, ValueError):
+                pass
+            # 3. 构建具体合约允许集合（按 allow_level 取具体 key）
+            for level_key in allow_level:
+                contract_id = info.get(level_key)
+                if contract_id:
+                    cid = str(contract_id).strip().upper()
+                    if cid:
+                        allowed_set.add(cid)
+        self._allowed_contracts_set = allowed_set
+        self._product_volume_multiple = vm_map
+        self._main_by_product_loaded = True
+        self.print(
+            f"[信息] main_by_product 加载完成: 共 {len(data)} 品种, "
+            f"允许级别={sorted(allow_level)}, 允许具体合约={len(allowed_set)} 个, "
+            f"乘数缓存={len(vm_map)} 品种"
+        )
+        return True
+
+    def _contract_is_mainline(self, instrument_id_upper: str) -> Optional[bool]:
+        """判断具体合约代码是否为 allow_level 指定的主/次主/次次主力。
+
+        返回 True/False/None：
+          True  = 明确是主流通合约
+          False = 明确是非主流通（远月/冷门月）
+          None  = 文件没加载成功（或未知品种），应视为"放行"避免误杀。
+        """
+        if not getattr(self, '_main_by_product_loaded', False):
+            self._load_main_by_product()
+        allowed = getattr(self, '_allowed_contracts_set', None)
+        if allowed is None:
+            return None
+        if len(allowed) == 0:
+            # allow_level 对应合约集合为空（= 文件加载失败），不拦避免误杀
+            return None
+        inst = (instrument_id_upper or '').upper()
+        if not inst:
+            return None
+        return inst in allowed
+
+    def _estimate_volume_multiple(self, instrument_id_upper: str) -> float:
+        """估算合约乘数（用于算 notional = qty × price × vm），失败回退 1.0。"""
+        if not getattr(self, '_main_by_product_loaded', False):
+            self._load_main_by_product()
+        product_id = (instrument_id_upper or '').strip().upper().rstrip("0123456789")
+        if product_id:
+            vm = (getattr(self, '_product_volume_multiple', None) or {}).get(product_id)
+            if vm and vm > 0:
+                return float(vm)
+        # 回退：查 _contract_info（旧 main_contracts.json 加载的）有没有 VolumeMultiple 字段
+        info = self._contract_info.get((instrument_id_upper or '').upper()) or {}
+        vm_raw = info.get("VolumeMultiple") if isinstance(info, dict) else None
+        try:
+            vm2 = float(vm_raw)
+            if vm2 > 0:
+                return vm2
+        except (TypeError, ValueError):
+            pass
+        return 1.0
+
+    def _estimate_notional(self, instrument_id_upper: str, qty_hand: int) -> float:
+        """估算单合约目标持仓的名义成交额（元）：qty_hand × LastPrice_or_PreClose × VolumeMultiple。
+
+        数据源优先级：
+          1) 若 manager 能取到最新行情 -> 用 LatestPrice × vm；
+          2) 否则按 main_by_product.json 查不到时回退：vm * 1000 * qty（保守估值，偏低不会误杀真实大单）
+        """
+        vm = self._estimate_volume_multiple(instrument_id_upper)
+        price = 0.0
+        # 尝试1：get_market_data 最新价
+        try:
+            md_getter = getattr(self, 'get_market_data', None)
+            if callable(md_getter):
+                md = md_getter(instrument_id_upper) or {}
+                if isinstance(md, dict):
+                    for k in ('LastPrice', 'LatestPrice', 'ClosePrice', 'PreClosePrice', 'SettlementPrice'):
+                        try:
+                            p = float(md.get(k, 0))
+                            if p > 0:
+                                price = p
+                                break
+                        except (TypeError, ValueError):
+                            continue
+        except Exception:
+            pass
+        # 尝试2：_main_by_product 有没有昨收/最新（没有的字段就 0）
+        if price <= 0:
+            product_id = (instrument_id_upper or '').strip().upper().rstrip("0123456789")
+            if product_id:
+                if not getattr(self, '_main_by_product_loaded', False):
+                    self._load_main_by_product()
+                info = (getattr(self, '_main_by_product', None) or {}).get(product_id, None)
+                if isinstance(info, dict):
+                    for k in ('main_volume',):  # 无昨收字段，跳过
+                        pass
+        # 尝试3：_contract_info 里有没有默认昨收 （一般没有，占位）
+        if price <= 0:
+            # 回退：保守估算——按 1000 元/手（这个估计偏低，尽量放行不误杀）
+            #   但对于真实品种的乘数，比如 FG 乘数 20 → 20 × 1500 = 3 万 → 1 手 3 万
+            #   所以直接取 1000 × vm 就能保证 1 手 FG 是 2 万 ≈ 真实 3 万的量级。
+            price = 1000.0
+        try:
+            q = int(qty_hand)
+        except (TypeError, ValueError):
+            q = 0
+        return float(max(q, 0)) * float(price) * float(vm)
+
     def _parse_hold_std(self) -> Dict[Tuple[str, int], int]:
-        """目标持仓构造器，支持 ratio/ration 的三种模式：
+        """目标持仓构造器，支持 ratio/ration 的三种模式 + 反探单过滤。
 
         (A) ratio > 0  → 正常跟单：hold-std 方向不变，手数 = round(原始手数 × ratio)，单合约最小 1 手（若原始>0）。
         (B) ratio == 0 → 清仓模式：目标持仓强制返回空 dict，相当于所有品种目标为 0；
@@ -312,25 +466,22 @@ class PositionSyncManagerData:
         (C) ratio < 0  → 对冲模式：以 hold-std 里的 source_account 原始持仓为基准，方向反转后再乘 abs(ratio)。
                          例：source wangk0402 持 FG 多 1 手，ratio=-1 → target 持 FG 空 1 手；ratio=-2 → 空 2 手。
                          等价于"跟单账户作为 signal_account 的对手方"。
-        三种模式下 exclude 品种过滤、非标准化跳过、volume<=0 跳过等通用逻辑始终生效。
+        三种模式下 exclude 品种过滤、非标准化跳过、volume<=0 跳过、
+        追加 4 层「反探单过滤」：deny_products → 主流通合约检查 + 大单豁免 → min_qty_hand → min_notional。
         """
-        result: Dict[Tuple[str, int], int] = {}
+        # 清仓模式：直接空 dict，不做反探单过滤（清仓是要把所有持仓平掉，包括非主流通/黑名单品种）
         ratio = getattr(self, '_position_ratio', 1.0)
-        total_original = 0
-        excluded_original = 0
-        hedged_total = 0  # ratio<0 时的对冲后总手数（按 abs(ratio) 计算）
-
-        # ==========================================
-        # [模式 B] ratio == 0：清仓
-        # ==========================================
         if ratio == 0:
             self.print("[模式-清仓] ration=0，目标持仓全部置 0（将以限价挂卖一/买一平掉所有实际持仓）")
-            return result
+            return {}
 
+        # 1) 先构建原始缩放后的 result（按 ratio/对冲 正常算）：代码复用原先已有实现
+        raw_result: Dict[Tuple[str, int], int] = {}
+        total_original = 0
+        excluded_original = 0
+        hedged_total = 0
         abs_ratio = abs(ratio)
-        # ==========================================
-        # 通用：逐行遍历 hold-std
-        # ==========================================
+
         for i, row in enumerate(self._hold_std):
             raw_contract = self._extract_contract(row)
             contract = self._standardize_contract(raw_contract)
@@ -342,7 +493,6 @@ class PositionSyncManagerData:
             if volume <= 0:
                 self.print(f"[调试-hold] 第{i}条 {contract} volume={volume}")
                 continue
-            # 排除品种过滤：目标持仓侧直接跳过
             if self._is_contract_excluded(contract):
                 excluded_original += volume
                 self.print(f"[exclude] 目标持仓跳过（{contract} 命中排除品种）: {direction_str} {volume}手")
@@ -356,41 +506,121 @@ class PositionSyncManagerData:
                 continue
             total_original += volume
 
-            # ==========================================
-            # [模式 A] ratio > 0：正常跟单（方向不变）
-            # [模式 C] ratio < 0：对冲（方向反转：买↔卖，2↔3）
-            # ==========================================
             if ratio > 0:
                 direction = src_direction
                 scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
-            else:  # ratio < 0 对冲
+            else:
                 direction = 3 if src_direction == 2 else 2
                 hedged_after = int(round(volume * abs_ratio)) if volume > 0 else 0
-                # 对冲模式下若原合约占 1 手、乘 2 倍 = 2 手，不强制 +1 到 1（已由 round 保证 ≥ 1 当 volume>0）
                 scaled_volume = hedged_after
                 hedged_total += hedged_after
 
             if scaled_volume > 0:
-                result[(contract, direction)] = result.get((contract, direction), 0) + scaled_volume
+                key = (contract, direction)
+                raw_result[key] = raw_result.get(key, 0) + scaled_volume
 
-        total_scaled = sum(result.values())
+        # 2) 追加 4 层「反探单过滤」（仅对 ration != 0 生效）
+        deny_products = getattr(self, '_deny_products', None) or set()
+        min_qty_hand = getattr(self, '_min_qty_hand', None)
+        min_notional = getattr(self, '_min_notional', None)
+        big_notional_exemption = getattr(self, '_big_notional_exemption', 1_000_000.0)
+
+        if not getattr(self, '_main_by_product_loaded', False):
+            self._load_main_by_product()
+
+        final_result: Dict[Tuple[str, int], int] = {}
+        filtered_counts = {"deny": 0, "non_main": 0, "min_qty": 0, "min_notional": 0}
+        exempt_non_main = 0
+
+        for (contract, direction), qty in raw_result.items():
+            if qty <= 0:
+                continue
+            cu = (contract or '').strip().upper()
+            product_id = cu.rstrip("0123456789")
+
+            # 层1：黑名单 deny（全球冷门 + 账号追加）→ 强剔除
+            if deny_products and product_id and product_id in deny_products:
+                self.print(
+                    f"[deny] 跳过（品种 {product_id} 命中黑名单合约）: {contract} "
+                    f"{'买' if direction == 2 else '卖'} {qty}手"
+                )
+                filtered_counts["deny"] += 1
+                continue
+
+            # 层2：非主流通合约 → 先估算 notional，再判断是否满足大豁免
+            mainline_flag = self._contract_is_mainline(cu)
+            if mainline_flag is False:
+                notional = self._estimate_notional(cu, qty)
+                if notional >= big_notional_exemption:
+                    exempt_non_main += 1
+                    self.print(
+                        f"[非主流通-大单豁免] {contract} {'买' if direction == 2 else '卖'} {qty}手, "
+                        f"估算成交额约 {notional:,.0f} 元 >= {big_notional_exemption:,.0f} 豁免阈值，放行"
+                    )
+                else:
+                    self.print(
+                        f"[非主流通] 跳过（{contract} 不属于 allow_level={sorted(getattr(self, '_allow_contract_level', None))}），"
+                        f"且成交额 {notional:,.0f} 元 < {big_notional_exemption:,.0f} 豁免阈值: "
+                        f"{'买' if direction == 2 else '卖'} {qty}手"
+                    )
+                    filtered_counts["non_main"] += 1
+                    continue
+
+            # 层3：min_qty_hand（单合约手数太小视为探单）
+            if min_qty_hand is not None and min_qty_hand > 0 and qty < min_qty_hand:
+                self.print(
+                    f"[min_qty] 跳过（{contract} 单合约 {qty} 手 < {min_qty_hand} 手门槛，视为探单）"
+                )
+                filtered_counts["min_qty"] += 1
+                continue
+
+            # 层4：min_notional（单合约成交额太小视为探单）
+            if min_notional is not None and min_notional > 0:
+                notional = self._estimate_notional(cu, qty)
+                if notional < min_notional:
+                    self.print(
+                        f"[min_notional] 跳过（{contract} 成交额 {notional:,.0f} 元 < {min_notional:,.0f} 元门槛，视为探单）："
+                        f"{qty} 手"
+                    )
+                    filtered_counts["min_notional"] += 1
+                    continue
+
+            # 全部通过
+            final_result[(contract, direction)] = qty
+
+        # 日志：先打印原模式（缩放/对冲）汇总，再追加过滤统计
+        total_scaled_raw = sum(raw_result.values())
+        total_final = sum(final_result.values())
         if ratio < 0:
-            if excluded_original > 0:
-                self.print(
-                    f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
-                    f"对冲后目标: {total_scaled} 手 (ratio={ratio}, 方向全部反转)"
-                )
-            else:
-                self.print(
-                    f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手, "
-                    f"对冲后目标: {total_scaled} 手 (ratio={ratio}, 方向全部反转)"
-                )
-        else:  # ratio > 0
-            if excluded_original > 0:
-                self.print(f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, 缩放后: {total_scaled} 手 (ratio={ratio})")
-            else:
-                self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
-        return result
+            base_mode_msg = (
+                f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
+                f"对冲后未过滤={total_scaled_raw} 手"
+            )
+        else:
+            base_mode_msg = (
+                f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
+                f"缩放后未过滤={total_scaled_raw} 手 (ratio={ratio})"
+            )
+        self.print(base_mode_msg)
+        filter_applied = any(v > 0 for v in filtered_counts.values()) or exempt_non_main > 0
+        if filter_applied:
+            parts = []
+            if filtered_counts["deny"]:
+                parts.append(f"黑名单剔除 {filtered_counts['deny']} 个合约")
+            if filtered_counts["non_main"]:
+                parts.append(f"非主流通剔除 {filtered_counts['non_main']} 个合约")
+            if exempt_non_main:
+                parts.append(f"非主流通大单豁免 {exempt_non_main} 个合约")
+            if filtered_counts["min_qty"]:
+                parts.append(f"手数门槛剔除 {filtered_counts['min_qty']} 个合约")
+            if filtered_counts["min_notional"]:
+                parts.append(f"成交额门槛剔除 {filtered_counts['min_notional']} 个合约")
+            self.print(f"[反探单过滤] {'、'.join(parts)}；最终通过合约 {len(final_result)} 个，目标手数合计: {total_final}")
+        elif len(raw_result) != len(final_result) or total_scaled_raw != total_final:
+            self.print(
+                f"[反探单过滤] 无剔除；最终通过合约 {len(final_result)} 个，目标手数合计: {total_final}"
+            )
+        return final_result
 
     def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:
         result: Dict[Tuple[str, int], int] = {}

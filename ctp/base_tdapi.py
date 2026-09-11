@@ -82,7 +82,15 @@ class CTdSpiBase(tdapi.CThostFtdcTraderSpi):
 
     def __del__(self):
         # 释放实例
-        self._api.Release()
+        # 防御：构造函数中途抛异常时 super().__init__ 未执行，对象没有 _api 属性；
+        # 若直接 Release 会引发 AttributeError 并掩盖原始初始化报错，
+        # 因此先 hasattr + 非空判断 + try/except 保证清理过程不抛异常。
+        try:
+            if hasattr(self, '_api') and self._api is not None:
+                self._api.Release()
+        except Exception as e:
+            # 不使用 self.print（构造失败时 _print_lock 等也可能不存在），只用内置 print
+            print(f"CTdSpiBase.__del__ 释放_api失败: {e}")
 
     @staticmethod
     def _check_req(req, ret: int):

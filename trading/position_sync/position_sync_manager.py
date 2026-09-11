@@ -74,6 +74,14 @@ def run_position_sync(
     logger=None,
     position_ratio: float = 1.0,
     exclude_products=None,
+    allow_contract_level=None,
+    deny_products=None,
+    big_notional_exemption: float = 1_000_000,
+    min_qty_hand=None,
+    min_notional=None,
+    random_delay_enabled: bool = False,
+    random_delay_max_ms: int = 3000,
+    main_by_product_path: str = None,
 ) -> bool:
     """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
@@ -84,6 +92,10 @@ def run_position_sync(
         print(f"  position_ratio={position_ratio}")
         if exclude_products:
             print(f"  exclude_products={list(exclude_products)}")
+        if allow_contract_level:
+            print(f"  allow_contract_level={sorted(allow_contract_level)}")
+        if deny_products:
+            print(f"  deny_products={sorted(deny_products)}")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
@@ -91,6 +103,14 @@ def run_position_sync(
             env_name=env_name,
             position_ratio=position_ratio,
             exclude_products=exclude_products,
+            allow_contract_level=allow_contract_level,
+            deny_products=deny_products,
+            big_notional_exemption=big_notional_exemption,
+            min_qty_hand=min_qty_hand,
+            min_notional=min_notional,
+            random_delay_enabled=random_delay_enabled,
+            random_delay_max_ms=random_delay_max_ms,
+            main_by_product_path=main_by_product_path,
         )
         if logger:
             mgr.set_logger(logger)
@@ -126,6 +146,14 @@ def run_position_sync_loop(
     stop_event=None,
     position_ratio: float = 1.0,
     exclude_products=None,
+    allow_contract_level=None,
+    deny_products=None,
+    big_notional_exemption: float = 1_000_000,
+    min_qty_hand=None,
+    min_notional=None,
+    random_delay_enabled: bool = False,
+    random_delay_max_ms: int = 3000,
+    main_by_product_path: str = None,
     source_account: str = None,
     target_user_id: str = None,
     runtime_config_resolver=None,
@@ -136,24 +164,35 @@ def run_position_sync_loop(
     1. 登录 CTP，建立连接
     2. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
     3. 持续监控：发现 hold-std.json 更新时执行同步
-       3a. 在每次 tick（每 2 秒一次）前，先调用 runtime_config_resolver(source_account, target_user_id)
-           热加载最新的 ration/ratio/exclude 配置，并通过 mgr.apply_runtime_target_config 动态生效
+       3a. 在每次 tick 前，按 HOT_RELOAD_INTERVAL 秒调用 runtime_config_resolver(...)
+           热加载最新配置（ratio/exclude/allow_level/deny/min_qty/min_notional/random），
+           并通过 mgr.apply_runtime_target_config 动态生效
     4. 永不关闭连接：保持长连接直到收到 stop_event
 
     Args:
         hold_std_path: 标准持仓文件路径
-        main_contracts_path: 主力合约配置路径
+        main_contracts_path: 主力合约配置路径（旧格式 list，main_contracts.json）
+        main_by_product_path: 新格式 by_product 路径（main_contracts_by_product.json，含 main/main2/main3 + volume_multiple）
         trade_volume: 交易手数
         conf: CTP 配置
         env_name: 环境名称
         logger: 日志记录器
         stop_event: 停止事件（threading.Event），设为 None 则一直运行
-        position_ratio: 持仓同步比例（启动初始值，运行时可被 runtime_config_resolver 覆盖）
-        exclude_products: 启动时的初始排除品种列表（运行时可被覆盖）
-        source_account: 源账号（如 WQ1017、wangk0402、zhouzhou、wangxy0617），用于热加载配置时定位
-        target_user_id: 目标账号 user_id（如 yuqj0821、17883），用于热加载配置时定位
-        runtime_config_resolver: 可选，callable(source_account, target_user_id) -> (new_ratio|None, new_exclude|None)
-                                 返回 None 表示保持当前值不变。热加载出错时返回 (None, None) 即可。
+        position_ratio: 持仓同步比例（启动初始值，运行时可被热加载覆盖）
+        exclude_products: 初始排除品种（如 {"SC","FG"}，可被热加载覆盖）
+        allow_contract_level: 允许跟单的合约级别 {"main","main2"}，可被热加载覆盖
+        deny_products: 追加黑名单（叠加全局，可被热加载覆盖）
+        big_notional_exemption: 大单豁免阈值（元，非主流通合约>=该值仍放行）
+        min_qty_hand: 单合约最低手数阈值（低于跳过，防探单）
+        min_notional: 单合约最低成交额阈值（元，低于跳过，防探单）
+        random_delay_enabled: 下单前随机延迟开关
+        random_delay_max_ms: 随机延迟最大毫秒数
+        source_account: 源账号，用于热加载定位
+        target_user_id: 目标账号，用于热加载定位
+        runtime_config_resolver: callable(source, user) -> 9-tuple
+                                 (ratio, exclude, allow_level, deny, min_qty, min_notional,
+                                  rnd_enabled, rnd_max_ms, matched_target)
+                                 返回 None 表示保持当前值不变。
     Returns:
         bool: 是否正常结束
     """
@@ -171,11 +210,22 @@ def run_position_sync_loop(
         _log(f"[同步] 创建 PositionSyncManager...")
         _log(f"  hold_std_path={hold_std_path}")
         _log(f"  main_contracts_path={main_contracts_path}")
+        _log(f"  main_by_product_path={main_by_product_path}")
         _log(f"  position_ratio={position_ratio}")
+        _log(f"  big_notional_exemption={big_notional_exemption}")
         _log(f"  source_account={source_account}, target_user_id={target_user_id}")
         _log(f"  runtime_config_resolver={'enabled' if runtime_config_resolver else 'disabled'}")
         if exclude_products:
             _log(f"  exclude_products={list(exclude_products)}")
+        if allow_contract_level:
+            _log(f"  allow_contract_level={sorted(allow_contract_level)}")
+        if deny_products:
+            _log(f"  deny_products={sorted(deny_products)}")
+        if min_qty_hand:
+            _log(f"  min_qty_hand={min_qty_hand}")
+        if min_notional:
+            _log(f"  min_notional={min_notional}")
+        _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -184,6 +234,14 @@ def run_position_sync_loop(
             env_name=env_name,
             position_ratio=position_ratio,
             exclude_products=exclude_products,
+            allow_contract_level=allow_contract_level,
+            deny_products=deny_products,
+            big_notional_exemption=big_notional_exemption,
+            min_qty_hand=min_qty_hand,
+            min_notional=min_notional,
+            random_delay_enabled=random_delay_enabled,
+            random_delay_max_ms=random_delay_max_ms,
+            main_by_product_path=main_by_product_path,
         )
         if logger:
             mgr.set_logger(logger)
@@ -221,13 +279,22 @@ def run_position_sync_loop(
                     _last_reload_ts = _now
                     try:
                         _rr = runtime_config_resolver(source_account, target_user_id)
-                        # 解析函数返回 tuple (new_ratio, new_exclude)，任一可以为 None 表示保持旧值
-                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 2:
-                            new_ratio, new_exclude = _rr[0], _rr[1]
+                        # 解析函数返回 9-tuple (ratio, exclude, allow_level, deny,
+                        #                      min_qty, min_notional, rnd_enabled, rnd_max_ms, matched)
+                        # 任一值为 None 表示保持当前值不变
+                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 9:
+                            (new_ratio, new_exclude, new_allow_level, new_deny,
+                             new_min_qty, new_min_not, new_rnd_en, new_rnd_ms, _matched) = _rr
                             try:
                                 mgr.apply_runtime_target_config(
                                     position_ratio=new_ratio,
                                     exclude_products=new_exclude,
+                                    allow_contract_level=new_allow_level,
+                                    deny_products=new_deny,
+                                    min_qty_hand=new_min_qty,
+                                    min_notional=new_min_not,
+                                    random_delay_enabled=new_rnd_en,
+                                    random_delay_max_ms=new_rnd_ms,
                                 )
                             except Exception as _ae:
                                 _log(f"[热更新] 应用配置异常: {_ae}")
@@ -247,8 +314,8 @@ def run_position_sync_loop(
                     _log(f"[同步] 检测到 hold-std.json 更新，执行同步...")
                     last_hold_std_mtime = current_mtime
                     try:
-                        # 注意：sync_and_trade 内部的 _parse_hold_std() 会读取 self._position_ratio（最新热加载后的值），
-                        # 所以这里不需要传 position_ratio 参数即可。
+                        # 注意：sync_and_trade 内部的 _parse_hold_std() 会读取 self 上最新热加载后的值，
+                        # 所以这里不需要传 position_ratio 参数。
                         mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=None)
                     except Exception as e:
                         _log(f"[同步] 同步执行异常: {e}")

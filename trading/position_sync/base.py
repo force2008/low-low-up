@@ -50,9 +50,18 @@ class PositionSyncManagerBase(CTdSpiBase):
         env_name: str = None,
         position_ratio: float = 1.0,
         exclude_products=None,
+        allow_contract_level=None,
+        deny_products=None,
+        big_notional_exemption: float = 1_000_000,
+        min_qty_hand=None,
+        min_notional=None,
+        random_delay_enabled: bool = False,
+        random_delay_max_ms: int = 3000,
+        main_by_product_path: str = None,
     ):
-        if position_ratio <= 0:
-            raise ValueError(f"position_ratio 必须大于 0，当前值: {position_ratio}")
+        # ratio/ration 支持：正数跟单 / 0 清仓 / 负数对冲（任意实数合法，仅 NaN/inf 才报错）
+        if position_ratio != position_ratio or position_ratio in (float("inf"), float("-inf")):
+            raise ValueError(f"position_ratio 必须是有限实数，当前值: {position_ratio}")
         self._position_ratio = float(position_ratio)
 
         # 排除品种集合（全大写）：合约代码以前缀命中就不再参与目标持仓/实际持仓比对
@@ -61,11 +70,77 @@ class PositionSyncManagerBase(CTdSpiBase):
         #       也不把 CTP 端已有的这些老持仓当"超额"触发强制平仓（用户自己手动管理）。
         def _norm(x):
             return str(x).strip().upper() if x is not None and str(x).strip() else None
+
         self._exclude_products: set = set()
         if exclude_products:
             normalized = [_norm(x) for x in exclude_products if _norm(x)]
             if normalized:
                 self._exclude_products = set(normalized)
+
+        # ---- 新增：反探单配置 ----
+        # 1) allow_contract_level：只跟单的合约级别（main/main2/main3），默认 {"main","main2"}
+        if allow_contract_level:
+            pieces = {str(x).strip().lower() for x in allow_contract_level if str(x).strip()}
+            valid = pieces & {"main", "main2", "main3", "main4"}
+            self._allow_contract_level = valid if valid else {"main", "main2"}
+        else:
+            self._allow_contract_level = {"main", "main2"}
+
+        # 2) deny_products：追加冷门品种黑名单（叠加默认全局 WR/FB/BB… 已由调用方合并后传入）
+        self._deny_products: set = set()
+        if deny_products:
+            self._deny_products = {_norm(x) for x in deny_products if _norm(x)}
+
+        # 3) big_notional_exemption：大单豁免（非主流通合约但成交额 >= 阈值仍放行）
+        try:
+            self._big_notional_exemption: float = float(big_notional_exemption)
+        except (TypeError, ValueError):
+            self._big_notional_exemption = 1_000_000.0
+        if self._big_notional_exemption < 0:
+            self._big_notional_exemption = 0.0
+
+        # 4) min_qty_hand：单合约最低手数
+        if min_qty_hand is None:
+            self._min_qty_hand = None
+        else:
+            try:
+                v = int(min_qty_hand)
+                self._min_qty_hand = v if v > 0 else None
+            except (TypeError, ValueError):
+                self._min_qty_hand = None
+
+        # 5) min_notional：单合约最低成交额阈值（元）
+        if min_notional is None:
+            self._min_notional = None
+        else:
+            try:
+                v = float(min_notional)
+                self._min_notional = v if v > 0 else None
+            except (TypeError, ValueError):
+                self._min_notional = None
+
+        # 6) 下单前随机延迟开关
+        self._random_delay_enabled = bool(random_delay_enabled)
+        try:
+            self._random_delay_max_ms: int = int(random_delay_max_ms)
+        except (TypeError, ValueError):
+            self._random_delay_max_ms = 3000
+        if self._random_delay_max_ms < 0:
+            self._random_delay_max_ms = 0
+
+        # 7) main_contracts_by_product.json 路径（含 main/main2/main3 与 volume_multiple/price_tick）
+        if main_by_product_path:
+            self._main_by_product_path = str(main_by_product_path)
+        else:
+            self._main_by_product_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data", "contracts", "main_contracts_by_product.json",
+            )
+        # 主连文件懒加载缓存：首次 _parse_hold_std 调 _load_main_by_product() 时读取
+        self._main_by_product_loaded: bool = False
+        self._main_by_product: dict = {}             # {ProductID: {main,main2,main3,volume_multiple,price_tick,...}}
+        self._allowed_contracts_set: set = set()      # 具体合约代码集合（允许的主/次主/次次主）
+        self._product_volume_multiple: dict = {}      # {ProductID: volume_multiple}
 
         self.hold_std_path = hold_std_path
         self.main_contracts_path = main_contracts_path
@@ -170,6 +245,16 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.print(f"[配置] 持仓同步比例: {self._position_ratio}")
         if self._exclude_products:
             self.print(f"[配置] 排除品种（不跟单/不比对）: {sorted(self._exclude_products)}")
+        if self._allow_contract_level:
+            self.print(f"[配置] 允许跟单合约级别: {sorted(self._allow_contract_level)}")
+        if self._deny_products:
+            self.print(f"[配置] 黑名单品种（全局拒绝）: {sorted(self._deny_products)}")
+        self.print(f"[配置] 大单豁免阈值: {self._big_notional_exemption:,.0f} 元")
+        if self._min_qty_hand:
+            self.print(f"[配置] 单合约最低手数: {self._min_qty_hand} 手（低于则跳过）")
+        if self._min_notional:
+            self.print(f"[配置] 单合约最低成交额: {self._min_notional:,.0f} 元（低于则跳过）")
+        self.print(f"[配置] 下单随机延迟: {self._random_delay_enabled}（最大 {self._random_delay_max_ms} ms）")
 
         # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
         # 注意：必须在 super().__init__ 之后调用，因为后者会阻塞直到登录成功
@@ -200,32 +285,48 @@ class PositionSyncManagerBase(CTdSpiBase):
     # ------------------------------------------------------------------
     # 运行时热更新 target 配置（account_targets.py 修改后动态生效）
     # ------------------------------------------------------------------
-    def apply_runtime_target_config(self, position_ratio=None, exclude_products=None) -> dict:
-        """运行时动态刷新 target 配置（ratio/ration 与 exclude）。
+    def apply_runtime_target_config(
+        self,
+        position_ratio=None,
+        exclude_products=None,
+        allow_contract_level=None,
+        deny_products=None,
+        min_qty_hand=None,
+        min_notional=None,
+        random_delay_enabled=None,
+        random_delay_max_ms=None,
+    ) -> dict:
+        """运行时动态刷新 target 配置。
 
         用于热加载：account_targets.py 被修改并 reload 后，
-        上层（run_position_sync_loop 每轮 tick）用这个方法把最新值推给已创建的 manager。
-        CTP 连接不会重建，仅更新 _position_ratio 和 _exclude_products 两个属性。
+        上层循环（每 10 秒 tick）用这个方法把最新值推给已创建的 manager。
+        CTP 连接不会重建，仅更新实例属性。
 
-        Args:
-            position_ratio: 可选，传入则覆盖；None 表示保持不变。
-                            支持正数（跟单比例）、0（清仓）、负数（对冲倍数）。
-            exclude_products: 可选，list/set/None；None 表示保持不变；
-                              []（空 list）可显式表示「清空排除列表」。
-
-        Returns:
-            dict: {'changed': bool,
-                   'ratio':   (new_ratio, old_ratio, status),
-                   'exclude': (new_exclude_sorted, old_exclude_sorted, status)}
-                   status ∈ {changed, unchanged, kept}
+        参数：传 None 表示保持当前值不变；显式传 0/空 list/bool 会被当成合法值覆盖。
         """
         import time as _t
+        def _norm(x):
+            return str(x).strip().upper() if x is not None and str(x).strip() else None
+
         old_ratio = float(self._position_ratio)
         old_exclude = set(self._exclude_products or set())
+        old_allow = set(self._allow_contract_level or set())
+        old_deny = set(self._deny_products or set())
+        old_min_qty = self._min_qty_hand
+        old_min_not = self._min_notional
+        old_rnd_en = bool(self._random_delay_enabled)
+        old_rnd_ms = int(self._random_delay_max_ms)
+
         ratio_status = 'kept'
         exclude_status = 'kept'
+        allow_status = 'kept'
+        deny_status = 'kept'
+        min_qty_status = 'kept'
+        min_not_status = 'kept'
+        rnd_en_status = 'kept'
+        rnd_ms_status = 'kept'
 
-        # ratio 更新（允许任何实数：正数/0/负数）
+        # -------- 1. ratio --------
         if position_ratio is not None:
             try:
                 r = float(position_ratio)
@@ -239,10 +340,8 @@ class PositionSyncManagerBase(CTdSpiBase):
                     else:
                         ratio_status = 'unchanged'
 
-        # exclude 更新：None 不动，空 list/空 set 可清空
+        # -------- 2. exclude --------
         if exclude_products is not None:
-            def _norm(x):
-                return str(x).strip().upper() if x is not None and str(x).strip() else None
             normalized = []
             try:
                 iterable = list(exclude_products)
@@ -252,24 +351,142 @@ class PositionSyncManagerBase(CTdSpiBase):
                 s = _norm(x)
                 if s:
                     normalized.append(s)
-            new_exclude_set = set(normalized)
-            if new_exclude_set == old_exclude:
+            new_set = set(normalized)
+            if new_set == old_exclude:
                 exclude_status = 'unchanged'
             else:
-                self._exclude_products = new_exclude_set
+                self._exclude_products = new_set
                 exclude_status = 'changed'
 
-        changed = (ratio_status == 'changed') or (exclude_status == 'changed')
+        # -------- 3. allow_contract_level --------
+        if allow_contract_level is not None:
+            try:
+                pieces = {str(x).strip().lower() for x in list(allow_contract_level) if str(x).strip()}
+                valid = pieces & {"main", "main2", "main3", "main4"}
+                if not valid:
+                    valid = {"main", "main2"}
+            except Exception:
+                self.print(f"[热更新] 忽略非法 allow_contract_level={allow_contract_level!r}，保持 {sorted(old_allow)}")
+                valid = None
+            if valid is not None:
+                if valid == old_allow:
+                    allow_status = 'unchanged'
+                else:
+                    self._allow_contract_level = valid
+                    # 主连缓存标记需要重算（allow_level 变了 -> 具体允许合约集合变了）
+                    self._main_by_product_loaded = False
+                    allow_status = 'changed'
+
+        # -------- 4. deny_products --------
+        if deny_products is not None:
+            try:
+                pieces = {_norm(x) for x in list(deny_products) if _norm(x)}
+            except Exception:
+                pieces = None
+                self.print(f"[热更新] 忽略非法 deny_products={deny_products!r}，保持 {sorted(old_deny)}")
+            if pieces is not None:
+                if pieces == old_deny:
+                    deny_status = 'unchanged'
+                else:
+                    self._deny_products = pieces
+                    deny_status = 'changed'
+
+        # -------- 5. min_qty_hand --------
+        if min_qty_hand is not None:
+            try:
+                v = int(min_qty_hand)
+                v2 = v if v > 0 else None
+            except (TypeError, ValueError):
+                v2 = None
+                self.print(f"[热更新] 忽略非法 min_qty_hand={min_qty_hand!r}，保持 {old_min_qty}")
+            if v2 == old_min_qty:
+                min_qty_status = 'unchanged'
+            else:
+                self._min_qty_hand = v2
+                min_qty_status = 'changed'
+
+        # -------- 6. min_notional --------
+        if min_notional is not None:
+            try:
+                v = float(min_notional)
+                v2 = v if v > 0 else None
+            except (TypeError, ValueError):
+                v2 = None
+                self.print(f"[热更新] 忽略非法 min_notional={min_notional!r}，保持 {old_min_not}")
+            if (v2 is None and old_min_not is None) or (v2 is not None and old_min_not is not None and abs(v2 - old_min_not) < 1e-9):
+                min_not_status = 'unchanged'
+            else:
+                self._min_notional = v2
+                min_not_status = 'changed'
+
+        # -------- 7. random_delay_enabled --------
+        if random_delay_enabled is not None:
+            if isinstance(random_delay_enabled, bool):
+                v = random_delay_enabled
+            elif isinstance(random_delay_enabled, (int, float)):
+                v = bool(random_delay_enabled)
+            elif isinstance(random_delay_enabled, str):
+                s = random_delay_enabled.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    v = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    v = False
+                else:
+                    v = old_rnd_en
+            else:
+                v = old_rnd_en
+            if v == old_rnd_en:
+                rnd_en_status = 'unchanged'
+            else:
+                self._random_delay_enabled = v
+                rnd_en_status = 'changed'
+
+        # -------- 8. random_delay_max_ms --------
+        if random_delay_max_ms is not None:
+            try:
+                v = int(random_delay_max_ms)
+                if v < 0:
+                    v = 0
+            except (TypeError, ValueError):
+                v = old_rnd_ms
+                self.print(f"[热更新] 忽略非法 random_delay_max_ms={random_delay_max_ms!r}，保持 {old_rnd_ms}")
+            if v == old_rnd_ms:
+                rnd_ms_status = 'unchanged'
+            else:
+                self._random_delay_max_ms = v
+                rnd_ms_status = 'changed'
+
+        changed_lst = [s for s in (
+            ratio_status, exclude_status, allow_status, deny_status,
+            min_qty_status, min_not_status, rnd_en_status, rnd_ms_status,
+        ) if s == 'changed']
+        changed = len(changed_lst) > 0
         if changed:
+            lines = [
+                f"ratio {old_ratio}->{self._position_ratio} ({ratio_status})",
+                f"exclude {sorted(old_exclude)}->{sorted(self._exclude_products)} ({exclude_status})",
+                f"allow {sorted(old_allow)}->{sorted(self._allow_contract_level)} ({allow_status})",
+                f"deny {sorted(old_deny)}->{sorted(self._deny_products)} ({deny_status})",
+                f"min_qty {old_min_qty}->{self._min_qty_hand} ({min_qty_status})",
+                f"min_not {old_min_not}->{self._min_notional} ({min_not_status})",
+                f"rnd_en {old_rnd_en}->{self._random_delay_enabled} ({rnd_en_status})",
+                f"rnd_ms {old_rnd_ms}->{self._random_delay_max_ms} ({rnd_ms_status})",
+            ]
+            changed_lines = [ln for ln in lines if '(changed)' in ln]
             self.print(
-                f"[热更新] ratio: {old_ratio} -> {self._position_ratio} ({ratio_status}); "
-                f"exclude: {sorted(old_exclude) or []} -> {sorted(self._exclude_products) or []} ({exclude_status}) "
-                f"[ts {_t.strftime('%H:%M:%S')}]"
+                f"[热更新] " + "; ".join(changed_lines) +
+                f" [ts {_t.strftime('%H:%M:%S')}]"
             )
         return {
             'changed': changed,
-            'ratio':   (self._position_ratio, old_ratio, ratio_status),
+            'ratio': (self._position_ratio, old_ratio, ratio_status),
             'exclude': (sorted(self._exclude_products or []), sorted(old_exclude or []), exclude_status),
+            'allow': (sorted(self._allow_contract_level or []), sorted(old_allow or []), allow_status),
+            'deny': (sorted(self._deny_products or []), sorted(old_deny or []), deny_status),
+            'min_qty': (self._min_qty_hand, old_min_qty, min_qty_status),
+            'min_not': (self._min_notional, old_min_not, min_not_status),
+            'rnd_en': (self._random_delay_enabled, old_rnd_en, rnd_en_status),
+            'rnd_ms': (self._random_delay_max_ms, old_rnd_ms, rnd_ms_status),
         }
 
     def _notify_async(self, text: str):

@@ -33,6 +33,28 @@ class PositionSyncManagerOrderOps:
             self._order_ref_seq += 1
             return f"PSM{self._order_ref_seq:09d}"
 
+    def _maybe_random_delay_before_submit(
+        self, exact_id: str, direction: str, volume: int
+    ) -> float:
+        """下单前可选随机延迟（摧毁时序指纹）。返回实际 sleep 秒数（0=未延迟）。"""
+        delay_s = 0.0
+        if getattr(self, '_random_delay_enabled', False):
+            max_ms = 0
+            try:
+                max_ms = int(getattr(self, '_random_delay_max_ms', 0))
+            except (TypeError, ValueError):
+                max_ms = 0
+            if max_ms > 0:
+                import random as _rnd
+                delay_s = _rnd.uniform(0, max_ms) / 1000.0
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                    self.print(
+                        f"[随机延迟] {exact_id} {direction} {volume}手，"
+                        f"sleep {delay_s:.3f}s (最大 {max_ms}ms)"
+                    )
+        return delay_s
+
     def place_limit_order(
         self,
         exchange_id: str,
@@ -86,6 +108,7 @@ class PositionSyncManagerOrderOps:
                 "replace_count": 0,
             }
 
+        delay_s = self._maybe_random_delay_before_submit(exact_id, direction, volume)
         ret = self._api.ReqOrderInsert(req, 0)
         if ret != 0:
             self.print(f"[错误] {exact_id} 报单发送失败，返回值={ret}")
@@ -97,9 +120,10 @@ class PositionSyncManagerOrderOps:
             )
             return None
 
+        delay_tag = f" 延迟={delay_s:.3f}s" if delay_s > 0 else ""
         self.print(
             f"[报单] {exact_id} {direction} {volume}手 "
-            f"限价={limit_price} OrderRef={order_ref}"
+            f"限价={limit_price} OrderRef={order_ref}{delay_tag}"
         )
         self._notify_async(
             f"📤 报单已提交\n合约：{exact_id}\n方向：{direction}\n"
@@ -161,6 +185,7 @@ class PositionSyncManagerOrderOps:
                 "pending_rejection": False,  # 标记是否收到拒绝（由回调设置）
             }
 
+        delay_s = self._maybe_random_delay_before_submit(exact_id, direction, volume)
         ret = self._api.ReqOrderInsert(req, 0)
         if ret != 0:
             self.print(f"[错误] {exact_id} 报单发送失败，返回值={ret}")
@@ -173,9 +198,10 @@ class PositionSyncManagerOrderOps:
             )
             return False
 
+        delay_tag = f" 延迟={delay_s:.3f}s" if delay_s > 0 else ""
         self.print(
             f"[报单] {exact_id} {direction} {volume}手 "
-            f"限价={limit_price} OrderRef={order_ref}"
+            f"限价={limit_price} OrderRef={order_ref}{delay_tag}"
         )
 
         # 等待报单确认（最多 3 秒），如果收到拒绝则返回 False

@@ -524,6 +524,31 @@ def build_target_conf(target: dict) -> dict:
     return conf
 
 
+# ==================== 反跟单侦察防护：全局/账号级配置 ====================
+# ① 全局冷门品种黑名单（任何账号都不跟，强剔除，不参与开/平仓）
+#    这些品种全市场常年持仓量/成交量极低，是"下探单查跟单"的天然陷阱。
+GLOBAL_DENY_PRODUCTS = {"WR", "FB", "BB", "RR", "RS", "WH", "PM", "RI","ZC","JR"}
+
+# ② 全局允许的合约级别（取 main_contracts_by_product.json 中对应 key）
+#    默认只跟主力 main + 次主力 main2；如需宽松可加 "main3"。
+#    任何非 main/main2 的合约（远月/冷门月）都视为非主流通合约，
+#    不满足大单豁免时直接剔除，避免在远月小流通池里下探单直接暴露跟单身份。
+GLOBAL_ALLOW_CONTRACT_LEVEL = {"main", "main2","main3"}
+
+# ③ 大单豁免阈值（元）：即使是非主流通合约，单合约目标成交额 >= 该值也放行。
+#    用于防误杀：换月前大资金提前移仓到次次主、或者策略专门做跨期套利时的真实大额交易。
+#    计算公式：notional = qty_hand × Price(昨收/最新价) × VolumeMultiple（合约乘数）
+BIG_NOTIONAL_EXEMPTION = 1_000_000  # 100 万
+
+# ④ 下单前随机延迟（摧毁"时序指纹"，防止源方用 hold-std 更新后 X 秒必下单的统计相关性锁定跟单）
+#    默认关闭（避免今日第一次上线引入新变量），生产确认没问题可打开 True。
+#    启用后：每笔开仓/平仓委托 submit 前，随机 sleep 0 ~ RANDOM_ORDER_DELAY_MAX_MS 毫秒。
+RANDOM_ORDER_DELAY_ENABLED = False
+RANDOM_ORDER_DELAY_MAX_MS = 3000  # 3 秒内均匀随机
+
+# ================================================================
+
+
 def _get_target_ratio(target: dict) -> float:
     """获取目标账户的持仓同步比例/模式（ration / ratio 都行）。
 
@@ -602,6 +627,151 @@ def _get_target_exclude(target: dict) -> list:
         return []
 
 
+def _get_target_allow_contract_level(target: dict) -> set:
+    """获取目标账户的「允许跟单的合约级别」(set of str)。
+
+    支持字段：allow_contract_level / allow_level / contract_level。
+    值可以是 list（如 ["main","main2"]）或逗号分隔字符串（如 "main,main2"）。
+    未配置时回退到全局 GLOBAL_ALLOW_CONTRACT_LEVEL = {"main","main2"}。
+    合法取值：main（主力）/ main2（次主力）/ main3（次次主）。
+    """
+    raw = None
+    for key in ("allow_contract_level", "allow_level", "contract_level"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    if raw is None:
+        return set(GLOBAL_ALLOW_CONTRACT_LEVEL)
+    valid_keys = {"main", "main2", "main3", "main4"}
+    try:
+        if isinstance(raw, str):
+            pieces = [p.strip() for p in raw.replace(',', ' ').replace(';', ' ').split() if p.strip()]
+        else:
+            pieces = [str(p).strip() for p in list(raw) if str(p).strip()]
+        result = {p for p in pieces if p in valid_keys}
+        if not result:
+            logger.warning(
+                "[allow_level] 目标账户 %s 的 allow_contract_level=%s 无合法取值（合法:%s），"
+                "回退默认全局 %s",
+                target.get("user_id", "unknown"), raw, sorted(valid_keys),
+                sorted(GLOBAL_ALLOW_CONTRACT_LEVEL),
+            )
+            return set(GLOBAL_ALLOW_CONTRACT_LEVEL)
+        return result
+    except Exception as e:
+        logger.warning(
+            "[allow_level] 目标账户 %s allow_contract_level 解析失败: %s（原始=%s），回退全局 %s",
+            target.get("user_id", "unknown"), e, raw, sorted(GLOBAL_ALLOW_CONTRACT_LEVEL),
+        )
+        return set(GLOBAL_ALLOW_CONTRACT_LEVEL)
+
+
+def _get_target_deny_products(target: dict) -> set:
+    """获取目标账户级的追加冷门品种黑名单（叠加到全局 GLOBAL_DENY_PRODUCTS 上，返回合并 set，全大写）。
+
+    支持字段：deny_products / deny。
+    """
+    raw = None
+    for key in ("deny_products", "deny"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    result = set(GLOBAL_DENY_PRODUCTS)
+    if raw is None:
+        return result
+    try:
+        if isinstance(raw, str):
+            pieces = [p.strip().upper() for p in raw.replace(',', ' ').replace(';', ' ').split() if p.strip()]
+        else:
+            pieces = [str(p).strip().upper() for p in list(raw) if str(p).strip()]
+        result.update(pieces)
+    except Exception as e:
+        logger.warning(
+            "[deny] 目标账户 %s deny_products 解析失败: %s（原始=%s），仅保留全局黑名单 %s",
+            target.get("user_id", "unknown"), e, raw, sorted(GLOBAL_DENY_PRODUCTS),
+        )
+    return result
+
+
+def _get_target_min_qty_hand(target: dict) -> Optional[int]:
+    """单合约最低手数阈值（低于该手数的小单视为探单，直接跳过）。未配置返回 None 表示不启用。
+
+    支持字段：min_qty_hand / min_qty_hand / min_hand / min_qty。
+    """
+    for key in ("min_qty_hand", "min_hand", "min_qty"):
+        if key in target and target[key] is not None:
+            try:
+                v = int(target[key])
+                if v <= 0:
+                    return None
+                return v
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[min_qty] 目标账户 %s 的 %s=%s 不是正整数，忽略",
+                    target.get("user_id", "unknown"), key, target[key],
+                )
+    return None
+
+
+def _get_target_min_notional(target: dict) -> Optional[float]:
+    """单合约最低成交额阈值（元，低于该值的小单视为探单跳过）。未配置返回 None 表示不启用。
+
+    支持字段：min_notional / min_amount / min_value。
+    """
+    for key in ("min_notional", "min_amount", "min_value"):
+        if key in target and target[key] is not None:
+            try:
+                v = float(target[key])
+                if v <= 0:
+                    return None
+                return v
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[min_notional] 目标账户 %s 的 %s=%s 不是正数，忽略",
+                    target.get("user_id", "unknown"), key, target[key],
+                )
+    return None
+
+
+def _get_random_delay_config(target: dict) -> Tuple[bool, int]:
+    """下单前随机延迟配置 -> (enabled:bool, max_ms:int)。
+
+    目标账户配置优先（字段：random_delay / enable_random_delay / random_delay_ms）；
+    目标账户未配置时回退到全局 RANDOM_ORDER_DELAY_ENABLED / RANDOM_ORDER_DELAY_MAX_MS。
+    """
+    enabled = RANDOM_ORDER_DELAY_ENABLED
+    max_ms = RANDOM_ORDER_DELAY_MAX_MS
+    # 字段1：显式启用/禁用
+    for key in ("random_delay", "enable_random_delay"):
+        if key in target and target[key] is not None:
+            v = target[key]
+            if isinstance(v, bool):
+                enabled = v
+            elif isinstance(v, (int, float)):
+                enabled = bool(v)
+            elif isinstance(v, str):
+                s = v.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    enabled = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    enabled = False
+            break
+    # 字段2：最大毫秒数
+    for key in ("random_delay_ms", "random_delay_max_ms", "delay_max_ms"):
+        if key in target and target[key] is not None:
+            try:
+                v = int(target[key])
+                if v >= 0:
+                    max_ms = v
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[delay] 目标账户 %s 的 %s=%s 不是非负整数，使用默认 %s ms",
+                    target.get("user_id", "unknown"), key, target[key], max_ms,
+                )
+            break
+    return enabled, max_ms
+
+
 # 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
 _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
@@ -644,15 +814,17 @@ def _reload_account_targets_module():
 def _resolve_latest_target_config(source_account: str, user_id: str):
     """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
 
-    返回 tuple: (latest_ratio:float, latest_exclude:list, matched_target:dict|None)
-    找不到匹配的条目时 -> 返回 (None, None, None)，调用方可以用这个值判断是否要继续沿用旧值。
+    返回 9-tuple:
+      (ratio, exclude, allow_level, deny_products, min_qty_hand, min_notional,
+       random_enabled, random_max_ms, matched_target)
+    找不到匹配条目时 -> 返回全 None，调用方沿用旧值。
     """
     targets_cfg = _reload_account_targets_module()
     if not targets_cfg or not source_account or not user_id:
-        return None, None, None
+        return None, None, None, None, None, None, None, None, None
     target_list = targets_cfg.get(source_account) or []
     if not isinstance(target_list, (list, tuple)):
-        return None, None, None
+        return None, None, None, None, None, None, None, None, None
     matched = None
     for t in target_list:
         if not isinstance(t, dict):
@@ -661,8 +833,15 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
             matched = t
             break
     if matched is None:
-        return None, None, None
-    return _get_target_ratio(matched), _get_target_exclude(matched), matched
+        return None, None, None, None, None, None, None, None, None
+    ratio = _get_target_ratio(matched)
+    exclude = _get_target_exclude(matched)
+    allow_level = _get_target_allow_contract_level(matched)
+    deny = _get_target_deny_products(matched)
+    min_qty = _get_target_min_qty_hand(matched)
+    min_not = _get_target_min_notional(matched)
+    rnd_enabled, rnd_max_ms = _get_random_delay_config(matched)
+    return ratio, exclude, allow_level, deny, min_qty, min_not, rnd_enabled, rnd_max_ms, matched
 
 
 # ==================== 线程间通信 ====================
@@ -1100,9 +1279,20 @@ def main():
                 conf = build_target_conf(target)
                 ratio = _get_target_ratio(target)
                 exclude = _get_target_exclude(target)
+                allow_level = _get_target_allow_contract_level(target)
+                deny_products = _get_target_deny_products(target)
+                min_qty_hand = _get_target_min_qty_hand(target)
+                min_notional = _get_target_min_notional(target)
+                rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
-                logger.info("[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s)",
-                            source_account, user_id, ratio, exclude or '[]')
+                logger.info(
+                    "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
+                    "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
+                    "random_delay=%s@%sms)",
+                    source_account, user_id, ratio, exclude or '[]',
+                    sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
+                    rnd_enabled, rnd_max_ms,
+                )
             else:
                 # 回退到默认单账户模式
                 user_id = "default"
@@ -1110,6 +1300,11 @@ def main():
                 conf = None
                 ratio = POSITION_RATIO
                 exclude = []
+                allow_level = set(GLOBAL_ALLOW_CONTRACT_LEVEL)
+                deny_products = set(GLOBAL_DENY_PRODUCTS)
+                min_qty_hand = None
+                min_notional = None
+                rnd_enabled, rnd_max_ms = RANDOM_ORDER_DELAY_ENABLED, RANDOM_ORDER_DELAY_MAX_MS
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
@@ -1126,9 +1321,19 @@ def main():
                 stop_event=shutdown_event,
                 position_ratio=ratio,
                 exclude_products=exclude,
+                allow_contract_level=allow_level,
+                deny_products=deny_products,
+                big_notional_exemption=BIG_NOTIONAL_EXEMPTION,
+                min_qty_hand=min_qty_hand,
+                min_notional=min_notional,
+                random_delay_enabled=rnd_enabled,
+                random_delay_max_ms=rnd_max_ms,
+                main_by_product_path=os.path.join(
+                    PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
+                ),
                 source_account=source_account,
                 target_user_id=user_id,
-                # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude)
+                # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude, ...)
                 runtime_config_resolver=_resolve_latest_target_config,
             )
         except Exception as e:
