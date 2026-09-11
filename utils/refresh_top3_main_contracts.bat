@@ -8,7 +8,7 @@ REM ================================================================
 setlocal
 
 REM 1) 强制切盘 + 切工作目录（计划任务默认在 system32 下，必须 cd /d）
-cd /d E:\projects-02\low-low-up
+cd /d D:\projects\low-low-up
 
 REM 2) 激活 conda 环境 python310（call 等它完成，不新开子shell）
 call conda activate python310
