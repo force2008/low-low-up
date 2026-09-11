@@ -303,10 +303,34 @@ class PositionSyncManagerData:
         return 0
 
     def _parse_hold_std(self) -> Dict[Tuple[str, int], int]:
+        """目标持仓构造器，支持 ratio/ration 的三种模式：
+
+        (A) ratio > 0  → 正常跟单：hold-std 方向不变，手数 = round(原始手数 × ratio)，单合约最小 1 手（若原始>0）。
+        (B) ratio == 0 → 清仓模式：目标持仓强制返回空 dict，相当于所有品种目标为 0；
+                         后续比对会判定为"实际持仓超额"，走 _submit_excess_orders 平仓分支，
+                         平仓价格按 sync.py 既定逻辑：多平挂卖一(BidPrice1)、空平挂买一(AskPrice1)。
+        (C) ratio < 0  → 对冲模式：以 hold-std 里的 source_account 原始持仓为基准，方向反转后再乘 abs(ratio)。
+                         例：source wangk0402 持 FG 多 1 手，ratio=-1 → target 持 FG 空 1 手；ratio=-2 → 空 2 手。
+                         等价于"跟单账户作为 signal_account 的对手方"。
+        三种模式下 exclude 品种过滤、非标准化跳过、volume<=0 跳过等通用逻辑始终生效。
+        """
         result: Dict[Tuple[str, int], int] = {}
         ratio = getattr(self, '_position_ratio', 1.0)
         total_original = 0
         excluded_original = 0
+        hedged_total = 0  # ratio<0 时的对冲后总手数（按 abs(ratio) 计算）
+
+        # ==========================================
+        # [模式 B] ratio == 0：清仓
+        # ==========================================
+        if ratio == 0:
+            self.print("[模式-清仓] ration=0，目标持仓全部置 0（将以限价挂卖一/买一平掉所有实际持仓）")
+            return result
+
+        abs_ratio = abs(ratio)
+        # ==========================================
+        # 通用：逐行遍历 hold-std
+        # ==========================================
         for i, row in enumerate(self._hold_std):
             raw_contract = self._extract_contract(row)
             contract = self._standardize_contract(raw_contract)
@@ -324,20 +348,48 @@ class PositionSyncManagerData:
                 self.print(f"[exclude] 目标持仓跳过（{contract} 命中排除品种）: {direction_str} {volume}手")
                 continue
             if direction_str in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
-                direction = 2
+                src_direction = 2
             elif direction_str in ("卖", "空头", "空", "Sell", "SELL", "sell", "S"):
-                direction = 3
+                src_direction = 3
             else:
                 self.print(f"[调试-hold] 第{i}条 {contract} 方向无法解析 '{direction_str}'")
                 continue
             total_original += volume
-            scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
-            result[(contract, direction)] = result.get((contract, direction), 0) + scaled_volume
+
+            # ==========================================
+            # [模式 A] ratio > 0：正常跟单（方向不变）
+            # [模式 C] ratio < 0：对冲（方向反转：买↔卖，2↔3）
+            # ==========================================
+            if ratio > 0:
+                direction = src_direction
+                scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
+            else:  # ratio < 0 对冲
+                direction = 3 if src_direction == 2 else 2
+                hedged_after = int(round(volume * abs_ratio)) if volume > 0 else 0
+                # 对冲模式下若原合约占 1 手、乘 2 倍 = 2 手，不强制 +1 到 1（已由 round 保证 ≥ 1 当 volume>0）
+                scaled_volume = hedged_after
+                hedged_total += hedged_after
+
+            if scaled_volume > 0:
+                result[(contract, direction)] = result.get((contract, direction), 0) + scaled_volume
+
         total_scaled = sum(result.values())
-        if excluded_original > 0:
-            self.print(f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, 缩放后: {total_scaled} 手 (ratio={ratio})")
-        else:
-            self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
+        if ratio < 0:
+            if excluded_original > 0:
+                self.print(
+                    f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
+                    f"对冲后目标: {total_scaled} 手 (ratio={ratio}, 方向全部反转)"
+                )
+            else:
+                self.print(
+                    f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手, "
+                    f"对冲后目标: {total_scaled} 手 (ratio={ratio}, 方向全部反转)"
+                )
+        else:  # ratio > 0
+            if excluded_original > 0:
+                self.print(f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, 缩放后: {total_scaled} 手 (ratio={ratio})")
+            else:
+                self.print(f"[比例] 原始目标持仓: {total_original} 手, 缩放后: {total_scaled} 手 (ratio={ratio})")
         return result
 
     def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:

@@ -197,6 +197,81 @@ class PositionSyncManagerBase(CTdSpiBase):
         else:
             self.print("[行情] 配置中无行情前置地址，跳过行情API提供者")
 
+    # ------------------------------------------------------------------
+    # 运行时热更新 target 配置（account_targets.py 修改后动态生效）
+    # ------------------------------------------------------------------
+    def apply_runtime_target_config(self, position_ratio=None, exclude_products=None) -> dict:
+        """运行时动态刷新 target 配置（ratio/ration 与 exclude）。
+
+        用于热加载：account_targets.py 被修改并 reload 后，
+        上层（run_position_sync_loop 每轮 tick）用这个方法把最新值推给已创建的 manager。
+        CTP 连接不会重建，仅更新 _position_ratio 和 _exclude_products 两个属性。
+
+        Args:
+            position_ratio: 可选，传入则覆盖；None 表示保持不变。
+                            支持正数（跟单比例）、0（清仓）、负数（对冲倍数）。
+            exclude_products: 可选，list/set/None；None 表示保持不变；
+                              []（空 list）可显式表示「清空排除列表」。
+
+        Returns:
+            dict: {'changed': bool,
+                   'ratio':   (new_ratio, old_ratio, status),
+                   'exclude': (new_exclude_sorted, old_exclude_sorted, status)}
+                   status ∈ {changed, unchanged, kept}
+        """
+        import time as _t
+        old_ratio = float(self._position_ratio)
+        old_exclude = set(self._exclude_products or set())
+        ratio_status = 'kept'
+        exclude_status = 'kept'
+
+        # ratio 更新（允许任何实数：正数/0/负数）
+        if position_ratio is not None:
+            try:
+                r = float(position_ratio)
+            except (TypeError, ValueError):
+                self.print(f"[热更新] 忽略非法 ratio={position_ratio!r}，保持 {old_ratio}")
+            else:
+                if r == r and r not in (float('inf'), float('-inf')):
+                    if abs(r - old_ratio) > 1e-9 or (r == 0) != (old_ratio == 0):
+                        self._position_ratio = r
+                        ratio_status = 'changed'
+                    else:
+                        ratio_status = 'unchanged'
+
+        # exclude 更新：None 不动，空 list/空 set 可清空
+        if exclude_products is not None:
+            def _norm(x):
+                return str(x).strip().upper() if x is not None and str(x).strip() else None
+            normalized = []
+            try:
+                iterable = list(exclude_products)
+            except Exception:
+                iterable = []
+            for x in iterable:
+                s = _norm(x)
+                if s:
+                    normalized.append(s)
+            new_exclude_set = set(normalized)
+            if new_exclude_set == old_exclude:
+                exclude_status = 'unchanged'
+            else:
+                self._exclude_products = new_exclude_set
+                exclude_status = 'changed'
+
+        changed = (ratio_status == 'changed') or (exclude_status == 'changed')
+        if changed:
+            self.print(
+                f"[热更新] ratio: {old_ratio} -> {self._position_ratio} ({ratio_status}); "
+                f"exclude: {sorted(old_exclude) or []} -> {sorted(self._exclude_products) or []} ({exclude_status}) "
+                f"[ts {_t.strftime('%H:%M:%S')}]"
+            )
+        return {
+            'changed': changed,
+            'ratio':   (self._position_ratio, old_ratio, ratio_status),
+            'exclude': (sorted(self._exclude_products or []), sorted(old_exclude or []), exclude_status),
+        }
+
     def _notify_async(self, text: str):
         """异步发送飞书通知，完全不阻塞
 

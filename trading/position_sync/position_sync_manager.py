@@ -126,6 +126,9 @@ def run_position_sync_loop(
     stop_event=None,
     position_ratio: float = 1.0,
     exclude_products=None,
+    source_account: str = None,
+    target_user_id: str = None,
+    runtime_config_resolver=None,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -133,6 +136,8 @@ def run_position_sync_loop(
     1. 登录 CTP，建立连接
     2. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
     3. 持续监控：发现 hold-std.json 更新时执行同步
+       3a. 在每次 tick（每 2 秒一次）前，先调用 runtime_config_resolver(source_account, target_user_id)
+           热加载最新的 ration/ratio/exclude 配置，并通过 mgr.apply_runtime_target_config 动态生效
     4. 永不关闭连接：保持长连接直到收到 stop_event
 
     Args:
@@ -143,14 +148,18 @@ def run_position_sync_loop(
         env_name: 环境名称
         logger: 日志记录器
         stop_event: 停止事件（threading.Event），设为 None 则一直运行
-        position_ratio: 持仓同步比例
-        exclude_products: 排除品种列表/可迭代集合，例：["SC","FG"]，命中前缀的合约不参与对齐
-
+        position_ratio: 持仓同步比例（启动初始值，运行时可被 runtime_config_resolver 覆盖）
+        exclude_products: 启动时的初始排除品种列表（运行时可被覆盖）
+        source_account: 源账号（如 WQ1017、wangk0402、zhouzhou、wangxy0617），用于热加载配置时定位
+        target_user_id: 目标账号 user_id（如 yuqj0821、17883），用于热加载配置时定位
+        runtime_config_resolver: 可选，callable(source_account, target_user_id) -> (new_ratio|None, new_exclude|None)
+                                 返回 None 表示保持当前值不变。热加载出错时返回 (None, None) 即可。
     Returns:
         bool: 是否正常结束
     """
     import threading
     import os
+    import time as _t
     mgr = None
 
     def _log(msg):
@@ -163,6 +172,8 @@ def run_position_sync_loop(
         _log(f"  hold_std_path={hold_std_path}")
         _log(f"  main_contracts_path={main_contracts_path}")
         _log(f"  position_ratio={position_ratio}")
+        _log(f"  source_account={source_account}, target_user_id={target_user_id}")
+        _log(f"  runtime_config_resolver={'enabled' if runtime_config_resolver else 'disabled'}")
         if exclude_products:
             _log(f"  exclude_products={list(exclude_products)}")
 
@@ -187,14 +198,43 @@ def run_position_sync_loop(
         # 首次同步
         _log("[同步] 首次同步...")
         try:
-            mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+            # position_ratio=None：保留 __init__ 时写入 self._position_ratio 的值
+            mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=None)
         except Exception as e:
             _log(f"[同步] 首次同步异常: {e}")
             traceback.print_exc()
             return False
 
         # 持续监控循环（永不关闭连接）
+        # 性能控制：热加载 reload account_targets.py 不是每 2 秒 tick 都跑，单独按 HOT_RELOAD_INTERVAL 秒一次，
+        # 避免 2 秒 reload 一次过于频繁（py 编译有开销）。
+        HOT_RELOAD_INTERVAL = 10.0
+        _last_reload_ts = 0.0
+
         while True:
+            # ------------------------------------------------------------------
+            # [热加载] 每 HOT_RELOAD_INTERVAL 秒尝试 reload account_targets.py 并刷新配置
+            # ------------------------------------------------------------------
+            if runtime_config_resolver is not None and source_account and target_user_id:
+                _now = _t.time()
+                if _now - _last_reload_ts >= HOT_RELOAD_INTERVAL - 1e-6:
+                    _last_reload_ts = _now
+                    try:
+                        _rr = runtime_config_resolver(source_account, target_user_id)
+                        # 解析函数返回 tuple (new_ratio, new_exclude)，任一可以为 None 表示保持旧值
+                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 2:
+                            new_ratio, new_exclude = _rr[0], _rr[1]
+                            try:
+                                mgr.apply_runtime_target_config(
+                                    position_ratio=new_ratio,
+                                    exclude_products=new_exclude,
+                                )
+                            except Exception as _ae:
+                                _log(f"[热更新] 应用配置异常: {_ae}")
+                    except Exception as _re:
+                        # 热加载异常（文件语法错等）不影响主循环，打一条 warning 继续
+                        _log(f"[热更新] reload account_targets 异常: {_re}")
+
             # 检查停止信号
             if stop_event is not None and stop_event.is_set():
                 _log("[同步] 收到停止信号，退出")
@@ -207,7 +247,9 @@ def run_position_sync_loop(
                     _log(f"[同步] 检测到 hold-std.json 更新，执行同步...")
                     last_hold_std_mtime = current_mtime
                     try:
-                        mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=position_ratio)
+                        # 注意：sync_and_trade 内部的 _parse_hold_std() 会读取 self._position_ratio（最新热加载后的值），
+                        # 所以这里不需要传 position_ratio 参数即可。
+                        mgr.sync_and_trade(trade_volume=trade_volume, position_ratio=None)
                     except Exception as e:
                         _log(f"[同步] 同步执行异常: {e}")
                         traceback.print_exc()

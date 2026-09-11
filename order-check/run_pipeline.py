@@ -23,6 +23,7 @@ import logging
 import threading
 import faulthandler
 import atexit
+import importlib
 from logging.handlers import RotatingFileHandler
 
 # 启用 C 级崩溃转储：在 SIGSEGV / access violation 时把 Python 栈写到 stderr / 日志
@@ -524,18 +525,26 @@ def build_target_conf(target: dict) -> dict:
 
 
 def _get_target_ratio(target: dict) -> float:
-    """获取目标账户的持仓同步比例。
+    """获取目标账户的持仓同步比例/模式（ration / ratio 都行）。
 
     支持字段名：ratio / ration / position_ratio，优先使用 ratio。
+    值的语义：
+      - 值 >  0：正常跟单，按比例缩放（ration=2 → 两倍；0.5 → 半仓）
+      - 值 == 0：【清仓模式】目标持仓强制置 0，将按卖一/买一限价把实际持仓全部平掉
+      - 值 == -N（如 -1、-2、-3.5…）：【对冲模式】取 source_account 的持仓方向反转，
+        再乘 N 倍。例：source wangk0402 持 FG 多 1 手，ration=-1 → target 持 FG 空 1 手；
+        ration=-2 → target 持 FG 空 2 手。
     如果都没有配置，则回退到全局 POSITION_RATIO（命令行 --ratio，默认 1.0）。
     """
     for key in ("ratio", "ration", "position_ratio"):
         if key in target:
             try:
                 value = float(target[key])
-                if value <= 0:
+                # 现在允许所有实数：正数=跟单、0=清仓、负数=对冲
+                # 只有 NaN / inf 这种非法浮点数才回退到 1.0
+                if not (value == value) or value in (float("inf"), float("-inf")):
                     logger.warning(
-                        "[ratio] 目标账户 %s 的 %s=%s 必须大于 0，使用默认值 1.0",
+                        "[ratio] 目标账户 %s 的 %s=%s 是非有限浮点数，使用默认值 1.0",
                         target.get("user_id", "unknown"),
                         key,
                         target[key],
@@ -591,6 +600,69 @@ def _get_target_exclude(target: dict) -> list:
             target.get("user_id", "unknown"), e, raw,
         )
         return []
+
+
+# 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
+_at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
+
+
+def _reload_account_targets_module():
+    """reload account_targets.py，返回 ACCOUNT_TARGETS dict。
+
+    加载失败（import error / reload error / 语法错误）时：回退到全局内存中的 ACCOUNT_TARGETS，
+    不影响现有正在运行的同步线程。
+    """
+    global ACCOUNT_TARGETS, _at_module
+    # 首次调用时通过 sys.modules 或者直接 import 找到模块对象
+    try:
+        if _at_module is None:
+            if 'account_targets' in sys.modules:
+                _at_module_ref = sys.modules['account_targets']
+            else:
+                import account_targets as _tmp
+                _at_module_ref = _tmp
+            _at_module_2 = importlib.reload(_at_module_ref)
+        else:
+            _at_module_2 = importlib.reload(_at_module)
+    except Exception as e:
+        # reload 失败（例如 account_targets.py 语法错、缺字段）：
+        # 打印一条 warning，但返回全局内存中上次成功加载的 ACCOUNT_TARGETS，
+        # 保证运行时不崩。
+        logger.warning(
+            "[hot-reload] reload account_targets.py 失败: %s，沿用上次成功加载的配置",
+            e,
+        )
+        return dict(ACCOUNT_TARGETS or {})
+    # 成功 reload -> 覆盖全局 ACCOUNT_TARGETS 供其它链路（导出循环、主列表循环等）继续用
+    new_cfg = getattr(_at_module_2, 'ACCOUNT_TARGETS', None) or {}
+    _at_module = _at_module_2
+    if isinstance(new_cfg, dict):
+        ACCOUNT_TARGETS = new_cfg
+    return dict(ACCOUNT_TARGETS or {})
+
+
+def _resolve_latest_target_config(source_account: str, user_id: str):
+    """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
+
+    返回 tuple: (latest_ratio:float, latest_exclude:list, matched_target:dict|None)
+    找不到匹配的条目时 -> 返回 (None, None, None)，调用方可以用这个值判断是否要继续沿用旧值。
+    """
+    targets_cfg = _reload_account_targets_module()
+    if not targets_cfg or not source_account or not user_id:
+        return None, None, None
+    target_list = targets_cfg.get(source_account) or []
+    if not isinstance(target_list, (list, tuple)):
+        return None, None, None
+    matched = None
+    for t in target_list:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("user_id") or "").strip() == str(user_id).strip():
+            matched = t
+            break
+    if matched is None:
+        return None, None, None
+    return _get_target_ratio(matched), _get_target_exclude(matched), matched
 
 
 # ==================== 线程间通信 ====================
@@ -1039,6 +1111,7 @@ def main():
                 ratio = POSITION_RATIO
                 exclude = []
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
+                source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
 
             from trading.position_sync.position_sync_manager import run_position_sync_loop
@@ -1053,6 +1126,10 @@ def main():
                 stop_event=shutdown_event,
                 position_ratio=ratio,
                 exclude_products=exclude,
+                source_account=source_account,
+                target_user_id=user_id,
+                # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude)
+                runtime_config_resolver=_resolve_latest_target_config,
             )
         except Exception as e:
             logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)

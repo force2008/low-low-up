@@ -33,7 +33,7 @@ class PositionSyncManagerSync:
         self,
         trade_volume: int = 1,
         timeout: int = 30,
-        position_ratio: float = 1.0,
+        position_ratio: float = None,
     ) -> bool:
         # 获取线程锁，防止并发调用
         if not self._sync_lock.acquire(blocking=True, timeout=5):
@@ -48,12 +48,25 @@ class PositionSyncManagerSync:
             self._sync_lock.release()
 
     def _do_sync(self, trade_volume: int = 1, timeout: int = 30, position_ratio: float = None, lock_held: bool = False) -> bool:
-        """执行同步：加载数据 -> 对比 -> 快速同步"""
+        """执行同步：加载数据 -> 对比 -> 快速同步
+
+        position_ratio 参数语义（2026-09-11 升级后）：
+          - None（默认）：保持实例已有的 self._position_ratio，不覆盖。
+            热加载 ration/ratio 后（可能 0 清仓、正数跟单、负数对冲），这里不动它。
+          - 非 None：
+              · 浮点数非法（NaN / inf） → 忽略，保持现有 ratio 不变
+              · 合法实数：覆盖 self._position_ratio，可能 >0 跟单 =0 清仓 <0 对冲
+        """
         if position_ratio is not None:
-            if position_ratio <= 0:
-                self.print(f"[错误] position_ratio 必须大于 0，当前值: {position_ratio}")
-                return False
-            self._position_ratio = float(position_ratio)
+            try:
+                r = float(position_ratio)
+            except (TypeError, ValueError):
+                self.print(f"[ratio] 传入的 position_ratio={position_ratio!r} 不是有效数字，忽略并保持 {self._position_ratio}")
+            else:
+                if r == r and r not in (float('inf'), float('-inf')):
+                    self._position_ratio = r
+                else:
+                    self.print(f"[ratio] 传入的 position_ratio={position_ratio!r} 是非有限浮点数，忽略并保持 {self._position_ratio}")
 
         self.print("=" * 60)
         self.print("【持仓同步开始】")
