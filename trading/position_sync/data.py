@@ -462,7 +462,9 @@ class PositionSyncManagerData:
         (A) ratio > 0  → 正常跟单：hold-std 方向不变，手数 = round(原始手数 × ratio)，单合约最小 1 手（若原始>0）。
         (B) ratio == 0 → 清仓模式：目标持仓强制返回空 dict，相当于所有品种目标为 0；
                          后续比对会判定为"实际持仓超额"，走 _submit_excess_orders 平仓分支，
-                         平仓价格按 sync.py 既定逻辑：多平挂卖一(BidPrice1)、空平挂买一(AskPrice1)。
+                         平仓价格按 sync.py 既定逻辑（排队挂单，多赚滑点）：
+                           多头卖出平仓 → 挂 AskPrice1（卖一价，排在卖方队列等成交）；
+                           空头买入平仓 → 挂 BidPrice1（买一价，排在买方队列等成交）。
         (C) ratio < 0  → 对冲模式：以 hold-std 里的 source_account 原始持仓为基准，方向反转后再乘 abs(ratio)。
                          例：source wangk0402 持 FG 多 1 手，ratio=-1 → target 持 FG 空 1 手；ratio=-2 → 空 2 手。
                          等价于"跟单账户作为 signal_account 的对手方"。
@@ -472,7 +474,7 @@ class PositionSyncManagerData:
         # 清仓模式：直接空 dict，不做反探单过滤（清仓是要把所有持仓平掉，包括非主流通/黑名单品种）
         ratio = getattr(self, '_position_ratio', 1.0)
         if ratio == 0:
-            self.print("[模式-清仓] ration=0，目标持仓全部置 0（将以限价挂卖一/买一平掉所有实际持仓）")
+            self.print("[模式-清仓] ration=0，目标持仓全部置 0（多平挂卖一AskPrice1、空平挂买一BidPrice1，排队挂单不急成交）")
             return {}
 
         # 1) 先构建原始缩放后的 result（按 ratio/对冲 正常算）：代码复用原先已有实现

@@ -139,6 +139,7 @@ class PositionSyncManagerOrderOps:
         volume: int,
         limit_price: float,
         offset_flag: int,
+        is_liquidate_mode: bool = False,
     ) -> bool:
         """通用下单方法，支持指定开平标志，返回 True/False"""
         exact_id = self._standardize_contract(instrument_id)
@@ -183,6 +184,7 @@ class PositionSyncManagerOrderOps:
                 "replace_count": 0,
                 "limit_price": limit_price,  # 保存委托价格，用于撤单重挂时对比价格变化
                 "pending_rejection": False,  # 标记是否收到拒绝（由回调设置）
+                "is_liquidate_mode": is_liquidate_mode,  # ratio==0 清仓模式标记：True=排队价，False=吃单价
             }
 
         delay_s = self._maybe_random_delay_before_submit(exact_id, direction, volume)
@@ -691,11 +693,20 @@ class PositionSyncManagerOrderOps:
             last_price = info.get("limit_price", 0) or info.get("last_md_price", 0)
             direction = info.get("direction", "")
             offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+            # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
+            # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
+            use_passive_close = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
 
             if direction == "buy":
-                current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                if use_passive_close:
+                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                else:
+                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
             else:
-                current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                if use_passive_close:
+                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                else:
+                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
 
             if not current_price or current_price <= 0:
                 continue
@@ -758,10 +769,19 @@ class PositionSyncManagerOrderOps:
         # 重新获取行情
         md = market_data_map.get(contract.upper())
         if md:
+            # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
+            # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
+            use_passive_close = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
             if direction == "buy":
-                current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                if use_passive_close:
+                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                else:
+                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
             else:
-                current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                if use_passive_close:
+                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                else:
+                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
         else:
             current_price = new_price
 
@@ -791,6 +811,7 @@ class PositionSyncManagerOrderOps:
             volume=volume,
             limit_price=current_price,
             offset_flag=offset_flag,
+            is_liquidate_mode=bool(info.get("is_liquidate_mode", False)),
         )
 
         if ok:

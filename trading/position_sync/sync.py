@@ -140,6 +140,9 @@ class PositionSyncManagerSync:
             # 5. 聚合持仓
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
+            # 记录本次是否清仓模式（ratio==0），用于区分平仓策略：
+            #   清仓模式 → passive 排队挂单；正常对齐 → aggressive 吃单
+            self._is_liquidate_mode = (getattr(self, '_position_ratio', 1.0) == 0)
 
             # 6. 再次查询在途委托（撤销后的状态）
             ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
@@ -224,6 +227,7 @@ class PositionSyncManagerSync:
                         "contract": contract,
                         "direction": direction,
                         "volume": vol_to_close,
+                        "is_liquidate_mode": getattr(self, '_is_liquidate_mode', False),
                     })
 
             # 10. 更新 hold.json
@@ -581,12 +585,22 @@ class PositionSyncManagerSync:
                     time.sleep(0.2)
                     continue
 
-                if pos_dir == 2:  # 多头 → 卖出
+                if pos_dir == 2:  # 多头 → 卖出平仓
                     close_direction = "sell"
-                    limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
-                else:  # 空头 → 买入
+                    if eo.get("is_liquidate_mode", False):
+                        # 清仓模式(ratio==0)：挂卖一 AskPrice1 排队，不急成交多赚滑点
+                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        # 正常对齐平仓：挂买一 BidPrice1 主动吃单，尽快对齐
+                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                else:  # 空头 → 买入平仓
                     close_direction = "buy"
-                    limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    if eo.get("is_liquidate_mode", False):
+                        # 清仓模式(ratio==0)：挂买一 BidPrice1 排队，不急成交多赚滑点
+                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        # 正常对齐平仓：挂卖一 AskPrice1 主动吃单，尽快对齐
+                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
 
                 if limit_price <= 0:
                     skip_close[0] += 1
@@ -625,6 +639,7 @@ class PositionSyncManagerSync:
                         volume=close_today,
                         limit_price=limit_price,
                         offset_flag=tdapi.THOST_FTDC_OF_CloseToday,
+                        is_liquidate_mode=eo.get("is_liquidate_mode", False),
                     )
                     if not ok:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
@@ -650,6 +665,7 @@ class PositionSyncManagerSync:
                         volume=diff,
                         limit_price=limit_price,
                         offset_flag=offset,
+                        is_liquidate_mode=eo.get("is_liquidate_mode", False),
                     )
                     if not ok:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
