@@ -30,22 +30,39 @@ class PositionSyncManagerData:
     # ------------------------------------------------------------------
     # 排除品种工具：由 Base.__init__ 写入 self._exclude_products（全大写 set）
     # ------------------------------------------------------------------
-    def _is_contract_excluded(self, instrument_id_upper: str) -> bool:
-        """合约代码前缀命中任一排除品种即返回 True。
+    def _product_from_contract_upper(self, instrument_id_upper: str) -> str:
+        """从合约代码（大写）提取品种前缀，匹配 exclude/deny 时用。
 
-        例：排除 {"SC", "FG"} → 合约 SC2501 / SC2503 / FG501 / FG509 均命中并跳过；
-        未配置排除时 self._exclude_products 为空 set，全部返回 False。
+        合约代码通用形态：
+          <品种字母前缀> + <年份数字><月份数字>    e.g. A2611 / AG2612 / FG501 / MA411
+        其中 <品种字母前缀> 长度可能为 1/2/3 位（A=1, AG/AL/AU=2, MAM=3 等），
+        年月全是数字。因此只需 rstrip("0123456789") 就能精准剥出 product prefix，
+        避免 1 位品种（如 A、B、C、I、P）用 startswith 误伤 2 位品种（AG、AL、AU、
+        CS、IC、PP 等）。
+        """
+        s = (instrument_id_upper or "").strip().upper()
+        if not s:
+            return ""
+        return s.rstrip("0123456789")
+
+    def _is_contract_excluded(self, instrument_id_upper: str) -> bool:
+        """合约「品种前缀」命中任一排除品种即返回 True。
+
+        例：排除 {"A","SC","FG"} ：
+          A2509 → product="A" 命中；
+          SC2501 / SC2503 → product="SC" 命中；
+          FG501 / FG509 → product="FG" 命中；
+          AG2612 → product="AG" ≠ "A" → 不误杀（修复前 startswith("A") 会误杀）。
+          AL2611 → product="AL" ≠ "A" → 不误杀；
+          AU2610 → product="AU" ≠ "A" → 不误杀；
         """
         excludes = getattr(self, '_exclude_products', None)
         if not excludes:
             return False
-        s = (instrument_id_upper or '').upper()
-        if not s:
+        product = self._product_from_contract_upper(instrument_id_upper)
+        if not product:
             return False
-        for prefix in excludes:
-            if s.startswith(prefix):
-                return True
-        return False
+        return product in {str(p).strip().upper() for p in excludes}
 
     def _load_contract_info(self) -> bool:
         """从 main_contracts.json / instruments.json 加载合约信息（交易所、PriceTick、ProductID）"""
