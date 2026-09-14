@@ -625,18 +625,31 @@ class PositionSyncManagerData:
         return final_result
 
     def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:
+        """聚合 CTP 实际持仓。
+
+        语义变更（2026-09-14 起）：
+          - exclude 品种 **不再从实际持仓侧剔除**。
+          - 含义：如果跟单账户里持有 exclude 老仓（例如 exclude=["SC"] 但账户有 SC 多 5 手），
+            这 5 手会保留在 actual dict 中参与对比；而 _parse_hold_std 对 exclude 品种
+            的目标持仓强制为 0（不跟开）→ 对比结果为 "超额 5 手" → 走平仓分支平掉。
+          - 平掉之后：目标=0、实际=0，后续永不复开；源侧再怎么开 exclude 品种也不会跟开。
+        """
         result: Dict[Tuple[str, int], int] = {}
-        excluded_actual = 0
+        excluded_actual = 0  # 仅用于日志统计：命中 exclude 的实际持仓合计（这些仓位仍参与对齐，用于触发退出平仓）
         for pos in self._actual_positions:
             contract = self._standardize_contract(pos["InstrumentID"])
-            # 排除品种过滤：实际持仓侧直接跳过，避免当成"超额"触发平仓
-            if self._is_contract_excluded(contract):
-                excluded_actual += int(pos.get("Position", 0) or 0)
+            volume = int(pos.get("Position", 0) or 0)
+            if volume <= 0:
                 continue
             key = (contract, pos["PosiDirection"])
-            result[key] = result.get(key, 0) + pos["Position"]
+            result[key] = result.get(key, 0) + volume
+            if self._is_contract_excluded(contract):
+                excluded_actual += volume
         if excluded_actual > 0:
-            self.print(f"[exclude] 实际持仓跳过 {excluded_actual} 手（命中排除品种，不参与对齐比较）")
+            self.print(
+                f"[exclude] 检测到排除品种仍有实际持仓共 {excluded_actual} 手，"
+                f"将作为「超额」参与对齐（优先平仓退出，后续永不复开）"
+            )
         return result
 
     def _get_position_detail(self, contract: str, direction: int) -> dict:

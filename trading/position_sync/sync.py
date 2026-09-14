@@ -223,12 +223,20 @@ class PositionSyncManagerSync:
                     if contract.upper() in cooling_contracts:
                         self.print(f"[平] {contract} 在1009冷却期内（30秒），跳过本次平仓")
                         continue
+                    is_exclude_exit = self._is_contract_excluded(contract)
                     excess_orders.append({
                         "contract": contract,
                         "direction": direction,
                         "volume": vol_to_close,
                         "is_liquidate_mode": getattr(self, '_is_liquidate_mode', False),
+                        # exclude 品种老仓退出：与 ratio==0 清仓模式同样走 passive 排队挂单，多赚滑点
+                        "is_exclude_exit": is_exclude_exit,
                     })
+                    if is_exclude_exit:
+                        self.print(
+                            f"[exclude-退出] {contract} {'多' if direction == 2 else '空'} "
+                            f"计划平 {vol_to_close} 手（命中 exclude，后续永不复开）"
+                        )
 
             # 10. 更新 hold.json
             self._update_hold_json_file()
@@ -259,10 +267,24 @@ class PositionSyncManagerSync:
                         diff_lines.append(f"  {mo['contract']} {d} {mo['volume']}手")
                 if excess_orders:
                     total_excess = sum(eo["volume"] for eo in excess_orders)
-                    diff_lines.append(f"📉 超额平仓 ({len(excess_orders)} 个合约，共 {total_excess} 手):")
-                    for eo in excess_orders:
-                        d = "多" if eo["direction"] == 2 else "空"
-                        diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
+                    exit_cnt = sum(1 for eo in excess_orders if eo.get("is_exclude_exit"))
+                    common_cnt = len(excess_orders) - exit_cnt
+                    exit_vol = sum(eo["volume"] for eo in excess_orders if eo.get("is_exclude_exit"))
+                    common_vol = total_excess - exit_vol
+                    if common_cnt > 0:
+                        diff_lines.append(f"📉 超额平仓 ({common_cnt} 个合约，共 {common_vol} 手):")
+                        for eo in excess_orders:
+                            if eo.get("is_exclude_exit"):
+                                continue
+                            d = "多" if eo["direction"] == 2 else "空"
+                            diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手")
+                    if exit_cnt > 0:
+                        diff_lines.append(f"🚪 exclude 品种退出平仓 ({exit_cnt} 个合约，共 {exit_vol} 手，退出后永不复开):")
+                        for eo in excess_orders:
+                            if not eo.get("is_exclude_exit"):
+                                continue
+                            d = "多" if eo["direction"] == 2 else "空"
+                            diff_lines.append(f"  {eo['contract']} {d} {eo['volume']}手（退出）")
 
                 if skipped_contracts:
                     diff_lines.append(f"⏸️ 以下 {len(skipped_contracts)} 个合约当前非交易时段，已跳过对齐：")
@@ -347,6 +369,16 @@ class PositionSyncManagerSync:
             """串行提交开仓委托（与 PositionManagerUI.py 保持一致）"""
             for mo in missing_orders:
                 contract = mo["contract"]
+                # 【开仓双保险拦截】：exclude 品种永不复新开仓
+                # 正常情况下：_parse_hold_std 阶段 exclude 已剔除，到不了 missing_orders；
+                # 这道保险是为了防止未来改动 _parse_hold_std 逻辑时意外放行 exclude 开仓。
+                if self._is_contract_excluded(contract):
+                    self.print(
+                        f"[开] {contract} 命中 exclude 品种，开仓指令被拦截（永不复开）。"
+                        f"若实际仍有该合约老仓，会在超额段走 exclude 退出平仓。"
+                    )
+                    skip_open[0] += 1
+                    continue
                 md = market_data_map.get(contract)
                 if not md:
                     exact = self._standardize_contract(contract)
@@ -475,26 +507,32 @@ class PositionSyncManagerSync:
                                         break
                 if pending_close_ref:
                     # 有平仓委托在途，等待30秒检查循环处理
-                    self.print(f"[平] {contract} 已有平仓委托在途，等待30秒检查循环处理")
+                    tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    self.print(f"{tag} {contract} 已有平仓委托在途，等待30秒检查循环处理")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
 
                 md = market_data_map.get(contract)
                 if not md:
+                    if eo.get("is_exclude_exit"):
+                        self.print(f"[exclude-退出] {contract} 无行情，跳过退出平仓（下次同步重试）")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
 
                 detail = self._get_position_detail(contract, pos_dir)
                 if detail.get("Position", 0) <= 0:
+                    if eo.get("is_exclude_exit"):
+                        self.print(f"[exclude-退出] {contract} 实际持仓已为 0，退出完成 ✅")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
 
                 info = self._get_contract_info(contract)
                 if not info:
-                    self.print(f"[平] {contract} 获取合约信息失败")
+                    tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    self.print(f"{tag} {contract} 获取合约信息失败")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -510,7 +548,8 @@ class PositionSyncManagerSync:
                 current_time = time.time()
                 last_rejected = getattr(self, '_last_1009_reject', {}).get(contract.upper(), 0)
                 if current_time - last_rejected < 30:  # 30秒内不重复尝试同一合约
-                    self.print(f"[平] {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
+                    tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    self.print(f"{tag} {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -520,7 +559,8 @@ class PositionSyncManagerSync:
                 # 不应该在这个时间点平仓，避免"开仓未成交但持仓已平"的错误
                 pending_open_vol = pending_map.get((contract.upper(), pos_dir, True), 0)
                 if pending_open_vol > 0:
-                    self.print(f"[平] {contract} 有在途开仓委托 {pending_open_vol} 手，跳过平仓（等待成交确认）")
+                    tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    self.print(f"{tag} {contract} 有在途开仓委托 {pending_open_vol} 手，跳过平仓（等待成交确认）")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -587,16 +627,19 @@ class PositionSyncManagerSync:
 
                 if pos_dir == 2:  # 多头 → 卖出平仓
                     close_direction = "sell"
-                    if eo.get("is_liquidate_mode", False):
-                        # 清仓模式(ratio==0)：挂卖一 AskPrice1 排队，不急成交多赚滑点
+                    # exclude 退出平仓：与 ratio==0 清仓模式走同一套 passive 排队挂单策略，多赚滑点
+                    use_passive = bool(eo.get("is_liquidate_mode") or eo.get("is_exclude_exit"))
+                    if use_passive:
+                        # 清仓/退出模式：挂卖一 AskPrice1 排队，不急成交多赚滑点
                         limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
                     else:
                         # 正常对齐平仓：挂买一 BidPrice1 主动吃单，尽快对齐
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                 else:  # 空头 → 买入平仓
                     close_direction = "buy"
-                    if eo.get("is_liquidate_mode", False):
-                        # 清仓模式(ratio==0)：挂买一 BidPrice1 排队，不急成交多赚滑点
+                    use_passive = bool(eo.get("is_liquidate_mode") or eo.get("is_exclude_exit"))
+                    if use_passive:
+                        # 清仓/退出模式：挂买一 BidPrice1 排队，不急成交多赚滑点
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                     else:
                         # 正常对齐平仓：挂卖一 AskPrice1 主动吃单，尽快对齐
@@ -682,7 +725,13 @@ class PositionSyncManagerSync:
 
                 # 只有实际提交了才记录
                 if close_vol_submitted > 0:
-                    self.print(f"[平] {contract} 提交成功 @{limit_price} ({close_vol_submitted}手)")
+                    if eo.get("is_exclude_exit"):
+                        self.print(
+                            f"[exclude-退出] {contract} 提交成功 @{limit_price} ({close_vol_submitted}手，"
+                            f"排队挂单模式，退出后永不复开)"
+                        )
+                    else:
+                        self.print(f"[平] {contract} 提交成功 @{limit_price} ({close_vol_submitted}手)")
                     submitted_close[0] += 1
                     close_orders.append({
                         "contract": contract,
