@@ -627,22 +627,25 @@ class PositionSyncManagerSync:
 
                 if pos_dir == 2:  # 多头 → 卖出平仓
                     close_direction = "sell"
-                    # exclude 退出平仓：与 ratio==0 清仓模式走同一套 passive 排队挂单策略，多赚滑点
-                    use_passive = bool(eo.get("is_liquidate_mode") or eo.get("is_exclude_exit"))
+                    # 定价策略：
+                    #  - ratio==0 全仓清仓模式 (is_liquidate_mode=True) 且非 exclude 退出 → passive 排队挂单（多赚滑点）
+                    #  - exclude 品种老仓退出 (is_exclude_exit=True) → aggressive 主动吃盘（时间优先，尽快退干净）
+                    #  - 正常对齐调仓平仓 → aggressive 主动吃盘（尽快对齐）
+                    use_passive = bool(eo.get("is_liquidate_mode") and not eo.get("is_exclude_exit"))
                     if use_passive:
-                        # 清仓/退出模式：挂卖一 AskPrice1 排队，不急成交多赚滑点
+                        # 清仓模式(ratio==0)：挂卖一 AskPrice1 排队，不急成交多赚滑点
                         limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
                     else:
-                        # 正常对齐平仓：挂买一 BidPrice1 主动吃单，尽快对齐
+                        # 正常对齐 / exclude 退出平仓：挂买一 BidPrice1 主动吃单，尽快成交
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                 else:  # 空头 → 买入平仓
                     close_direction = "buy"
-                    use_passive = bool(eo.get("is_liquidate_mode") or eo.get("is_exclude_exit"))
+                    use_passive = bool(eo.get("is_liquidate_mode") and not eo.get("is_exclude_exit"))
                     if use_passive:
-                        # 清仓/退出模式：挂买一 BidPrice1 排队，不急成交多赚滑点
+                        # 清仓模式(ratio==0)：挂买一 BidPrice1 排队，不急成交多赚滑点
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                     else:
-                        # 正常对齐平仓：挂卖一 AskPrice1 主动吃单，尽快对齐
+                        # 正常对齐 / exclude 退出平仓：挂卖一 AskPrice1 主动吃单，尽快成交
                         limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
 
                 if limit_price <= 0:
