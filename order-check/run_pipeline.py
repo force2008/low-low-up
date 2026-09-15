@@ -894,8 +894,13 @@ def check_key_time_and_alert():
     return False
 
 
-def run_sync():
-    """执行持仓同步"""
+def run_sync(source_account=None):
+    """执行持仓同步
+
+    Args:
+        source_account: 源账户名称（多账户模式传入，生成 hold-std-{name}.json）。
+                        为 None 时使用旧单账户逻辑（全局 ACCOUNT + hold-std.json）。
+    """
     # 分阶段等待锁，每阶段检查 shutdown_event
     lock = None
     for attempt in range(10):  # 最多尝试10次，每次等1秒
@@ -916,12 +921,26 @@ def run_sync():
     logger.info("已获取交易锁: 开始持仓同步")
 
     try:
-        # 重新生成 hold-std.json（从导出的持仓明细 CSV）
+        # 重新生成标准持仓文件（从导出的持仓明细 CSV）
         import compare_orders
-        gen_ok = compare_orders.generate_hold_std(account=_CURRENT_ACCOUNT)
+
+        if source_account is None:
+            # 旧单账户模式：使用全局 ACCOUNT
+            current_account = ACCOUNT
+            hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
+            gen_ok = compare_orders.generate_hold_std(account=current_account)
+            path_basename = 'hold-std.json'
+        else:
+            # 多账户模式：使用传入的 source_account
+            current_account = source_account
+            hold_std_path = os.path.join(_CURR_DIR, f'hold-std-{source_account}.json')
+            gen_ok = compare_orders.generate_hold_std(
+                account=current_account, output_path=hold_std_path
+            )
+            path_basename = os.path.basename(hold_std_path)
+
         if not gen_ok:
-            logger.warning("生成 hold-std.json 失败")
-        hold_std_path = os.path.join(_CURR_DIR, 'hold-std.json')
+            logger.warning("生成 %s 失败", path_basename)
 
         # 读取当前标准仓（供日志使用）
         if os.path.exists(hold_std_path):
@@ -978,7 +997,13 @@ def run_sync():
 
 
 def force_sync():
-    """强制同步（忽略冷却，直接执行）"""
+    """强制同步（忽略冷却，直接执行）。
+
+    自动识别多账户/单账户模式：
+    - 多账户：为 ACCOUNT_TARGETS 中的每个 source_account 分别生成标准持仓文件，
+              并按每个 target 的配置（user_id / env / ratio / conf）独立同步。
+    - 单账户：回退到全局 ACCOUNT + hold-std.json + POSITION_RATIO。
+    """
     # 分阶段等待锁，每阶段检查 shutdown_event
     lock = None
     for attempt in range(10):
@@ -1006,32 +1031,78 @@ def force_sync():
 
     _CURR_DIR_SYNC = _CURR_DIR
     _PROJECT_ROOT_SYNC = PROJECT_ROOT
+    MAIN_CONTRACTS_PATH = os.path.join(_PROJECT_ROOT_SYNC, 'data', 'contracts', 'main_contracts.json')
 
     try:
         import compare_orders
-        compare_orders.generate_hold_std(account=_CURRENT_ACCOUNT)
-        hold_std_path = os.path.join(_CURR_DIR_SYNC, 'hold-std.json')
-
         from trading.position_sync.position_sync_manager import run_position_sync
-        MAIN_CONTRACTS_PATH = os.path.join(_PROJECT_ROOT_SYNC, 'data', 'contracts', 'main_contracts.json')
 
-        sync_ok = run_position_sync(
-            hold_std_path=hold_std_path,
-            main_contracts_path=MAIN_CONTRACTS_PATH,
-            trade_volume=1,
-            timeout=120,  # 首次建仓可能需要挂出50+合约的委托
-            conf=None,
-            env_name=_CTP_ENV_NAME,
-            logger=logger,
-            position_ratio=POSITION_RATIO,
-        )
-        if sync_ok:
-            logger.info("强制同步完成")
+        # 构造任务列表：[(source_account, hold_std_path, ratio, env_label, conf, user_id)]
+        sync_tasks = []
+
+        if ACCOUNT_TARGETS:
+            # ========= 多账户模式 =========
+            for source_account, targets in ACCOUNT_TARGETS.items():
+                hold_std_path = os.path.join(_CURR_DIR_SYNC, f'hold-std-{source_account}.json')
+                # 为该源账户生成标准持仓文件
+                gen_ok = compare_orders.generate_hold_std(
+                    account=source_account, output_path=hold_std_path
+                )
+                if not gen_ok or not os.path.exists(hold_std_path):
+                    logger.warning("[强制同步] %s 生成失败，跳过该源账户",
+                                   os.path.basename(hold_std_path))
+                    continue
+                for target in targets:
+                    user_id = target.get("user_id")
+                    if not user_id:
+                        continue
+                    env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
+                    conf = build_target_conf(target)
+                    ratio = _get_target_ratio(target)
+                    sync_tasks.append((
+                        source_account, hold_std_path, ratio, env_label, conf, user_id,
+                    ))
+        else:
+            # ========= 回退：旧单账户模式 =========
+            hold_std_path = os.path.join(_CURR_DIR_SYNC, 'hold-std.json')
+            gen_ok = compare_orders.generate_hold_std(account=ACCOUNT)
+            if gen_ok and os.path.exists(hold_std_path):
+                sync_tasks.append((
+                    "default", hold_std_path, POSITION_RATIO, _CTP_ENV_NAME, None, "default",
+                ))
+            else:
+                logger.warning("[强制同步] 生成 hold-std.json 失败")
+
+        if not sync_tasks:
+            logger.warning("[强制同步] 没有任何可执行的同步任务")
+            send_feishu_text("⚠️ 强制同步：未找到可执行的同步任务")
+            return False
+
+        all_ok = True
+        total = len(sync_tasks)
+        for idx, (src_account, hold_std_path, ratio, env_label, conf, user_id) in enumerate(sync_tasks):
+            logger.info("[强制同步] (%d/%d) 开始: %s -> %s", idx + 1, total, src_account, user_id)
+            sync_ok = run_position_sync(
+                hold_std_path=hold_std_path,
+                main_contracts_path=MAIN_CONTRACTS_PATH,
+                trade_volume=1,
+                timeout=120,  # 首次建仓可能需要挂出50+合约的委托
+                conf=conf,
+                env_name=env_label,
+                logger=logger,
+                position_ratio=ratio,
+            )
+            if not sync_ok:
+                all_ok = False
+                logger.warning("[强制同步] %s -> %s 未完成", src_account, user_id)
+
+        if all_ok:
+            logger.info("[强制同步] 全部 %d 个任务完成", total)
             # 详细通知由 PositionSyncManager._send_sync_notification 发送
         else:
-            logger.warning("强制同步未完成")
-            send_feishu_text("⚠️ 强制同步未完成")
-        return sync_ok
+            logger.warning("[强制同步] 部分任务未完成")
+            send_feishu_text("⚠️ 强制同步：部分任务未完成")
+        return all_ok
     except Exception as e:
         logger.error("强制同步异常: %s", e)
         import traceback
