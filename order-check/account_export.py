@@ -150,7 +150,7 @@ def save_exported_data():
     # 处理导出完成确认弹框（最多等待 10 秒，账号多需要更长时间）
     print("等待导出完成确认弹框...")
     try:
-        wait_for_window("融航风控", timeout=10)
+        wait_for_window("融航风控", timeout=30)
         print("检测到导出完成弹框，点击确认按钮...")
         pyautogui.moveTo(OK_BUTTON_POSITION)
         pyautogui.click()
