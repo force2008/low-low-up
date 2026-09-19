@@ -430,10 +430,21 @@ class PositionSyncManagerSync:
                     continue
 
                 # 下单
-                if mo["direction"] == "buy":
-                    limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                # 开仓定价策略：
+                #  - passive_mode=True（套利跟单被动模式）：用被动排队价，挂买一/卖一排队，赚滑点
+                #       买开 = BidPrice1（买一排队价），卖开 = AskPrice1（卖一排队价）
+                #  - passive_mode=False（默认）：用 aggressive 主动吃单价，尽快成交
+                #       买开 = AskPrice1（卖一主动吃），卖开 = BidPrice1（买一主动吃）
+                if getattr(self, '_passive_mode', False):
+                    if mo["direction"] == "buy":
+                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
                 else:
-                    limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    if mo["direction"] == "buy":
+                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
 
                 if limit_price <= 0:
                     self.print(f"[开] {contract} 无有效价格")
@@ -627,25 +638,34 @@ class PositionSyncManagerSync:
 
                 if pos_dir == 2:  # 多头 → 卖出平仓
                     close_direction = "sell"
-                    # 定价策略：
-                    #  - ratio==0 全仓清仓模式 (is_liquidate_mode=True) 且非 exclude 退出 → passive 排队挂单（多赚滑点）
-                    #  - exclude 品种老仓退出 (is_exclude_exit=True) → aggressive 主动吃盘（时间优先，尽快退干净）
-                    #  - 正常对齐调仓平仓 → aggressive 主动吃盘（尽快对齐）
-                    use_passive = bool(eo.get("is_liquidate_mode") and not eo.get("is_exclude_exit"))
+                    # 定价策略（优先级从高到低）：
+                    #  ① exclude 品种老仓退出 (is_exclude_exit=True) → 永远 aggressive 主动吃盘（时间优先，尽快退干净）
+                    #  ② ratio==0 全仓清仓模式 (is_liquidate_mode=True) → 永远 passive 排队挂单（不急成交多赚滑点）
+                    #  ③ passive_mode=True（套利跟单账户）→ 普通对齐调仓也走 passive 排队价（赚滑点优先）
+                    #  ④ 默认（普通对齐调仓 + passive_mode=False）→ aggressive 主动吃盘（尽快对齐）
+                    is_exclude_exit = bool(eo.get("is_exclude_exit", False))
+                    is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
+                    use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
                     if use_passive:
-                        # 清仓模式(ratio==0)：挂卖一 AskPrice1 排队，不急成交多赚滑点
+                        # passive 模式：挂卖一 AskPrice1 排队价，不急成交多赚滑点
+                        #   · 包含：ratio=0 全仓清仓（原有语义不变）
+                        #   · 新增：passive_mode=1 套利跟单账户的普通对齐调仓
                         limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
                     else:
-                        # 正常对齐 / exclude 退出平仓：挂买一 BidPrice1 主动吃单，尽快成交
+                        # aggressive 模式：挂买一 BidPrice1 主动吃单，尽快成交
+                        #   · 包含：普通对齐调仓（默认行为不变）
+                        #   · 包含：exclude 品种退出平仓（时间优先，尽快退）
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                 else:  # 空头 → 买入平仓
                     close_direction = "buy"
-                    use_passive = bool(eo.get("is_liquidate_mode") and not eo.get("is_exclude_exit"))
+                    is_exclude_exit = bool(eo.get("is_exclude_exit", False))
+                    is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
+                    use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
                     if use_passive:
-                        # 清仓模式(ratio==0)：挂买一 BidPrice1 排队，不急成交多赚滑点
+                        # passive 模式：挂买一 BidPrice1 排队价，不急成交多赚滑点
                         limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
                     else:
-                        # 正常对齐 / exclude 退出平仓：挂卖一 AskPrice1 主动吃单，尽快成交
+                        # aggressive 模式：挂卖一 AskPrice1 主动吃单，尽快成交
                         limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
 
                 if limit_price <= 0:

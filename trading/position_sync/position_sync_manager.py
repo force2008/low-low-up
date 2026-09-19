@@ -82,6 +82,8 @@ def run_position_sync(
     random_delay_enabled: bool = False,
     random_delay_max_ms: int = 3000,
     main_by_product_path: str = None,
+    passive_mode: bool = False,
+    passive_wait_seconds: int = 300,
 ) -> bool:
     """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
@@ -96,6 +98,7 @@ def run_position_sync(
             print(f"  allow_contract_level={sorted(allow_contract_level)}")
         if deny_products:
             print(f"  deny_products={sorted(deny_products)}")
+        print(f"  passive_mode={passive_mode}, passive_wait_seconds={passive_wait_seconds}s")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
@@ -111,6 +114,8 @@ def run_position_sync(
             random_delay_enabled=random_delay_enabled,
             random_delay_max_ms=random_delay_max_ms,
             main_by_product_path=main_by_product_path,
+            passive_mode=passive_mode,
+            passive_wait_seconds=passive_wait_seconds,
         )
         if logger:
             mgr.set_logger(logger)
@@ -157,6 +162,8 @@ def run_position_sync_loop(
     source_account: str = None,
     target_user_id: str = None,
     runtime_config_resolver=None,
+    passive_mode: bool = False,
+    passive_wait_seconds: int = 300,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -165,7 +172,7 @@ def run_position_sync_loop(
     2. 首次同步：对比 hold-std.json 与实际持仓，提交差异委托
     3. 持续监控：发现 hold-std.json 更新时执行同步
        3a. 在每次 tick 前，按 HOT_RELOAD_INTERVAL 秒调用 runtime_config_resolver(...)
-           热加载最新配置（ratio/exclude/allow_level/deny/min_qty/min_notional/random），
+           热加载最新配置（ratio/exclude/allow_level/deny/min_qty/min_notional/random/passive），
            并通过 mgr.apply_runtime_target_config 动态生效
     4. 永不关闭连接：保持长连接直到收到 stop_event
 
@@ -187,11 +194,13 @@ def run_position_sync_loop(
         min_notional: 单合约最低成交额阈值（元，低于跳过，防探单）
         random_delay_enabled: 下单前随机延迟开关
         random_delay_max_ms: 随机延迟最大毫秒数
+        passive_mode: 被动挂单模式开关（套利跟单账户用，True=排队价挂单，5分钟内不撤）
+        passive_wait_seconds: 被动模式下的排队等待窗口秒数（默认300=5分钟）
         source_account: 源账号，用于热加载定位
         target_user_id: 目标账号，用于热加载定位
-        runtime_config_resolver: callable(source, user) -> 9-tuple
+        runtime_config_resolver: callable(source, user) -> 11-tuple
                                  (ratio, exclude, allow_level, deny, min_qty, min_notional,
-                                  rnd_enabled, rnd_max_ms, matched_target)
+                                  rnd_enabled, rnd_max_ms, passive_mode, passive_wait_seconds, matched_target)
                                  返回 None 表示保持当前值不变。
     Returns:
         bool: 是否正常结束
@@ -226,6 +235,7 @@ def run_position_sync_loop(
         if min_notional:
             _log(f"  min_notional={min_notional}")
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
+        _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -242,6 +252,8 @@ def run_position_sync_loop(
             random_delay_enabled=random_delay_enabled,
             random_delay_max_ms=random_delay_max_ms,
             main_by_product_path=main_by_product_path,
+            passive_mode=passive_mode,
+            passive_wait_seconds=passive_wait_seconds,
         )
         if logger:
             mgr.set_logger(logger)
@@ -279,12 +291,14 @@ def run_position_sync_loop(
                     _last_reload_ts = _now
                     try:
                         _rr = runtime_config_resolver(source_account, target_user_id)
-                        # 解析函数返回 9-tuple (ratio, exclude, allow_level, deny,
-                        #                      min_qty, min_notional, rnd_enabled, rnd_max_ms, matched)
+                        # 解析函数返回 11-tuple (ratio, exclude, allow_level, deny,
+                        #                      min_qty, min_notional, rnd_enabled, rnd_max_ms,
+                        #                      passive_mode, passive_wait_seconds, matched)
                         # 任一值为 None 表示保持当前值不变
-                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 9:
+                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 11:
                             (new_ratio, new_exclude, new_allow_level, new_deny,
-                             new_min_qty, new_min_not, new_rnd_en, new_rnd_ms, _matched) = _rr
+                             new_min_qty, new_min_not, new_rnd_en, new_rnd_ms,
+                             new_passive_mode, new_passive_wait_sec, _matched) = _rr
                             try:
                                 mgr.apply_runtime_target_config(
                                     position_ratio=new_ratio,
@@ -295,6 +309,8 @@ def run_position_sync_loop(
                                     min_notional=new_min_not,
                                     random_delay_enabled=new_rnd_en,
                                     random_delay_max_ms=new_rnd_ms,
+                                    passive_mode=new_passive_mode,
+                                    passive_wait_seconds=new_passive_wait_sec,
                                 )
                             except Exception as _ae:
                                 _log(f"[热更新] 应用配置异常: {_ae}")

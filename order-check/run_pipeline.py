@@ -547,6 +547,15 @@ BIG_NOTIONAL_EXEMPTION = 1_000_000  # 100 万
 RANDOM_ORDER_DELAY_ENABLED = False
 RANDOM_ORDER_DELAY_MAX_MS = 3000  # 3 秒内均匀随机
 
+# ⑤ 被动挂单模式（专为套利跟单账户设计，不主动吃单，用排队价挂单赚滑点）
+#    全局默认：False（不启用，保持原 aggressive 主动吃单 + 30 秒撤单重挂逻辑）
+#    账号级可通过 account_targets.py 的 passive/passive_mode/enable_passive 字段覆盖为 True。
+#    passive_wait_seconds：被动模式下的「排队等待窗口」秒数；
+#        挂单后 < 此窗口：即使盘口偏离也不撤单，让排队价自然成交（默认 300 = 5 分钟）；
+#        挂单后 >= 此窗口仍未成交：撤单 → 向对手盘方向进 1 tick 重新排队，逐档咬盘口。
+PASSIVE_MODE_DEFAULT = False
+PASSIVE_WAIT_SECONDS_DEFAULT = 300
+
 # ================================================================
 
 
@@ -773,6 +782,55 @@ def _get_random_delay_config(target: dict) -> Tuple[bool, int]:
     return enabled, max_ms
 
 
+def _get_target_passive_config(target: dict) -> Tuple[bool, int]:
+    """被动挂单模式配置 -> (passive_mode:bool, wait_seconds:int)。
+
+    目标账户配置优先（字段：passive / passive_mode / enable_passive 与
+    passive_wait_seconds / passive_wait_sec / passive_timeout）；
+    未配置时回退到全局 PASSIVE_MODE_DEFAULT / PASSIVE_WAIT_SECONDS_DEFAULT。
+    """
+    # ① 是否启用 passive 模式
+    passive_mode = PASSIVE_MODE_DEFAULT
+    for key in ("passive", "passive_mode", "enable_passive"):
+        if key in target and target[key] is not None:
+            v = target[key]
+            if isinstance(v, bool):
+                passive_mode = v
+            elif isinstance(v, (int, float)):
+                passive_mode = bool(v)
+            elif isinstance(v, str):
+                s = v.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    passive_mode = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    passive_mode = False
+            break
+
+    # ② 等待窗口秒数（>= 10 才合法，否则兜底 300）
+    wait_seconds = PASSIVE_WAIT_SECONDS_DEFAULT
+    for key in ("passive_wait_seconds", "passive_wait_sec", "passive_timeout"):
+        if key in target and target[key] is not None:
+            try:
+                v = int(target[key])
+                if v >= 10:
+                    wait_seconds = v
+                else:
+                    logger.warning(
+                        "[passive] 目标账户 %s 的 %s=%s < 10 秒，兜底使用默认 %s 秒",
+                        target.get("user_id", "unknown"), key, target[key],
+                        PASSIVE_WAIT_SECONDS_DEFAULT,
+                    )
+                    wait_seconds = PASSIVE_WAIT_SECONDS_DEFAULT
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[passive] 目标账户 %s 的 %s=%s 不是合法整数，使用默认 %s 秒",
+                    target.get("user_id", "unknown"), key, target[key],
+                    PASSIVE_WAIT_SECONDS_DEFAULT,
+                )
+            break
+    return passive_mode, wait_seconds
+
+
 # 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
 _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
@@ -815,17 +873,17 @@ def _reload_account_targets_module():
 def _resolve_latest_target_config(source_account: str, user_id: str):
     """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
 
-    返回 9-tuple:
+    返回 11-tuple:
       (ratio, exclude, allow_level, deny_products, min_qty_hand, min_notional,
-       random_enabled, random_max_ms, matched_target)
+       random_enabled, random_max_ms, passive_mode, passive_wait_seconds, matched_target)
     找不到匹配条目时 -> 返回全 None，调用方沿用旧值。
     """
     targets_cfg = _reload_account_targets_module()
     if not targets_cfg or not source_account or not user_id:
-        return None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None
     target_list = targets_cfg.get(source_account) or []
     if not isinstance(target_list, (list, tuple)):
-        return None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None
     matched = None
     for t in target_list:
         if not isinstance(t, dict):
@@ -834,7 +892,7 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
             matched = t
             break
     if matched is None:
-        return None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None
     ratio = _get_target_ratio(matched)
     exclude = _get_target_exclude(matched)
     allow_level = _get_target_allow_contract_level(matched)
@@ -842,7 +900,9 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
     min_qty = _get_target_min_qty_hand(matched)
     min_not = _get_target_min_notional(matched)
     rnd_enabled, rnd_max_ms = _get_random_delay_config(matched)
-    return ratio, exclude, allow_level, deny, min_qty, min_not, rnd_enabled, rnd_max_ms, matched
+    passive_mode, passive_wait_sec = _get_target_passive_config(matched)
+    return (ratio, exclude, allow_level, deny, min_qty, min_not,
+            rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, matched)
 
 
 # ==================== 线程间通信 ====================
@@ -1356,14 +1416,15 @@ def main():
                 min_qty_hand = _get_target_min_qty_hand(target)
                 min_notional = _get_target_min_notional(target)
                 rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
+                passive_mode, passive_wait_sec = _get_target_passive_config(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
                 logger.info(
                     "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
                     "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
-                    "random_delay=%s@%sms)",
+                    "random_delay=%s@%sms, passive=%s@%ss)",
                     source_account, user_id, ratio, exclude or '[]',
                     sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
-                    rnd_enabled, rnd_max_ms,
+                    rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec,
                 )
             else:
                 # 回退到默认单账户模式
@@ -1377,6 +1438,7 @@ def main():
                 min_qty_hand = None
                 min_notional = None
                 rnd_enabled, rnd_max_ms = RANDOM_ORDER_DELAY_ENABLED, RANDOM_ORDER_DELAY_MAX_MS
+                passive_mode, passive_wait_sec = PASSIVE_MODE_DEFAULT, PASSIVE_WAIT_SECONDS_DEFAULT
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
@@ -1400,6 +1462,8 @@ def main():
                 min_notional=min_notional,
                 random_delay_enabled=rnd_enabled,
                 random_delay_max_ms=rnd_max_ms,
+                passive_mode=passive_mode,
+                passive_wait_seconds=passive_wait_sec,
                 main_by_product_path=os.path.join(
                     PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
                 ),

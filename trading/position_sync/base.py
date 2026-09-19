@@ -58,6 +58,14 @@ class PositionSyncManagerBase(CTdSpiBase):
         random_delay_enabled: bool = False,
         random_delay_max_ms: int = 3000,
         main_by_product_path: str = None,
+        # ---- 跟单 passive 模式（专为套利跟单账户设计）----
+        # passive_mode=False(默认)：开仓/普通调仓平仓 全部用 aggressive 主动吃单（尽快成交），撤单重挂按30秒原逻辑
+        # passive_mode=True：        开仓/普通调仓平仓 用 passive 排队价（挂买一/卖一排队，不主动吃）；
+        #                            挂单后 passive_wait_seconds 内（默认 5分钟=300s）即使价格变化也不撤单重挂，
+        #                            超过仍未成交 -> 撤单 -> 以「向对手价方向进 1 tick」的新价重新排队挂，逐档咬盘口；
+        #                            exclude 退出平仓 / ratio==0 的全仓清仓 不受 passive 影响，仍按各自策略走。
+        passive_mode: bool = False,
+        passive_wait_seconds: int = 300,
     ):
         # ratio/ration 支持：正数跟单 / 0 清仓 / 负数对冲（任意实数合法，仅 NaN/inf 才报错）
         if position_ratio != position_ratio or position_ratio in (float("inf"), float("-inf")):
@@ -141,6 +149,17 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._main_by_product: dict = {}             # {ProductID: {main,main2,main3,volume_multiple,price_tick,...}}
         self._allowed_contracts_set: set = set()      # 具体合约代码集合（允许的主/次主/次次主）
         self._product_volume_multiple: dict = {}      # {ProductID: volume_multiple}
+
+        # ------------------------------------------------------------------
+        # 8) 跟单 passive 模式（为套利跟单账户设计，详见 __init__ 签名上方的参数：
+        # ------------------------------------------------------------------
+        self._passive_mode: bool = bool(passive_mode)
+        try:
+            self._passive_wait_seconds: int = int(passive_wait_seconds)
+        except (TypeError, ValueError):
+            self._passive_wait_seconds = 300
+        if self._passive_wait_seconds < 10:
+            self._passive_wait_seconds = 300
 
         self.hold_std_path = hold_std_path
         self.main_contracts_path = main_contracts_path
@@ -295,6 +314,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         min_notional=None,
         random_delay_enabled=None,
         random_delay_max_ms=None,
+        passive_mode=None,
+        passive_wait_seconds=None,
     ) -> dict:
         """运行时动态刷新 target 配置。
 
@@ -316,6 +337,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         old_min_not = self._min_notional
         old_rnd_en = bool(self._random_delay_enabled)
         old_rnd_ms = int(self._random_delay_max_ms)
+        old_passive_mode = bool(getattr(self, '_passive_mode', False))
+        old_passive_wait = int(getattr(self, '_passive_wait_seconds', 300))
 
         ratio_status = 'kept'
         exclude_status = 'kept'
@@ -325,6 +348,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         min_not_status = 'kept'
         rnd_en_status = 'kept'
         rnd_ms_status = 'kept'
+        passive_mode_status = 'kept'
+        passive_wait_status = 'kept'
 
         # -------- 1. ratio --------
         if position_ratio is not None:
@@ -456,9 +481,52 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self._random_delay_max_ms = v
                 rnd_ms_status = 'changed'
 
+        # -------- 9. passive_mode --------
+        if passive_mode is not None:
+            if isinstance(passive_mode, bool):
+                v = passive_mode
+            elif isinstance(passive_mode, (int, float)):
+                v = bool(passive_mode)
+            elif isinstance(passive_mode, str):
+                s = passive_mode.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    v = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    v = False
+                else:
+                    v = old_passive_mode
+            else:
+                v = old_passive_mode
+            if v == old_passive_mode:
+                passive_mode_status = 'unchanged'
+            else:
+                self._passive_mode = v
+                passive_mode_status = 'changed'
+
+        # -------- 10. passive_wait_seconds --------
+        if passive_wait_seconds is not None:
+            try:
+                v = int(passive_wait_seconds)
+                if v < 10:
+                    # 小于 10 秒兜底回 300
+                    v2 = 300
+                    if v != old_passive_wait:
+                        self.print(f"[热更新] passive_wait_seconds={passive_wait_seconds!r} <10s，兜底使用 300s")
+                else:
+                    v2 = v
+            except (TypeError, ValueError):
+                v2 = old_passive_wait
+                self.print(f"[热更新] 忽略非法 passive_wait_seconds={passive_wait_seconds!r}，保持 {old_passive_wait}")
+            if v2 == old_passive_wait:
+                passive_wait_status = 'unchanged'
+            else:
+                self._passive_wait_seconds = v2
+                passive_wait_status = 'changed'
+
         changed_lst = [s for s in (
             ratio_status, exclude_status, allow_status, deny_status,
             min_qty_status, min_not_status, rnd_en_status, rnd_ms_status,
+            passive_mode_status, passive_wait_status,
         ) if s == 'changed']
         changed = len(changed_lst) > 0
         if changed:
@@ -471,6 +539,8 @@ class PositionSyncManagerBase(CTdSpiBase):
                 f"min_not {old_min_not}->{self._min_notional} ({min_not_status})",
                 f"rnd_en {old_rnd_en}->{self._random_delay_enabled} ({rnd_en_status})",
                 f"rnd_ms {old_rnd_ms}->{self._random_delay_max_ms} ({rnd_ms_status})",
+                f"passive_mode {old_passive_mode}->{getattr(self, '_passive_mode', False)} ({passive_mode_status})",
+                f"passive_wait {old_passive_wait}->{getattr(self, '_passive_wait_seconds', 300)} ({passive_wait_status})",
             ]
             changed_lines = [ln for ln in lines if '(changed)' in ln]
             self.print(
@@ -487,6 +557,8 @@ class PositionSyncManagerBase(CTdSpiBase):
             'min_not': (self._min_notional, old_min_not, min_not_status),
             'rnd_en': (self._random_delay_enabled, old_rnd_en, rnd_en_status),
             'rnd_ms': (self._random_delay_max_ms, old_rnd_ms, rnd_ms_status),
+            'passive_mode': (getattr(self, '_passive_mode', False), old_passive_mode, passive_mode_status),
+            'passive_wait': (getattr(self, '_passive_wait_seconds', 300), old_passive_wait, passive_wait_status),
         }
 
     def _notify_async(self, text: str):

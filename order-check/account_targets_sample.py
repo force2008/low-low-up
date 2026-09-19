@@ -82,6 +82,26 @@
      语义：随机延迟上限（毫秒），random_delay_enabled=True 时生效。
      默认全局：3000（0~3 秒均匀随机）。
 
+  9) passive / passive_mode / enable_passive
+     语义：是否启用【被动挂单模式】（专为套利跟单账户设计，不主动吃单，用排队价挂单赚滑点）。
+     默认：0 / False（不启用，保持原 aggressive 主动吃单 + 30 秒撤单重挂逻辑）。
+     启用后行为：
+       · 定价：开仓、普通调仓平仓 全部走被动排队价
+           买开=买一 BidPrice1 排队；卖开=卖一 AskPrice1 排队；
+           多平=卖一 AskPrice1 排队；空平=买一 BidPrice1 排队。
+       · 撤单重挂：挂单后 passive_wait_seconds 秒内（默认 5 分钟）即使盘口价格偏离也**不撤单重挂**，
+           给足时间让排队价自然成交；
+           超过仍未成交 → 撤单 → 以「向对手盘方向进 1 tick」的新价重新排队挂，
+           每 passive_wait_seconds 秒一轮，逐档咬盘口直到成交。
+     不受影响的独立策略：
+       · exclude 品种退出平仓（is_exclude_exit）—— 永远用 aggressive 主动吃单（时间优先）；
+       · ratio==0 清仓模式（is_liquidate_mode）—— 永远用 passive 排队价（不急成交多赚滑点）。
+
+  10) passive_wait_seconds / passive_wait_sec / passive_timeout
+     语义：被动挂单模式下的「排队等待窗口」秒数。挂单后在此窗口内不撤单，让排队价自然成交；
+          超时仍未成交则逐档向对手盘进 1 tick 重挂。
+     默认：300（5 分钟），合法值 >= 10（小于 10 则兜底回默认 300 避免过短）。
+
   ------------------------------------------------------------------
   【反探单 4 层过滤执行顺序】（仅 ration != 0 时生效）：
      第 1 层 deny 品种黑名单 → 第 2 层 allow_level 主流通合约校验（非主流通 + 未达 100 万豁免 = 拦）
@@ -114,10 +134,19 @@
              "exclude": ["SC", "FG"],
              "allow_contract_level": ["main", "main2"],
              "deny": ["WR", "FB"],
-             "min_qty_hand": None,
-             "min_notional": None,
+             "min_qty_hand": 1,
+             "min_notional": 30000,
              "random_delay_enabled": False,
              "random_delay_max_ms": 2000},
+            #
+            # ===== 套利跟单账户 passive 模式示例（专为套利账户设计） =====
+            #   · passive=1：启用被动挂单模式，开仓/普通调仓平仓都用排队价，
+            #                挂单后 5 分钟（300 秒）内即使盘口偏离也不撤；
+            #                超过 5 分钟仍未成交 → 撤单 → 向对手盘方向进 1 tick 重挂，
+            #                每 5 分钟一轮，逐档咬盘口直到成交；
+            #   · passive_wait_seconds=300：5 分钟等待窗口（默认 300，可省略）。
+            # {"env_name": "online", "user_id": "ta001", "password": "xxx",
+            #  "ratio": 1, "passive": 1, "passive_wait_seconds": 300},
         ],
         # 最小化写法示例：只写 exclude + ratio，其余字段全走 run_pipeline.py 顶部全局默认
         "minimal_demo": [

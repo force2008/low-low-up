@@ -185,6 +185,9 @@ class PositionSyncManagerOrderOps:
                 "limit_price": limit_price,  # 保存委托价格，用于撤单重挂时对比价格变化
                 "pending_rejection": False,  # 标记是否收到拒绝（由回调设置）
                 "is_liquidate_mode": is_liquidate_mode,  # ratio==0 清仓模式标记：True=排队价，False=吃单价
+                # 跟单 passive 模式戳记：套利跟单账户 passive_mode=True 时提交的委托
+                # 撤单重挂逻辑据此判断 5 分钟内不撤、超时逐档进 1 tick 咬盘口
+                "is_passive_mode": bool(getattr(self, '_passive_mode', False)),
             }
 
         delay_s = self._maybe_random_delay_before_submit(exact_id, direction, volume)
@@ -598,6 +601,9 @@ class PositionSyncManagerOrderOps:
                     "replace_count": 0,
                     "from_ctp_sync": True,
                     "limit_price": o.get("LimitPrice", 0),  # 保存委托价格，用于撤单重挂时对比价格变化
+                    # 从 CTP 同步的历史委托：按当前 manager 的全局 passive_mode 兜底填充
+                    # passive_mode=True 时老的未成交也按被动模式处理（5 分钟窗口+逐档咬）
+                    "is_passive_mode": bool(getattr(self, '_passive_mode', False)),
                 }
                 existing_refs.add(key_ref)
                 synced += 1
@@ -683,6 +689,10 @@ class PositionSyncManagerOrderOps:
 
         # 检查每个委托（所有委托都检查，包括开仓和平仓）
         cancel_list = []
+        now_ts = time.time()
+        passive_wait = int(getattr(self, '_passive_wait_seconds', 300))
+        if passive_wait < 10:
+            passive_wait = 300
 
         for ref, info in pending_orders:
             contract = info.get("instr", "").upper()
@@ -693,6 +703,47 @@ class PositionSyncManagerOrderOps:
             last_price = info.get("limit_price", 0) or info.get("last_md_price", 0)
             direction = info.get("direction", "")
             offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+            is_passive_mode = bool(info.get("is_passive_mode", False))
+            submit_ts = info.get("submit_time", 0) or 0
+            elapsed = now_ts - submit_ts if submit_ts > 0 else float('inf')
+
+            # ------------------------------------------------------------------
+            # 分支 1：passive 模式订单（套利跟单账户，赚滑点优先）
+            #   · elapsed < passive_wait（默认 5 分钟内）：即使盘口偏离也不撤，让排队价自然成交
+            #   · elapsed >= passive_wait 仍未成交：触发撤单，并在 item 中打标，
+            #     _cancel_and_replace 会按「旧 passive 排队价 + 向对手盘方向进 1 tick」重挂，逐档咬盘口
+            # ------------------------------------------------------------------
+            if is_passive_mode:
+                if elapsed < passive_wait:
+                    # 5 分钟窗口内：即使价格偏离也跳过（给足排队时间自然成交）
+                    remain = int(max(0, passive_wait - elapsed))
+                    self.print(
+                        f"[监控-passive-等待] {contract} 挂单 {int(elapsed)}s < {passive_wait}s，"
+                        f"剩余 {remain}s 不撤单继续排队 @{last_price}"
+                    )
+                    continue
+                # 已超时：触发撤单，交给 _cancel_and_replace 做「向对手盘方向进 1 tick」重挂
+                replace_count = info.get("replace_count", 0)
+                if replace_count >= self.MAX_REPLACE_COUNT:
+                    self.print(f"[监控] {contract} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，跳过")
+                    continue
+                self.print(
+                    f"[监控-passive-超时] {contract} 挂单 {int(elapsed)}s >= {passive_wait}s 仍未成交，"
+                    f"撤单重挂（逐档向对手盘进 1 tick）"
+                )
+                cancel_list.append({
+                    "ref": ref,
+                    "info": info,
+                    "old_price": last_price,
+                    "new_price": last_price,  # 新价在 _cancel_and_replace 按进 1 tick 计算
+                    "is_passive_timeout_replace": True,
+                })
+                continue
+
+            # ------------------------------------------------------------------
+            # 分支 2：非 passive 模式订单（默认 aggressive，成交时间优先）
+            #   · 保持原有逻辑：价格偏离 1 price_tick 就撤单重挂（30 秒循环一次）
+            # ------------------------------------------------------------------
             # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
             # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
             use_passive_close = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
@@ -734,7 +785,7 @@ class PositionSyncManagerOrderOps:
 
         # 执行撤单和重挂
         if cancel_list:
-            self.print(f"[监控] 发现 {len(cancel_list)} 个委托价格变化，需要撤单重挂")
+            self.print(f"[监控] 发现 {len(cancel_list)} 个委托需要撤单重挂")
             for item in cancel_list:
                 self._cancel_and_replace(item, market_data_map)
 
@@ -747,7 +798,8 @@ class PositionSyncManagerOrderOps:
         offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
         volume = info.get("volume", 0)
         old_price = item["old_price"]
-        new_price = item["new_price"]
+        new_price = item.get("new_price", old_price)
+        is_passive_timeout_replace = bool(item.get("is_passive_timeout_replace", False))
 
         # 检查冷却机制：如果是平仓委托且在1009冷却期内，跳过重挂
         if offset_flag != tdapi.THOST_FTDC_OF_Open:
@@ -766,27 +818,77 @@ class PositionSyncManagerOrderOps:
             self.cancel_order(ref)
         time.sleep(0.5)
 
-        # 重新获取行情
+        # 获取 price_tick 与 最新盘口
+        info_obj = self._get_contract_info(contract.lower())
+        price_tick = float(info_obj.get("PriceTick", 1.0)) if info_obj else 1.0
         md = market_data_map.get(contract.upper())
-        if md:
-            # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
-            # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
-            use_passive_close = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
+
+        # 重新获取行情 & 计算重挂价
+        if is_passive_timeout_replace:
+            # ------------------------------------------------------------------
+            # passive 模式超时重挂：旧排队价 + 向对手盘方向进 1 tick（逐档咬盘口）
+            # 计算规则：
+            #   direction=buy（买方向：买开/买平）：
+            #       原挂的是买一 BidPrice1 排队 → 向对手 Ask 方向进 1 tick
+            #       → 新价 = old_price + price_tick
+            #       上限：不超过当前盘口卖一 AskPrice1（避免一步跨到涨停/太激进），但至少要加 1 tick
+            #   direction=sell（卖方向：卖开/卖平）：
+            #       原挂的是卖一 AskPrice1 排队 → 向对手 Bid 方向进 1 tick
+            #       → 新价 = old_price - price_tick
+            #       下限：不低于当前盘口买一 BidPrice1（避免一步跨到跌停/太激进），但至少要减 1 tick
+            # ------------------------------------------------------------------
             if direction == "buy":
-                if use_passive_close:
-                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                suggested = float(old_price) + price_tick
+                if md and float(md.get("AskPrice1", 0) or 0) > 0:
+                    cap = float(md["AskPrice1"])
+                    current_price = min(suggested, cap)
                 else:
-                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
-            else:
-                if use_passive_close:
-                    current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    current_price = suggested
+                self.print(
+                    f"[撤单重挂-passive-进1tick] {contract} 买方向："
+                    f"旧排队价 {old_price} → 向 Ask 进 1 tick @{price_tick} → 新价 {current_price}"
+                )
+            else:  # direction == "sell"
+                suggested = float(old_price) - price_tick
+                if md and float(md.get("BidPrice1", 0) or 0) > 0:
+                    floor = float(md["BidPrice1"])
+                    current_price = max(suggested, floor)
                 else:
-                    current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    current_price = suggested
+                self.print(
+                    f"[撤单重挂-passive-进1tick] {contract} 卖方向："
+                    f"旧排队价 {old_price} → 向 Bid 进 1 tick @{price_tick} → 新价 {current_price}"
+                )
+            # price_tick 精度对齐（避免浮点误差）
+            if price_tick > 0:
+                decimals = 0
+                try:
+                    s = f"{price_tick:.10f}".rstrip('0').rstrip('.')
+                    if '.' in s:
+                        decimals = len(s.split('.')[-1])
+                except Exception:
+                    decimals = 4
+                current_price = round(round(current_price / price_tick) * price_tick, decimals)
         else:
-            current_price = new_price
+            # 非 passive 超时：保持原逻辑，按最新盘口价重挂（aggressive 吃单价）
+            if md:
+                # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
+                # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
+                use_passive_close = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
+                if direction == "buy":
+                    if use_passive_close:
+                        current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                else:
+                    if use_passive_close:
+                        current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    else:
+                        current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+            else:
+                current_price = new_price
 
         # 获取交易所
-        info_obj = self._get_contract_info(contract.lower())
         if info_obj:
             exchange_id = info_obj.get("ExchangeID", exchange_id)
 
@@ -827,7 +929,9 @@ class PositionSyncManagerOrderOps:
                 f"合约: {contract}\n"
                 f"方向: {d}\n"
                 f"原价格: {old_price}\n"
-                f"新价格: {current_price}"
+                f"新价格: {current_price}\n"
+                f"手数: {volume} 手\n"
+                f"模式: {'passive-逐档进1tick' if is_passive_timeout_replace else '价格偏离修正'}"
             )
             self.print(f"[监控] {contract} 撤单重挂 @{current_price}")
         else:
