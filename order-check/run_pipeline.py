@@ -227,10 +227,10 @@ TRADING_SESSIONS = [
     ("21:00:15", "23:59:00"),    # 夜盘（跨午夜）
     ("00:00:15", "02:30:00"),    # 夜盘（跨午夜续）
 ]
-CHECK_INTERVAL = 20  # 秒（导出线程轮询间隔）
-# 注意：真正的同步冷却在 trading/position_sync/sync.py sync_and_trade() 里 SYNC_COOLDOWN=25 秒；
+CHECK_INTERVAL = 10  # 秒（导出线程轮询间隔）
+# 注意：真正的同步冷却在 trading/position_sync/sync.py sync_and_trade() 里 SYNC_COOLDOWN=15 秒；
 # 此处常量仅作注释参考，同步循环实际按 hold-std.json 文件变更事件触发（约 2 秒扫描一次）。
-SYNC_INTERVAL = 25    # 持仓同步冷却参考值（秒）
+SYNC_INTERVAL = 15    # 持仓同步冷却参考值（秒）
 
 # 持仓同步比例：1.0=全仓，0.5=半仓；可通过 --ratio 覆盖
 POSITION_RATIO = _POSITION_RATIO

@@ -73,10 +73,10 @@ class PositionSyncManagerSync:
         self.print(f"【持仓比例】{self._position_ratio}")
         self.print("=" * 60)
 
-        # 检查冷却期：上次同步后25秒内不再同步（避免CTP持仓数据滞后导致重复下单）
+        # 检查冷却期：上次同步后15秒内不再同步（避免CTP持仓数据滞后导致重复下单）
         current_time = time.time()
         last_sync = getattr(self, '_last_sync_time', 0)
-        SYNC_COOLDOWN = 25  # 25秒冷却
+        SYNC_COOLDOWN = 15  # 15秒冷却（加速对齐，减少滑点；若1009拒绝增多可调回20-25）
         if current_time - last_sync < SYNC_COOLDOWN:
             self.print(f"[跳过] 距离上次同步仅 {current_time - last_sync:.0f} 秒，冷却中（{SYNC_COOLDOWN}秒）")
             return False
