@@ -241,9 +241,21 @@ class PositionSyncManagerMarket:
         blocking=False 时若已有查询在进行则返回 None，避免竞态覆盖数据
         retries: 最大重试次数（默认2次）
         """
-        self.print("[持仓查询] 开始查询...")
+        _env = str(getattr(self, '_env_name', '') or '').strip() or None
+        _uid = str(getattr(self, '_user_id', '') or '').strip() or None
+        _bid = str(getattr(self, '_broker_id', '') or '').strip() or None
+        _prefix_parts = ["[持仓查询]"]
+        if _env:
+            _prefix_parts.append(f"[{_env}]")
+        if _uid:
+            _prefix_parts.append(f"[{_uid}]")
+        _prefix = "".join(_prefix_parts)
+        _acc_tag = (
+            f"(BrokerID={_bid}, InvestorID={_uid})" if (_bid or _uid) else ""
+        )
+        self.print(f"{_prefix} 开始查询... {_acc_tag}".rstrip())
         if not blocking and self._pos_query_lock.locked():
-            self.print("[持仓查询] 已有查询在进行中，跳过本次")
+            self.print(f"{_prefix} 已有查询在进行中，跳过本次 {_acc_tag}".rstrip())
             return None
 
         with self._pos_query_lock:
@@ -253,17 +265,17 @@ class PositionSyncManagerMarket:
                 req = tdapi.CThostFtdcQryInvestorPositionField()
                 req.BrokerID = self._broker_id
                 req.InvestorID = self._user_id
-                self.print(f"[持仓查询] 发送请求，attempt={attempt + 1}/{retries + 1}")
+                self.print(f"{_prefix} 发送请求，attempt={attempt + 1}/{retries + 1} {_acc_tag}".rstrip())
                 self._api.ReqQryInvestorPosition(req, 0)
                 ok = self._pos_query_event.wait(timeout=timeout)
                 if ok:
-                    self.print(f"[持仓查询] 成功，返回 {len(self._actual_positions)} 条记录")
+                    self.print(f"{_prefix} 成功，返回 {len(self._actual_positions)} 条记录 {_acc_tag}".rstrip())
                     self._reset_query_health()
                     return list(self._actual_positions)
                 if attempt < retries:
-                    self.print(f"[警告] 持仓查询超时，第 {attempt + 1} 次重试...")
+                    self.print(f"[警告] {_prefix} 持仓查询超时，第 {attempt + 1} 次重试... {_acc_tag}".rstrip())
                     time.sleep(1)
-            self.print(f"[错误] 持仓查询连续 {retries + 1} 次超时，返回 None")
+            self.print(f"[错误] {_prefix} 连续 {retries + 1} 次超时，返回 None {_acc_tag}".rstrip())
             self._on_query_timeout(source="持仓查询")
             return None
 

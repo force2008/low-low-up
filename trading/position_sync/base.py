@@ -1787,13 +1787,37 @@ class PositionSyncManagerBase(CTdSpiBase):
                 all_total_actual = sum(a for a in actual_agg.values())
 
                 if total_target != total_actual:
+                    # 逐合约方向列出手数差：diff = 标准 - 实际（负数=实际比标准多，正数=实际比标准少 缺额）
+                    # 先统计「可交易合约」的差异：与上面 total_target/total_actual 口径对齐
+                    diff_lines = []
+                    all_keys = set(target.keys()) | set(actual_agg.keys())
+                    for key in sorted(all_keys, key=lambda k: (str(k[0]).upper(), int(k[1]) if isinstance(k, tuple) and len(k) >= 2 else 0)):
+                        if not (isinstance(key, tuple) and len(key) >= 2):
+                            continue
+                        contract, direction = key
+                        if str(contract).upper() in non_trading_contracts:
+                            continue
+                        t_vol = int(target.get(key, 0) or 0)
+                        a_vol = int(actual_agg.get(key, 0) or 0)
+                        diff = int(t_vol - a_vol)
+                        if diff == 0:
+                            continue
+                        d_tag = "买" if direction == 2 else "卖"
+                        diff_lines.append(f"  {contract} {d_tag}: 标准{t_vol} 实际{a_vol} 差{diff:+d}手")
+                    diff_preview = ""
+                    if diff_lines:
+                        MAX_SHOW = 15
+                        shown = diff_lines[:MAX_SHOW]
+                        rest = len(diff_lines) - MAX_SHOW
+                        shown.append(f"  ... 共 {len(diff_lines)} 个合约有差异" if rest > 0 else f"  共 {len(diff_lines)} 个合约有差异")
+                        diff_preview = "\n差异明细（可交易，diff=标准-实际，+缺/-超）:\n" + "\n".join(shown)
                     self._notify_async(
                         f"⚠️ {monitor_tag}\n"
                         f"可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手\n"
                         f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手\n"
-                        f"状态: 手数不一致 ⚠️"
+                        f"状态: 手数不一致 ⚠️{diff_preview}"
                     )
-                    self.print(f"[监控] {monitor_tag}: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual})")
+                    self.print(f"[监控] {monitor_tag}: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual}，差异合约数={len(diff_lines)})")
                 else:
                     lines = [
                         f"✅ {monitor_tag}",

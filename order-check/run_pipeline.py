@@ -1330,7 +1330,16 @@ def export_loop():
                 break
 
             # ------ 交易时段判断：只在交易时段/跳过时段时真正执行导出 ------
-            in_session = is_in_trading_time() or SKIP_TRADING_TIME_CHECK
+            # 7x24 / simu 环境、--force、--skip-time-check 任一成立就当做在交易时段，
+            # 允许非开盘时间（周末/节假日/夜间）正常导出 hold-std + 对比 + 生成报表，
+            # 不再进入 else 分支打印「距离下次开盘 X 分 Y 秒」，也不再触发 L1366 时段结束强制退出。
+            _env_low = str(_CTP_ENV_NAME or "").lower().strip()
+            in_session = (
+                bool(is_in_trading_time())
+                or bool(SKIP_TRADING_TIME_CHECK)
+                or bool(_FORCE_RUN)
+                or (_env_low in ("simu", "7x24"))
+            )
             run_start_ts = time.time()
             next_run_at = run_start_ts + CHECK_INTERVAL  # 严格按“启动时刻 + 间隔”推进下一次
             # 本轮执行完立刻预写下一次启动时间：哪怕 run_once 异常退出，节奏也不漂移。

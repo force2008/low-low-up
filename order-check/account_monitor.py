@@ -388,6 +388,21 @@ if _FORCE_RUN:
     print("[提示] 强制运行模式，即使非交易日也会执行")
 
 
+# 解析运行环境：argv[1] or CTP_ENV（7x24/simu → 所有时段判断全部跳过，和 online 实盘隔离）
+def _get_account_monitor_env():
+    env = None
+    if len(sys.argv) > 1 and str(sys.argv[1]).lower() in ("online", "simu", "7x24"):
+        env = str(sys.argv[1]).lower()
+    if not env:
+        env = str(os.getenv("CTP_ENV") or "").lower() or "online"
+    return env.strip().lower()
+
+
+_ACCOUNT_MONITOR_ENV = _get_account_monitor_env()
+# 统一兜（--force / 7x24 / simu 任一成立 → 跳过交易时段判断 + 段结束时间判断，7x24 小时可运行）
+_SKIP_TRADING_CHECK = bool(_FORCE_RUN) or (_ACCOUNT_MONITOR_ENV in ("simu", "7x24"))
+
+
 def _is_trading_day():
     """检查今天是否为交易日"""
     today = datetime.date.today().isoformat()
@@ -446,8 +461,9 @@ def main():
             now = datetime.datetime.now()
             now_time = now.time()
 
-            # 检查是否超过时段结束时间
-            if is_after_session_end(now_time, _RESPONSIBLE_SESSION_END):
+            # 检查是否超过时段结束时间（7x24/simu/--force 模式跳过，允许非交易时段持续运行）
+            _need_exit_session_end = bool(is_after_session_end(now_time, _RESPONSIBLE_SESSION_END)) and not _SKIP_TRADING_CHECK
+            if _need_exit_session_end:
                 logger.info("[主循环] 已到达时段结束时间 %s，准备退出", _RESPONSIBLE_SESSION_END)
 
                 # 夜盘结束，清理文件
@@ -462,8 +478,9 @@ def main():
 
                 break
 
-            # 检查是否在交易时间
-            if is_in_trading_time():
+            # 检查是否在交易时间（7x24/simu/--force 模式也当做交易时段，正常导出）
+            _in_trading = bool(is_in_trading_time()) or _SKIP_TRADING_CHECK
+            if _in_trading:
                 current_time = time.time()
 
                 # 检查是否需要执行导出
