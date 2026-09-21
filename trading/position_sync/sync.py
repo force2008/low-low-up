@@ -1072,7 +1072,16 @@ class PositionSyncManagerSync:
                     exact = self._standardize_contract(contract)
                     _dir = "买" if mo.get("direction") == "buy" else "卖"
                     _vol = mo.get("volume", 0)
-                    self.print(f"[开跳过] {contract}({exact}) {_dir}{_vol}手: 第一阶段行情查询失败，已尝试：1) prefer_cached=True 再查 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；仍空 => 启动后从未收到过此合约 tick，建议确认合约是否正确/行情前置是否订阅到该合约")
+                    # 当前轮拿不到 md 就立刻启动一个后台异步 MdApi 订阅线程（不阻塞本轮同步主流程）
+                    # 后台线程长等 60s 拿首 tick，回填缓存后下一轮 sync/巡检直接命中 prefer_cached + 永久已知价
+                    _async_submitted = False
+                    try:
+                        if hasattr(self, 'submit_async_market_fetch'):
+                            _async_submitted = bool(self.submit_async_market_fetch(contract))
+                    except Exception:
+                        _async_submitted = False
+                    _async_tag = "；已启动后台异步行情回填订阅，下一轮同步时命中缓存" if _async_submitted else ""
+                    self.print(f"[开跳过] {contract}({exact}) {_dir}{_vol}手: 第一阶段行情查询失败，已尝试：1) prefer_cached=True 再查 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；仍空 => 启动后从未收到过此合约 tick，建议确认合约是否正确/行情前置是否订阅到该合约{_async_tag}")
                     skip_open[0] += 1
                     continue
                 elif _open_cache_fallback:
@@ -1392,8 +1401,17 @@ class PositionSyncManagerSync:
                 if not md:
                     if eo.get("is_exclude_exit"):
                         self.print(f"[exclude-退出] {contract} 无行情，跳过退出平仓（下次同步重试）")
+                    # 当前轮拿不到 md 就立刻启动一个后台异步 MdApi 订阅线程（不阻塞本轮同步主流程）
+                    # 后台线程长等 60s 拿首 tick，回填缓存后下一轮 sync/巡检直接命中 prefer_cached + 永久已知价
+                    _async_sub_close = False
+                    try:
+                        if hasattr(self, 'submit_async_market_fetch'):
+                            _async_sub_close = bool(self.submit_async_market_fetch(contract))
+                    except Exception:
+                        _async_sub_close = False
+                    _async_tg = "；已启动后台异步行情回填订阅，下一轮同步时命中缓存" if _async_sub_close else ""
                     _sk_reason = ("第一阶段行情查询未返回，已尝试：1) prefer_cached=True 再查一次 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；"
-                                  "仍空 => 启动后从未收到过此合约 tick，请确认合约是否正确/行情前置是否有此合约（可能真的非主力或映射错）")
+                                  "仍空 => 启动后从未收到过此合约 tick，请确认合约是否正确/行情前置是否有此合约（可能真的非主力或映射错）%s" % _async_tg)
                     _tag_dir = "多" if pos_dir == 2 else "空"
                     self.print("[平跳过] %s %s %s手: %s" % (contract, _tag_dir, eo_volume, _sk_reason))
                     skip_close[0] += 1

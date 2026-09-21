@@ -26,6 +26,136 @@ from ctp.base_tdapi import tdapi
 class PositionSyncManagerMarket:
     """持仓同步管理器 - 行情持仓查询部分"""
 
+    # ==============================
+    # 后台异步行情回填订阅（MdApi）
+    # ==============================
+    # 前 4 层兜（首阶段map / prefer_cached / 原始缓存 / 永久已知价）全空时，
+    # 不阻塞本轮同步主流程，直接起 daemon 线程后台订阅 MdApi 长等 60s，
+    # 只要收到首 tick 就回填 md_provider._quotes 和 _last_known_prices，
+    # 下一轮 sync/巡检直接命中 prefer_cached / 永久已知价。
+    # 用集合 + 双检去重，避免每轮每个合约都起新线程（15s 巡检×38 合约会炸线程数）。
+    _async_fetch_lock = threading.RLock()
+    _async_fetch_running = None  # Dict[str, float]，key=contract_upper，value=启动时间戳
+
+    def submit_async_market_fetch(self, instrument_id: str) -> bool:
+        """给指定合约提交一个「后台异步 MdApi 行情回填订阅任务」。
+        去重：同一合约如果已经在跑（<15 分钟）就不重复启动，返回 True=提交或已在跑。
+        """
+        try:
+            if not instrument_id:
+                return False
+            inst_key = str(self._standardize_contract(instrument_id) or instrument_id).strip().upper()
+            if not inst_key:
+                return False
+            # 懒初始化
+            if PositionSyncManagerMarket._async_fetch_running is None:
+                with PositionSyncManagerMarket._async_fetch_lock:
+                    if PositionSyncManagerMarket._async_fetch_running is None:
+                        PositionSyncManagerMarket._async_fetch_running = {}
+            now = time.time()
+            # 双检去重：15 分钟内已经起过就不再起
+            last_ts = 0.0
+            with PositionSyncManagerMarket._async_fetch_lock:
+                last_ts = float(PositionSyncManagerMarket._async_fetch_running.get(inst_key, 0.0) or 0.0)
+            if 0 < now - last_ts < 900.0:
+                return True
+            with PositionSyncManagerMarket._async_fetch_lock:
+                _cur = float(PositionSyncManagerMarket._async_fetch_running.get(inst_key, 0.0) or 0.0)
+                if 0 < now - _cur < 900.0:
+                    return True
+                PositionSyncManagerMarket._async_fetch_running[inst_key] = now
+            try:
+                t = threading.Thread(
+                    target=self._async_market_fetch_worker,
+                    args=(inst_key, instrument_id,),
+                    name=f"async-md-{inst_key}",
+                    daemon=True,
+                )
+                t.start()
+                return True
+            except Exception as e:
+                self.print(f"[警告] 启动后台异步行情回填线程失败: {inst_key}, err={e}")
+                with PositionSyncManagerMarket._async_fetch_lock:
+                    PositionSyncManagerMarket._async_fetch_running.pop(inst_key, None)
+                return False
+        except Exception:
+            return False
+
+    def _async_market_fetch_worker(self, inst_key: str, original_contract: str):
+        """后台线程：MdApi 订阅单合约，长等 60 秒拿首 tick，回填两个缓存；任何异常静默吞掉，不影响主流程。"""
+        try:
+            self.print(f"[信息][后台行情回填] 启动后台 MdApi 订阅回填: {inst_key}")
+            md_provider = getattr(self, "_md_provider", None)
+            md = None
+            if md_provider is not None:
+                try:
+                    # 第 1 轮：subscribe_many + 60s 长等（prefer_cached=False 强制等新 tick，不用历史缓存，
+                    # 因为历史缓存如果有值前面 prefer_cached=True 那层早命中了，不会走到这里）
+                    md_provider.subscribe_many([original_contract, inst_key])
+                    md = md_provider.get_quote(inst_key, timeout=60.0, prefer_cached=False, auto_subscribe=True)
+                    if not md:
+                        md = md_provider.get_quote(original_contract, timeout=1.0, prefer_cached=False, auto_subscribe=True)
+                    if not md:
+                        try:
+                            _kk = str(inst_key).strip().upper()
+                            with md_provider._quotes_lock:
+                                _dd = md_provider._quotes.get(_kk)
+                            if _dd:
+                                md = dict(_dd)
+                        except Exception:
+                            md = None
+                except Exception as e:
+                    self.print(f"[警告][后台行情回填] {inst_key} get_quote 异常: {e}")
+                    md = None
+            else:
+                # 老环境没起 md_provider 时，fallback 到 self.query_market_data(TD)
+                try:
+                    md = self.query_market_data(original_contract, timeout=60, max_retries=1, prefer_cached=False)
+                except Exception:
+                    md = None
+            if not md:
+                self.print(f"[警告][后台行情回填] {inst_key} 60 秒仍未收到首 tick，本次回填放弃（下次同步会重新尝试，若合约正确请确认行情前置/订阅权限）")
+                return
+            # 回填 1：md_provider._quotes 原始缓存（下一轮 sync 的第 2/3 层兜直接命中）
+            _final_key = inst_key
+            try:
+                _final_key = str(md.get("InstrumentID") or original_contract or inst_key).strip().upper() or inst_key
+            except Exception:
+                _final_key = inst_key
+            if md_provider is not None:
+                try:
+                    with md_provider._quotes_lock:
+                        md_provider._quotes[_final_key] = dict(md)
+                except Exception:
+                    pass
+            # 回填 2：_last_known_prices 永久已知价（第 4 层兜命中 + shutdown 刷盘跨时段）
+            try:
+                def _f(x):
+                    try:
+                        fv = float(x); return fv if (fv > 0 and __import__("math").isfinite(fv) and fv < 1e9) else 0.0
+                    except Exception:
+                        return 0.0
+                _lp = _f(md.get("LastPrice"))
+                _bp = _f(md.get("BidPrice1"))
+                _ap = _f(md.get("AskPrice1"))
+                if hasattr(self, "_update_last_known_prices"):
+                    _ok = self._update_last_known_prices(
+                        _final_key,
+                        last_price=_lp,
+                        bid_price1=_bp,
+                        ask_price1=_ap,
+                        ts=time.time(),
+                    )
+                    if _ok:
+                        self.print(f"[信息][后台行情回填] {_final_key} 成功回填：Last={_lp or 'N/A'} Bid={_bp or 'N/A'} Ask={_ap or 'N/A'}，下一轮同步直接命中缓存")
+            except Exception as e:
+                self.print(f"[警告][后台行情回填] {_final_key} 回填永久已知价失败: {e}")
+        except Exception as e:
+            self.print(f"[警告][后台行情回填] {inst_key} 线程异常退出: {e}")
+        finally:
+            # 跑过就清一下「正在跑」标记，但保留「15 分钟内不重跑」逻辑（用 now - ts < 900 自然过期，避免 pop 导致马上又重起）
+            pass
+
     def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2, prefer_cached: bool = True) -> Optional[dict]:
         """获取合约行情快照，统一通过行情 API（MdApi）订阅获取。
 
