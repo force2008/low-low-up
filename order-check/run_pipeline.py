@@ -1021,6 +1021,7 @@ def run_sync(source_account=None):
         MAIN_CONTRACTS_PATH = os.path.join(PROJECT_ROOT, 'data', 'contracts', 'main_contracts.json')
 
         logger.info(">>> 开始持仓对比与同步...")
+        _skip_time = bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN) or (str(_CTP_ENV_NAME).lower() in ("simu", "7x24"))
         sync_ok = run_position_sync(
             hold_std_path=hold_std_path,
             main_contracts_path=MAIN_CONTRACTS_PATH,
@@ -1030,6 +1031,7 @@ def run_sync(source_account=None):
             conf=None,
             env_name=_CTP_ENV_NAME,
             position_ratio=POSITION_RATIO,
+            skip_trading_time_check=_skip_time,
         )
         logger.info(">>> 持仓同步返回: sync_ok=%s", sync_ok)
         _last_sync_time[0] = time.time()
@@ -1142,6 +1144,7 @@ def force_sync():
         total = len(sync_tasks)
         for idx, (src_account, hold_std_path, ratio, env_label, conf, user_id) in enumerate(sync_tasks):
             logger.info("[强制同步] (%d/%d) 开始: %s -> %s", idx + 1, total, src_account, user_id)
+            _skip_time_f = bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN) or (str(env_label).lower() in ("simu", "7x24"))
             sync_ok = run_position_sync(
                 hold_std_path=hold_std_path,
                 main_contracts_path=MAIN_CONTRACTS_PATH,
@@ -1151,6 +1154,7 @@ def force_sync():
                 env_name=env_label,
                 logger=logger,
                 position_ratio=ratio,
+                skip_trading_time_check=_skip_time_f,
             )
             if not sync_ok:
                 all_ok = False
@@ -1558,6 +1562,7 @@ def main():
 
             from trading.position_sync.position_sync_manager import run_position_sync_loop
 
+            _skip_time_loop = bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN) or (str(env_label).lower() in ("simu", "7x24"))
             run_position_sync_loop(
                 hold_std_path=hold_std_path,
                 main_contracts_path=MAIN_CONTRACTS_PATH,
@@ -1584,6 +1589,7 @@ def main():
                 target_user_id=user_id,
                 # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude, ...)
                 runtime_config_resolver=_resolve_latest_target_config,
+                skip_trading_time_check=_skip_time_loop,
             )
         except Exception as e:
             logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)

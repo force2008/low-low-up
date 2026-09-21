@@ -84,6 +84,8 @@ def run_position_sync(
     main_by_product_path: str = None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
+    skip_trading_time_check: bool = False,
 ) -> bool:
     """便捷函数：单次运行持仓同步（同步方式）"""
     mgr = None
@@ -99,6 +101,7 @@ def run_position_sync(
         if deny_products:
             print(f"  deny_products={sorted(deny_products)}")
         print(f"  passive_mode={passive_mode}, passive_wait_seconds={passive_wait_seconds}s")
+        print(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式建议=True）")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
             main_contracts_path=main_contracts_path,
@@ -116,6 +119,7 @@ def run_position_sync(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            skip_trading_time_check=skip_trading_time_check,
         )
         if logger:
             mgr.set_logger(logger)
@@ -164,6 +168,8 @@ def run_position_sync_loop(
     runtime_config_resolver=None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
+    skip_trading_time_check: bool = False,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -236,6 +242,7 @@ def run_position_sync_loop(
             _log(f"  min_notional={min_notional}")
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
+        _log(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式=True，非开盘时间仍允许对齐和提交委托）")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -254,6 +261,7 @@ def run_position_sync_loop(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            skip_trading_time_check=skip_trading_time_check,
         )
         if logger:
             mgr.set_logger(logger)

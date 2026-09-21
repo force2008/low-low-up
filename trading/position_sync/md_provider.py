@@ -222,13 +222,14 @@ class MdQuoteProvider(CMdSpiBase):
         except Exception as e:
             self.print(f"[MdQuoteProvider] 批量订阅异常: {e}")
 
-    def get_quote(self, instrument_id: str, timeout: float = 3.0, auto_subscribe: bool = True) -> Optional[dict]:
+    def get_quote(self, instrument_id: str, timeout: float = 3.0, auto_subscribe: bool = True, prefer_cached: bool = True) -> Optional[dict]:
         """获取指定合约的最新行情快照
 
         Args:
             instrument_id: 合约代码（大小写不敏感，内部统一按 CTP 返回处理）
-            timeout: 等待首次 tick 的最大秒数
+            timeout: 等待首次 tick 的最大秒数（仅在没有缓存时生效）
             auto_subscribe: 是否在获取前自动订阅（批量查询时可设为 False）
+            prefer_cached: True=如果已有历史缓存直接返回，不等最新 tick（次主力稀疏 tick 场景默认 True）
 
         Returns:
             dict 或 None
@@ -242,6 +243,17 @@ class MdQuoteProvider(CMdSpiBase):
             self.subscribe(instrument_id)
 
         key = instrument_id.strip().upper()
+
+        # 次主力/冷门合约 tick 非常稀疏（可能 30 秒以上才一笔）。
+        # 平仓定价、对齐调仓等场景对 1tick 误差不敏感，
+        # 默认 prefer_cached=True：只要缓存里有就直接返回历史值，不阻塞等最新。
+        if prefer_cached:
+            with self._quotes_lock:
+                data = self._quotes.get(key)
+                if data:
+                    return dict(data)
+
+        # 只有明确要求 prefer_cached=False 或缓存确实空时才等最新 tick
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._quotes_lock:
@@ -250,7 +262,7 @@ class MdQuoteProvider(CMdSpiBase):
                     return dict(data)
             time.sleep(0.1)
 
-        # 超时后再查一次缓存
+        # 超时后再查一次缓存（兜底）
         with self._quotes_lock:
             data = self._quotes.get(key)
             if data:

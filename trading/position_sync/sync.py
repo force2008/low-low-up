@@ -653,13 +653,19 @@ class PositionSyncManagerSync:
                     self.print(f"[pending_map] {pm_key[0]} {'多' if pm_key[1] == 2 else '空'} 开仓 {pm_vol} 手")
 
             # 9. 过滤当前非交易时段的合约
+            # 7x24 / simu / --force / --skip-time-check 模式下（_skip_trading_time_check=True）整段跳过，
+            # 不调用 get_contracts_trading_status，不丢合约，非开盘时间也能对齐+提交。
             all_contracts = set(contract for contract, _ in set(target.keys()) | set(effective_actual.keys()))
-            trading_status = get_contracts_trading_status(list(all_contracts))
             non_trading_contracts = set()
-            for contract in all_contracts:
-                if not trading_status.get(contract, False):
-                    non_trading_contracts.add(contract.upper())
-                    self.print(f"[非交易时段] {contract} 当前不可交易，跳过对齐")
+            if not bool(getattr(self, '_skip_trading_time_check', False)):
+                trading_status = get_contracts_trading_status(list(all_contracts))
+                for contract in all_contracts:
+                    if not trading_status.get(contract, False):
+                        non_trading_contracts.add(contract.upper())
+                        self.print(f"[非交易时段] {contract} 当前不可交易，跳过对齐")
+            else:
+                if all_contracts:
+                    self.print(f"[信息] _skip_trading_time_check=True：跳过交易时段过滤（7x24/simu/--force），共 {len(all_contracts)} 个合约全部参与对齐")
 
             # 10. 计算缺额/超额
             missing_orders = []
@@ -950,6 +956,23 @@ class PositionSyncManagerSync:
                 if md:
                     with md_lock:
                         market_data_map[contract] = md
+                    # ---------- 关键：拿到行情后立刻写入永久已知价缓存（磁盘持久化 + 异步刷盘）----------
+                    # 次主力合约（SM701 等）30+ 分钟才一笔 tick，
+                    # 只要曾经拿到过一次，以后就算 md_provider 超时也能在 4 层兜底第 4 层命中。
+                    # 封装到 base.py 的 _update_last_known_prices：
+                    #   - 内置 _last_known_prices_lock（RLock 重入锁，并发查询多线程写入安全）
+                    #   - 变更后立刻 daemon 线程写 tmp + replace 原子刷盘
+                    #   - 任何异常全吞，不影响行情查询主流程。
+                    try:
+                        self._update_last_known_prices(
+                            contract=contract,
+                            last_price=md.get("LastPrice"),
+                            bid_price1=md.get("BidPrice1"),
+                            ask_price1=md.get("AskPrice1"),
+                            ts=time.time(),
+                        )
+                    except Exception:
+                        pass
 
         # 并行查询（每批8个）
         MAX_WORKERS = 8
@@ -987,11 +1010,75 @@ class PositionSyncManagerSync:
                     skip_open[0] += 1
                     continue
                 md = market_data_map.get(contract)
+                _open_cache_fallback = False
+                _open_lk_fallback = False
+                _open_lk_ts = ""
+                if not md:
+                    # 与平仓阶段相同的双兜底：首阶段没收到首 tick 时，再走一次 prefer_cached=True 查历史缓存
+                    # （开仓用的是标准仓里的新合约，首次订阅后首 tick 可能晚几秒/几十秒到）
+                    _md_provider = getattr(self, '_md_provider', None)
+                    if _md_provider is not None:
+                        try:
+                            md = _md_provider.get_quote(contract, timeout=3.0, auto_subscribe=True, prefer_cached=True)
+                        except Exception:
+                            md = None
+                    if not md and _md_provider is not None:
+                        try:
+                            _k = str(contract).strip().upper()
+                            with _md_provider._quotes_lock:
+                                _d = _md_provider._quotes.get(_k)
+                            if _d:
+                                md = dict(_d)
+                                _open_cache_fallback = True
+                        except Exception:
+                            md = None
+                    # ---------- 开仓阶段第 4 层兜底：永久已知价缓存 ----------
+                    # 注意：开仓如果完全没有历史行情数据，宁可跳过（避免开错价）；
+                    # 但如果历史上曾经拿到过一次行情（_last_known_prices 有），哪怕是老的也用，避免永久开不出来。
+                    if not md:
+                        try:
+                            _k2 = str(contract).strip().upper()
+                            _lkt = getattr(self, '_last_known_prices', None) or {}
+                            _lk = _lkt.get(_k2)
+                            if _lk and isinstance(_lk, dict):
+                                def _ok2(x):
+                                    try:
+                                        fv = float(x); return math.isfinite(fv) and 0 < fv < 1e9
+                                    except Exception:
+                                        return False
+                                lp_ok = _ok2(_lk.get("LastPrice"))
+                                b1_ok = _ok2(_lk.get("BidPrice1"))
+                                a1_ok = _ok2(_lk.get("AskPrice1"))
+                                if lp_ok or b1_ok or a1_ok:
+                                    base = float(_lk.get("LastPrice")) if lp_ok else (float(_lk.get("BidPrice1")) if b1_ok else float(_lk.get("AskPrice1")))
+                                    md = {
+                                        "InstrumentID": contract,
+                                        "LastPrice": base,
+                                        "BidPrice1": float(_lk.get("BidPrice1")) if b1_ok else base,
+                                        "AskPrice1": float(_lk.get("AskPrice1")) if a1_ok else base,
+                                    }
+                                    _open_lk_fallback = True
+                                    try:
+                                        import datetime as _dt_lk2
+                                        _t = float(_lk.get("_ts", 0) or 0)
+                                        if _t > 0:
+                                            _open_lk_ts = ", 缓存时间=" + _dt_lk2.datetime.fromtimestamp(_t).strftime("%H:%M:%S")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            md = None
+                            _open_lk_fallback = False
                 if not md:
                     exact = self._standardize_contract(contract)
-                    self.print(f"[开] {contract}({exact}) 无行情，跳过")
+                    _dir = "买" if mo.get("direction") == "buy" else "卖"
+                    _vol = mo.get("volume", 0)
+                    self.print(f"[开跳过] {contract}({exact}) {_dir}{_vol}手: 第一阶段行情查询失败，已尝试：1) prefer_cached=True 再查 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；仍空 => 启动后从未收到过此合约 tick，建议确认合约是否正确/行情前置是否订阅到该合约")
                     skip_open[0] += 1
                     continue
+                elif _open_cache_fallback:
+                    self.print(f"[信息] {contract} 使用 md_provider._quotes 历史缓存行情定价（次主力/新合约首tick未达，历史价可用）")
+                elif _open_lk_fallback:
+                    self.print(f"[信息] {contract} 使用 _last_known_prices 永久已知价定价（md_provider未返回新 tick%s）" % _open_lk_ts)
 
                 # 检查在途委托
                 mo_upper = contract.upper()
@@ -1213,6 +1300,7 @@ class PositionSyncManagerSync:
                 contract = eo["contract"]
                 pos_dir = eo["direction"]
                 eo_volume = eo["volume"]  # 保存原始计划数量
+                _sk_reason = ""
 
                 # 检查该合约+方向是否已有成功的平仓委托在处理中
                 # （避免重复提交导致 1009）
@@ -1232,23 +1320,98 @@ class PositionSyncManagerSync:
                 if pending_close_ref:
                     # 有平仓委托在途，等待30秒检查循环处理
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    _sk_reason = "已有平仓委托在途"
                     self.print(f"{tag} {contract} 已有平仓委托在途，等待30秒检查循环处理")
                     skip_close[0] += 1
                     time.sleep(0.2)
+                    if _sk_reason:
+                        self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     continue
 
                 md = market_data_map.get(contract)
+                _cache_hard_fallback = False
+                _last_known_fallback = False
+                _lk_ts_str = ""
+                if not md:
+                    # 次主力合约（SM701 等）tick 非常稀疏，首阶段 query_market_data 时没收到最新 tick，但
+                    # 可能在前面批量订阅后已经入缓存、或上一轮/上一次同步时缓存过历史 tick。
+                    # 优先再试一次 prefer_cached=True 的查询，再不行去 md_provider._quotes 原始缓存里拿。
+                    _md_provider = getattr(self, '_md_provider', None)
+                    if _md_provider is not None:
+                        try:
+                            md = _md_provider.get_quote(contract, timeout=3.0, auto_subscribe=True, prefer_cached=True)
+                        except Exception:
+                            md = None
+                    if not md and _md_provider is not None:
+                        try:
+                            _k = str(contract).strip().upper()
+                            with _md_provider._quotes_lock:
+                                _d = _md_provider._quotes.get(_k)
+                            if _d:
+                                md = dict(_d)
+                                _cache_hard_fallback = True
+                        except Exception:
+                            md = None
+                    # ---------- 第 4 层兜底：永久已知价缓存 ----------
+                    # 上三层（market_data_map / prefer_cached / 原始缓存）都空，
+                    # 但「历史上曾经拿到过一次行情」的话，_last_known_prices 里会存着一份。
+                    # 对次主力平仓场景，哪怕是 30 分钟前的价，也比永久平不掉强。
+                    if not md:
+                        try:
+                            _k2 = str(contract).strip().upper()
+                            _lkt = getattr(self, '_last_known_prices', None) or {}
+                            _lk = _lkt.get(_k2)
+                            if _lk and isinstance(_lk, dict):
+                                def _ok(x):
+                                    try:
+                                        fv = float(x); return math.isfinite(fv) and 0 < fv < 1e9
+                                    except Exception:
+                                        return False
+                                lp_ok = _ok(_lk.get("LastPrice"))
+                                b1_ok = _ok(_lk.get("BidPrice1"))
+                                a1_ok = _ok(_lk.get("AskPrice1"))
+                                if lp_ok or b1_ok or a1_ok:
+                                    base = float(_lk.get("LastPrice")) if lp_ok else (float(_lk.get("BidPrice1")) if b1_ok else float(_lk.get("AskPrice1")))
+                                    md = {
+                                        "InstrumentID": contract,
+                                        "LastPrice": base,
+                                        "BidPrice1": float(_lk.get("BidPrice1")) if b1_ok else base,
+                                        "AskPrice1": float(_lk.get("AskPrice1")) if a1_ok else base,
+                                    }
+                                    _last_known_fallback = True
+                                    try:
+                                        import datetime as _dt_lk
+                                        _t = float(_lk.get("_ts", 0) or 0)
+                                        if _t > 0:
+                                            _lk_ts_str = ", 缓存时间=" + _dt_lk.datetime.fromtimestamp(_t).strftime("%H:%M:%S")
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            md = None
+                            _last_known_fallback = False
                 if not md:
                     if eo.get("is_exclude_exit"):
                         self.print(f"[exclude-退出] {contract} 无行情，跳过退出平仓（下次同步重试）")
+                    _sk_reason = ("第一阶段行情查询未返回，已尝试：1) prefer_cached=True 再查一次 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；"
+                                  "仍空 => 启动后从未收到过此合约 tick，请确认合约是否正确/行情前置是否有此合约（可能真的非主力或映射错）")
+                    _tag_dir = "多" if pos_dir == 2 else "空"
+                    self.print("[平跳过] %s %s %s手: %s" % (contract, _tag_dir, eo_volume, _sk_reason))
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
+                elif _cache_hard_fallback:
+                    self.print("[信息] %s 使用 md_provider._quotes 历史缓存行情定价（次主力无最新 tick，历史价仍可用）。" % contract)
+                elif _last_known_fallback:
+                    self.print("[信息] %s 使用 _last_known_prices 永久已知价定价（md_provider未返回新tick%s）。" % (contract, _lk_ts_str))
 
                 detail = self._get_position_detail(contract, pos_dir)
-                if detail.get("Position", 0) <= 0:
+                _det_pos = detail.get("Position", 0) if detail else 0
+                if _det_pos <= 0:
                     if eo.get("is_exclude_exit"):
                         self.print(f"[exclude-退出] {contract} 实际持仓已为 0，退出完成 ✅")
+                    _sk_reason = "查询实际持仓=0（detail.Position=%s，账户实际已无仓，可能上一回合刚平掉或CTP刷新延迟）" % _det_pos
+                    _tag_dir = "多" if pos_dir == 2 else "空"
+                    self.print("[平跳过] %s %s %s手: %s" % (contract, _tag_dir, eo_volume, _sk_reason))
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1256,7 +1419,9 @@ class PositionSyncManagerSync:
                 info = self._get_contract_info(contract)
                 if not info:
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    _sk_reason = "获取合约信息失败（不在_contract_info_map映射内，主力main_contracts是否未更新？）"
                     self.print(f"{tag} {contract} 获取合约信息失败")
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1274,7 +1439,9 @@ class PositionSyncManagerSync:
                 last_rejected = getattr(self, '_last_1009_reject', {}).get(contract.upper(), 0)
                 if current_time - last_rejected < 30:  # 30秒内不重复尝试同一合约
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    _sk_reason = f"30秒内1009拒单冷却（last_reject={time.strftime('%H:%M:%S', time.localtime(last_rejected))}已过{int(current_time-last_rejected)}s<30s)"
                     self.print(f"{tag} {contract} 30秒内被1009拒绝过，跳过，等待下次同步")
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1283,9 +1450,12 @@ class PositionSyncManagerSync:
                 # 如果该合约+方向有在途开仓委托，说明持仓正在变化中
                 # 不应该在这个时间点平仓，避免"开仓未成交但持仓已平"的错误
                 pending_open_vol = pending_map.get((contract.upper(), pos_dir, True), 0)
+                pending_open_vol = pending_open_vol[0] if isinstance(pending_open_vol, tuple) else pending_open_vol
                 if pending_open_vol > 0:
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    _sk_reason = f"pending_map里有同方向在途开仓{pending_open_vol}手，等成交确认后下一轮再平"
                     self.print(f"{tag} {contract} 有在途开仓委托 {pending_open_vol} 手，跳过平仓（等待成交确认）")
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1339,6 +1509,8 @@ class PositionSyncManagerSync:
                 available = actual_pos  # 直接用实际持仓，不扣 pending_close_vol
                 self.print(f"[平调试] {contract} excess_orders.volume={eo['volume']}, actual_pos={actual_pos}, pending_close_vol={pending_close_vol}, available={available}")
                 if available <= 0:
+                    _sk_reason = f"撤销相反方向委托后重查持仓，available={available}≤0（可能刚被相反方向委托成交消耗掉实际可用持仓）"
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1353,6 +1525,8 @@ class PositionSyncManagerSync:
                 diff = min(eo["volume"], available)
                 self.print(f"[平调试] {contract} diff初始值={diff}")
                 if diff <= 0:
+                    _sk_reason = f"D2a截短后diff={diff}≤0（excess.eo_vol截到available后无剩余，无需平仓）"
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1393,7 +1567,9 @@ class PositionSyncManagerSync:
 
                 if not _is_valid_positive_price(limit_price):
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    _sk_reason = f"定价返回无效价格 limit_price={limit_price} ({pricing_note})，可能float_max脏价格/无最新行情LastPrice=0或负数"
                     self.print(f"{tag} {contract} 无有效价格 ({pricing_note})")
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1405,7 +1581,9 @@ class PositionSyncManagerSync:
                 latest_detail = self._get_position_detail(contract, pos_dir)
                 latest_pos = latest_detail.get("Position", 0)
                 if latest_pos <= 0:
+                    _sk_reason = f"提交前二次查询持仓latest_pos={latest_pos}≤0（可能前几秒CTP实际已被其它线程平掉或刷新延迟）"
                     self.print(f"[平] {contract} 最新查询持仓为 0，无需平仓，跳过")
+                    self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
@@ -1435,7 +1613,9 @@ class PositionSyncManagerSync:
                     )
                     if not ok:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
+                        _sk_reason = f"平今报单被_place_order拒绝（极可能CTP 1009-持仓不足，已记入30s冷却）"
                         self.print(f"[平] {contract} 平今报单被拒绝，跳过")
+                        self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                         skip_close[0] += 1
                         # 记录 1009 拒绝时间，用于冷却
                         if not hasattr(self, '_last_1009_reject'):
@@ -1461,7 +1641,9 @@ class PositionSyncManagerSync:
                     )
                     if not ok:
                         # 报单被拒绝（如1009持仓不足），跳过该合约继续下一个
+                        _sk_reason = f"平昨/平报单被_place_order拒绝（极可能CTP 1009-持仓不足/昨今划分错误，已记入30s冷却）"
                         self.print(f"[平] {contract} 平昨报单被拒绝，跳过")
+                        self.print(f"[平跳过] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
                         skip_close[0] += 1
                         # 记录 1009 拒绝时间，用于冷却
                         if not hasattr(self, '_last_1009_reject'):

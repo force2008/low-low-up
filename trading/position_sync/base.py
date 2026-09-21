@@ -66,6 +66,10 @@ class PositionSyncManagerBase(CTdSpiBase):
         #                            exclude 退出平仓 / ratio==0 的全仓清仓 不受 passive 影响，仍按各自策略走。
         passive_mode: bool = False,
         passive_wait_seconds: int = 300,
+        # ---- 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式下为 True）----
+        # 为 True 时：_do_sync 和 _check_position_diff 不再调用 get_contracts_trading_status 过滤，
+        # 非开盘时间（周末/节假日/夜间非连续交易段）也能正常对齐和提交委托，专供测试/仿真环境使用。
+        skip_trading_time_check: bool = False,
     ):
         # ratio/ration 支持：正数跟单 / 0 清仓 / 负数对冲（任意实数合法，仅 NaN/inf 才报错）
         if position_ratio != position_ratio or position_ratio in (float("inf"), float("-inf")):
@@ -161,6 +165,16 @@ class PositionSyncManagerBase(CTdSpiBase):
         if self._passive_wait_seconds < 10:
             self._passive_wait_seconds = 300
 
+        # ------------------------------------------------------------------
+        # 9) 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式）
+        # ------------------------------------------------------------------
+        # 两层兜底：
+        #  - 显式传入 skip_trading_time_check=True（由入口根据 --force/--skip-time-check/CTP_ENV 组装传入）
+        #  - 隐式：env_name 是 simu/7x24 直接强制 True，即使调用方忘记传也能兜住（7x24 仿真环境默认就不受真实交易时段限制）
+        env_low = (str(env_name or "") or "").strip().lower()
+        _implicit_skip = env_low in ("simu", "7x24")
+        self._skip_trading_time_check: bool = bool(skip_trading_time_check) or _implicit_skip
+
         self.hold_std_path = hold_std_path
         self.main_contracts_path = main_contracts_path
         self.env_name = env_name
@@ -193,6 +207,17 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         # 首次运行标志：只在第一次执行同步时为 True
         self._is_first_run: bool = True
+
+        # ---------- 次主力稀疏 tick 行情兜底：永久已知价缓存（磁盘持久化，跨时段/跨日/跨重启保留）----------
+        # 次主力合约（SM701、xx701 等）可能 30 分钟以上才有一笔行情，
+        # md_provider 3s 超时永远拿不到 tick，导致超仓平仓永久被跳过。
+        # 这里保存"历史上曾经成功拿到过的任何一次行情 LastPrice/BidPrice1/AskPrice1"：
+        #  - 内存：self._last_known_prices 字典
+        #  - 磁盘：PROJECT_ROOT/data/last_known_prices_{env_name}.json（按 env_name 隔离三个实例）
+        # 程序分时段重启（8:59/13:00/21:00 三次启动）后，从磁盘文件读回上次的值。
+        # 结构：{contract_upper: {"LastPrice": float, "BidPrice1": float, "AskPrice1": float, "_ts": float(time.time())}}
+        self._last_known_prices_lock = threading.RLock()
+        self._last_known_prices: Dict[str, dict] = self._load_last_known_prices()
 
         # 持仓查询锁：防止后台线程和用户操作并发查询导致数据错乱
         self._pos_query_lock = threading.Lock()
@@ -292,6 +317,13 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self._md_provider.print = self.print
                 if self._md_provider._login_ok:
                     self.print("[行情] 行情API提供者启动成功")
+                    # 注意：不要在 __init__ 阶段立刻批量订阅持仓合约，原因：
+                    #  1) self._actual_positions 是 CTP 异步回调写入，此处首查大概率还未回调，订阅到的是个空集合；
+                    #  2) 开仓需要的合约（target/hold_std 里的新合约）在 __init__ 这一刻根本不在持仓里，订阅不到；
+                    #  3) MdQuoteProvider.get_quote 已默认 prefer_cached=True，首次订阅后只要后续收到一笔 tick，
+                    #     再调用时就能命中缓存，没有必要在启动时强制批量订阅浪费首查时序和 CPU。
+                    # 真正兜底的是两处：md_provider.get_quote prefer_cached=True 永远优先返回历史缓存，
+                    # 以及 sync.py 平仓/开仓阶段 md 空时再从原始缓存锁里硬回退一次。
                 else:
                     self.print(f"[行情] 行情API提供者登录未成功: {self._md_provider._login_error}")
             except Exception as e:
@@ -1231,6 +1263,170 @@ class PositionSyncManagerBase(CTdSpiBase):
             pass
 
     # ------------------------------------------------------------------
+    # 已知价永久缓存（磁盘持久化）
+    # 次主力（SM701 等）30+ 分钟才一笔 tick，跨时段/跨日/跨重启必须能保留历史价，
+    # 否则每个时段首 30 分钟都会因 md=None 永久平不掉超仓。
+    # 按 env_name 单独文件隔离三个实例，防止互串写。
+    # ------------------------------------------------------------------
+    _LAST_KNOWN_PRICES_EXPIRE_SECONDS = 30 * 24 * 3600  # 30 天陈腐过期（避免几百年前的价永久占坑）
+
+    def _get_last_known_prices_file(self) -> str:
+        env = getattr(self, "env_name", "unknown") or "unknown"
+        safe_env = "".join(c for c in str(env) if c.isalnum() or c in ("_", "-")) or "unknown"
+        data_dir = os.path.join(PROJECT_ROOT, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, f"last_known_prices_{safe_env}.json")
+
+    def _load_last_known_prices(self) -> Dict[str, dict]:
+        """启动时从磁盘读回上次的已知价缓存；文件不存在/损坏/过期条目全跳过。"""
+        file_path = self._get_last_known_prices_file()
+        if not os.path.exists(file_path):
+            return {}
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            self.print(f"[已知价缓存] 读取文件失败（自动忽略，本时段重新积累）: {e}")
+            return {}
+        if not isinstance(raw, dict):
+            self.print("[已知价缓存] 文件结构不是 dict，忽略")
+            return {}
+        import math as _math
+        now_ts = time.time()
+        cutoff = now_ts - self._LAST_KNOWN_PRICES_EXPIRE_SECONDS
+        cleaned: Dict[str, dict] = {}
+        skipped_old = 0
+        skipped_bad = 0
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, dict):
+                skipped_bad += 1
+                continue
+            try:
+                ts_v = float(v.get("_ts", 0) or 0)
+            except Exception:
+                ts_v = 0.0
+            # 30 天陈腐自动丢弃
+            if ts_v > 0 and ts_v < cutoff:
+                skipped_old += 1
+                continue
+            def _ff(x):
+                try:
+                    fv = float(x); return fv if _math.isfinite(fv) and 0 < fv < 1e9 else None
+                except Exception:
+                    return None
+            lp = _ff(v.get("LastPrice"))
+            b1 = _ff(v.get("BidPrice1"))
+            a1 = _ff(v.get("AskPrice1"))
+            if lp is None and b1 is None and a1 is None:
+                skipped_bad += 1
+                continue
+            base = lp if lp is not None else (b1 if b1 is not None else a1)
+            cleaned[str(k).strip().upper()] = {
+                "LastPrice": float(base),
+                "BidPrice1": float(b1) if b1 is not None else float(base),
+                "AskPrice1": float(a1) if a1 is not None else float(base),
+                "_ts": float(ts_v) if ts_v > 0 else float(now_ts),
+            }
+        if skipped_old or skipped_bad or len(cleaned) != len(raw):
+            self.print(
+                f"[已知价缓存] 读盘完成：读入 {len(raw)} 条 → 清理后 {len(cleaned)} 条"
+                f"（陈腐过期丢弃 {skipped_old}、格式异常丢弃 {skipped_bad}）"
+            )
+        else:
+            self.print(f"[已知价缓存] 读盘完成：恢复 {len(cleaned)} 条历史已知价（文件：{os.path.basename(file_path)}）")
+        return cleaned
+
+    def _flush_last_known_prices_now(self) -> bool:
+        """同步刷盘（仅在 shutdown 退出时调用一次）。
+        任何异常都吞掉，绝不影响 shutdown 主流程。
+        """
+        try:
+            with self._last_known_prices_lock:
+                snapshot = dict(getattr(self, "_last_known_prices", {}) or {})
+            if not snapshot:
+                return False
+            file_path = self._get_last_known_prices_file()
+            tmp_path = file_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, file_path)
+            self.print(f"[已知价缓存] 退出时同步刷盘：写入 {len(snapshot)} 条 → {os.path.basename(file_path)}")
+            return True
+        except Exception as e:
+            try:
+                self.print(f"[已知价缓存] 退出刷盘异常（忽略）: {e}")
+            except Exception:
+                pass
+            return False
+
+    def _flush_last_known_prices_async(self) -> None:
+        """（保留但不再主动调用）后台线程异步刷盘：仅保留方法体作为兼容入口，不再在行情主线程里触发。
+        真正持久化只在 shutdown 退出时走 _flush_last_known_prices_now，避免 tick 密集时频繁 I/O 导致 CPU 上升。
+        """
+        def _worker():
+            try:
+                with self._last_known_prices_lock:
+                    snapshot = dict(getattr(self, "_last_known_prices", {}) or {})
+                if not snapshot:
+                    return
+                file_path = self._get_last_known_prices_file()
+                tmp_path = file_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, file_path)
+            except Exception:
+                try:
+                    self.print("[已知价缓存] 异步刷盘异常（忽略，下次再试）")
+                except Exception:
+                    pass
+        try:
+            t = threading.Thread(target=_worker, name="LkpFlush", daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def _update_last_known_prices(self, contract: str, last_price=None, bid_price1=None, ask_price1=None, ts: float = None) -> bool:
+        """更新一条已知价缓存（仅内存 + RLock 保护，**不触发任何 I/O**）。
+        真正的磁盘持久化只在 shutdown() 退出时执行一次 _flush_last_known_prices_now()，
+        避免主力合约 tick 密集时每笔都刷盘导致 CPU 上升。
+        """
+        try:
+            import math as _math2
+            def _ff(x):
+                try:
+                    fv = float(x); return fv if _math2.isfinite(fv) and 0 < fv < 1e9 else None
+                except Exception:
+                    return None
+            lp = _ff(last_price)
+            b1 = _ff(bid_price1)
+            a1 = _ff(ask_price1)
+            if lp is None and b1 is None and a1 is None:
+                return False
+            base = lp if lp is not None else (b1 if b1 is not None else a1)
+            key = str(contract or "").strip().upper()
+            if not key:
+                return False
+            ts_now = float(time.time()) if ts is None else float(ts)
+            entry = {
+                "LastPrice": float(base),
+                "BidPrice1": float(b1) if b1 is not None else float(base),
+                "AskPrice1": float(a1) if a1 is not None else float(base),
+                "_ts": ts_now,
+            }
+            with self._last_known_prices_lock:
+                prev = (getattr(self, "_last_known_prices", None) or {}).get(key)
+                if (not prev or
+                        abs(float(prev.get("LastPrice", 0) or 0) - float(entry["LastPrice"])) > 1e-9 or
+                        abs(float(prev.get("BidPrice1", 0) or 0) - float(entry["BidPrice1"])) > 1e-9 or
+                        abs(float(prev.get("AskPrice1", 0) or 0) - float(entry["AskPrice1"])) > 1e-9 or
+                        (ts_now - float(prev.get("_ts", 0) or 0)) > 60):  # 1 分钟强制刷新时间戳（防止陈腐 30 天过期），仍不写盘
+                    (getattr(self, "_last_known_prices", None) or {})[key] = entry
+                    return True
+            return False
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
     # CTP 查询健康度：连续超时后主动断线重连
     # ------------------------------------------------------------------
     def _on_query_timeout(self, source: str = "查询"):
@@ -1326,6 +1522,12 @@ class PositionSyncManagerBase(CTdSpiBase):
     def shutdown(self):
         """关闭管理器，停止后台监控线程"""
         self._stop_replace_monitor()
+        # ---------- 已知价缓存仅在退出时刷一次盘（避免主力 tick 密集时频繁 I/O 拉高 CPU）----------
+        # 磁盘持久化的目的只是跨时段/跨日/跨重启恢复，
+        # 正常时段（8:59/13:00/21:00 三段启动 → 11:30/15:15/02:30 三段正常关闭）都走这里写盘，
+        # 极端崩溃/断电场景下最多损失本时段新积累的已知价，下一时段从头再收即可，
+        # 不会出任何资金风险，只是极个别次主力合约在"崩溃后首 30 分钟收新 tick 前"可能 md=None skip。
+        self._flush_last_known_prices_now()
         if getattr(self, "_md_provider", None):
             try:
                 self._md_provider.shutdown()
@@ -1417,10 +1619,14 @@ class PositionSyncManagerBase(CTdSpiBase):
                 effective_actual[key] = a_vol + pending_open
 
             # 计算差异（使用有效持仓，避免在途开仓被错误判断）
-            # 同时过滤当前非交易时段的合约，避免无法交易的品种触发误报
+            # 同时过滤当前非交易时段的合约；_skip_trading_time_check=True（7x24/simu/--force/--skip-time-check）则整段跳过不丢合约。
             all_contracts = set(contract for contract, _ in set(target.keys()) | set(effective_actual.keys()))
-            trading_status = get_contracts_trading_status(list(all_contracts))
-            non_trading_contracts = {c.upper() for c, trading in trading_status.items() if not trading}
+            non_trading_contracts = set()
+            if not bool(getattr(self, '_skip_trading_time_check', False)):
+                trading_status = get_contracts_trading_status(list(all_contracts))
+                non_trading_contracts = {c.upper() for c, trading in trading_status.items() if not trading}
+            elif all_contracts:
+                self.print(f"[巡检] _skip_trading_time_check=True：跳过交易时段过滤（7x24/simu/--force），共 {len(all_contracts)} 个合约参与对比")
 
             missing = []
             excess = []

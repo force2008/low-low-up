@@ -26,23 +26,33 @@ from ctp.base_tdapi import tdapi
 class PositionSyncManagerMarket:
     """持仓同步管理器 - 行情持仓查询部分"""
 
-    def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2) -> Optional[dict]:
+    def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2, prefer_cached: bool = True) -> Optional[dict]:
         """获取合约行情快照，统一通过行情 API（MdApi）订阅获取。
 
         如果 MdApi 提供者未启动，才回退到交易 API 查询（保持兼容性）。
+
+        Args:
+            instrument_id: 合约代码
+            timeout: 等待 tick 秒数（仅在缓存空时生效）
+            max_retries: 交易 API 回退时的重试次数
+            prefer_cached: True=如果已有历史缓存直接返回，不等最新 tick（次主力稀疏场景默认 True）
         """
         exact_id = self._standardize_contract(instrument_id)
 
         # 优先使用行情 API 订阅提供者（统一 simu/online 机制）
         md_provider = getattr(self, "_md_provider", None)
         if md_provider:
-            md = md_provider.get_quote(exact_id, timeout=timeout)
+            md = md_provider.get_quote(exact_id, timeout=timeout, prefer_cached=prefer_cached)
             if md:
                 return md
-            self.print(f"[警告] {exact_id} 行情API订阅获取失败")
+            # 融航/多数柜台只开放 MdApi 订阅，不开放 TD ReqQryDepthMarketData，
+            # 次主力合约（如 SM701）tick 稀疏 3s 内没首 tick 是常态。
+            # 这里不直接用 TD API 回退（无回调入口会永久超时挂住 _md_pending），
+            # 而是返回 None 让调用方（sync.py 平仓分支）再用 prefer_cached=True 做二次兜底或使用缓存历史值。
+            self.print(f"[警告] {exact_id} 行情API订阅获取失败（次主力tick稀疏，prefer_cached={prefer_cached}仍无缓存）")
             return None
 
-        # 兼容无行情前置的环境：回退到交易 API 查询
+        # 兼容无行情前置的环境：回退到交易 API 查询（仅在 md_provider 不存在时走此路径）
         self.print(f"[警告] 无行情API提供者，回退到交易API查询 {exact_id}")
         last_error = None
         for attempt in range(max_retries + 1):
