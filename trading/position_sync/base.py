@@ -1030,7 +1030,9 @@ class PositionSyncManagerBase(CTdSpiBase):
                 "VolumeTraded": pOrder.VolumeTraded,
                 "OrderRef": (pOrder.OrderRef or "").strip(),
                 "OrderSysID": (pOrder.OrderSysID or "").strip(),
+                "LimitPrice": pOrder.LimitPrice,
                 "InsertDate": (pOrder.InsertDate or "").strip(),
+                "InsertTime": (getattr(pOrder, "InsertTime", None) or "").strip(),
             })
         if bIsLast:
             if self._orders_query_event:
@@ -1524,10 +1526,15 @@ class PositionSyncManagerBase(CTdSpiBase):
             self._order_ref_seq += 1
             return f"PSM{self._order_ref_seq:09d}"
 
-    # Placeholder methods to be implemented by subclasses
+    # 占位实现：子类(PositionManagerUI / PositionSyncManager) 覆盖真正的撤单重挂逻辑
     def _check_and_replace_pending_orders(self):
-        """扫描未成交委托（含开平仓），超时则撤单并用最新对手价重挂"""
-        pass
+        """扫描未成交委托（含开平仓），超时则撤单并用最新对手价重挂。
+
+        passive_mode=True 的开仓委托：
+            - 单条挂单 < _passive_wait_seconds（默认 300s）：不撤、不改、不重挂；
+            - 超时后才允许撤单，且新价用"逐档咬盘口 +1tick（buy: bid+tick, sell: ask-tick）"而非直接追对手价。
+        """
+        return
 
     def _update_hold_json_file(self):
         """使用已查询的持仓数据更新 hold.json 文件"""

@@ -228,6 +228,7 @@ class PositionSyncManagerOrderOps:
                 # 跟单 passive 模式戳记：套利跟单账户 passive_mode=True 时提交的委托
                 # 撤单重挂逻辑据此判断 5 分钟内不撤、超时逐档进 1 tick 咬盘口
                 "is_passive_mode": bool(getattr(self, '_passive_mode', False)),
+                "passive_wait_seconds": int(getattr(self, '_passive_wait_seconds', 300) or 300),
             }
 
         delay_s = self._maybe_random_delay_before_submit(exact_id, direction, volume)
@@ -243,10 +244,14 @@ class PositionSyncManagerOrderOps:
             )
             return False
 
+        passive_tag = ""
+        if bool(getattr(self, '_passive_mode', False)):
+            wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
+            passive_tag = f" [PASSIVE wait={wait_s}s]"
         delay_tag = f" 延迟={delay_s:.3f}s" if delay_s > 0 else ""
         self.print(
             f"[报单] {exact_id} {direction} {volume}手 "
-            f"限价={limit_price} OrderRef={order_ref}{delay_tag}"
+            f"限价={limit_price} OrderRef={order_ref}{passive_tag}{delay_tag}"
         )
 
         # 等待报单确认（最多 3 秒），如果收到拒绝则返回 False

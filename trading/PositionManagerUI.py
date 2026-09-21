@@ -1939,6 +1939,8 @@ class PositionManagerUI(CTdSpiBase):
         self._order_ref_seq += 1
         order_ref = str(self._order_ref_seq)
         exact_id = self._standardize_contract(instrument_id)
+        use_passive = bool(getattr(self, '_passive_mode', False))
+        wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
 
         req = tdapi.CThostFtdcInputOrderField()
         req.BrokerID = self._broker_id
@@ -1965,7 +1967,8 @@ class PositionManagerUI(CTdSpiBase):
         req.LimitPrice = price
 
         dname = "买" if direction == tdapi.THOST_FTDC_D_Buy else "卖"
-        self.print(f"[下单] {exact_id} {dname} 开仓 价格={price} 数量={volume} Ref={order_ref}")
+        p_tag = f" [PASSIVE wait={wait_s}s]" if use_passive else ""
+        self.print(f"[下单] {exact_id} {dname} 开仓 价格={price} 数量={volume} Ref={order_ref}{p_tag}")
 
         with self._orders_lock:
             self._orders_raw.append({
@@ -1997,6 +2000,8 @@ class PositionManagerUI(CTdSpiBase):
                 "price": price,
                 "replace_count": 0,
                 "orig_ref": "",
+                "is_passive_mode": use_passive,
+                "passive_wait_seconds": wait_s,
             }
             msg = f"开仓已提交: {exact_id} {dname} {volume}手 价={price} Ref={order_ref}"
             self._update_status(msg)
@@ -2132,16 +2137,33 @@ class PositionManagerUI(CTdSpiBase):
                 self.print(traceback.format_exc())
 
     def _check_and_replace_pending_orders(self):
-        """扫描未成交委托（含开平仓），超时则撤单并用最新对手价重挂"""
+        """扫描未成交开仓委托：超时则撤单重挂。
+
+        关键规则：
+        - _passive_mode=True（跟单被动模式）：使用 _passive_wait_seconds（默认 300s），
+          且 300s 内即使价格变也坚决不撤；
+          超过 300s 才按"逐档向对手方方向 +1 tick"重挂（而非直接吃对手价）。
+        - _passive_mode=False（默认 aggressive 模式）：仍按 _ORDER_TIMEOUT_SECONDS（默认 60s），
+          直接以最新对手价重挂。
+        """
+        use_passive = bool(getattr(self, '_passive_mode', False))
+        wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300) if use_passive else int(self._ORDER_TIMEOUT_SECONDS)
         now = time.time()
         orders_to_replace = []
 
-        # 调试日志：打印当前追踪的订单
-        self.print(f"[自动撤单检查] 当前追踪 {len(self._local_orders)} 个订单:")
+        # 调试日志：打印当前追踪的订单 + 是否 passive 保护
+        self.print(
+            f"[自动撤单检查] 当前追踪 {len(self._local_orders)} 个订单 "
+            f"(passive_mode={int(use_passive)} wait={wait_s}s):"
+        )
         for ref, item in self._local_orders.items():
             elapsed = now - item["submit_time"]
-            self.print(f"  Ref={ref} {item['instrument_id']} 开仓 {item['direction']} {item['volume']}手 "
-                        f"已提交 {elapsed:.0f}秒 重挂 {item['replace_count']}次")
+            p_tag = "P" if bool(item.get("is_passive_mode")) else "A"
+            w_tag = int(item.get("passive_wait_seconds", wait_s) or wait_s)
+            self.print(
+                f"  Ref={ref} {item['instrument_id']} 开仓 {item['direction']} {item['volume']}手 "
+                f"[{p_tag}] 已提交 {elapsed:.0f}s(wait={w_tag}) 重挂 {item['replace_count']}次"
+            )
 
         with self._orders_lock:
             for ref, item in list(self._local_orders.items()):
@@ -2156,14 +2178,19 @@ class PositionManagerUI(CTdSpiBase):
                         self.print(f"[自动撤单] {item['instrument_id']} Ref={ref} 已是终态(Status={status})，从追踪列表移除")
                         del self._local_orders[ref]
                         continue
+                # 该订单自己的 wait 秒数（可能来自 run_pipeline 动态配置）
+                item_wait_s = int(item.get("passive_wait_seconds", wait_s) or wait_s)
+                if bool(item.get("is_passive_mode")):
+                    effective_wait = item_wait_s
+                else:
+                    effective_wait = item_wait_s if use_passive else wait_s
                 # 检查超时
                 elapsed = now - item["submit_time"]
-                if elapsed < self._ORDER_TIMEOUT_SECONDS:
+                if elapsed < effective_wait:
                     continue
                 # 检查重挂次数
                 if item["replace_count"] >= self._MAX_REPLACE_COUNT:
                     self.print(f"[自动撤单] {item['instrument_id']} 已重挂 {item['replace_count']} 次，达到上限，不再处理")
-                    # 从追踪列表移除
                     del self._local_orders[ref]
                     continue
                 orders_to_replace.append((ref, item))
@@ -2177,9 +2204,11 @@ class PositionManagerUI(CTdSpiBase):
             volume = item["volume"]
             orig_ref = ref
             dname = "买" if direction == tdapi.THOST_FTDC_D_Buy else "卖"
+            item_passive = bool(item.get("is_passive_mode"))
             self.print(
                 f"[自动撤单] {instr} {dname}开仓 {volume}手 "
-                f"超时 {self._ORDER_TIMEOUT_SECONDS} 秒未成交，执行撤单重挂"
+                f"超时 wait={int(item.get('passive_wait_seconds', wait_s) or wait_s)}s "
+                f"elapsed={now - item['submit_time']:.0f}s passive={int(item_passive)}，执行撤单重挂"
             )
 
             # 撤单
@@ -2198,47 +2227,73 @@ class PositionManagerUI(CTdSpiBase):
                 self.print(f"[自动撤单] {instr} 无法获取行情，跳过重挂")
                 continue
 
-            # 取价逻辑：优先最新成交价，其次对手价
+            # 取价逻辑：
+            # - passive：按"逐档咬盘口"向对手方方向 +1 tick，若一步就够到对手价则直接吃对手价
+            # - aggressive：优先最新对手价
             limit_price = 0.0
-            last_price = md.get("LastPrice", 0)
-            if last_price > 0:
-                limit_price = last_price
-            if direction == tdapi.THOST_FTDC_D_Buy:
-                # 买开：优先卖价（对手价），其次买价，最后最新价
-                ask = md.get("AskPrice1", 0)
-                bid = md.get("BidPrice1", 0)
-                if ask > 0:
-                    limit_price = ask
-                elif bid > 0:
-                    limit_price = bid
+            info = self._get_contract_info(instr) or {}
+            price_tick = float(info.get("PriceTick", 1.0) or 1.0)
+            last_price = float(md.get("LastPrice", 0) or 0)
+            step_tag = ""
+            if item_passive:
+                if direction == tdapi.THOST_FTDC_D_Buy:
+                    limit_price, step_tag = (
+                        lambda: (
+                            (lambda bid, ask, t, lp:
+                                (ask, "reach-ask") if bid and ask and (bid + t) >= ask
+                                else ((bid + t), "bid+1tick") if bid
+                                else ((lp if lp > 0 else 0.0), "fallback-last")
+                            )(
+                                float(md.get("BidPrice1", 0) or 0),
+                                float(md.get("AskPrice1", 0) or 0),
+                                price_tick,
+                                last_price,
+                            )
+                        )
+                    )()
+                else:  # sell
+                    limit_price, step_tag = (
+                        lambda: (
+                            (lambda bid, ask, t, lp:
+                                (bid, "reach-bid") if bid and ask and (ask - t) <= bid
+                                else ((ask - t), "ask-1tick") if ask
+                                else ((lp if lp > 0 else 0.0), "fallback-last")
+                            )(
+                                float(md.get("BidPrice1", 0) or 0),
+                                float(md.get("AskPrice1", 0) or 0),
+                                price_tick,
+                                last_price,
+                            )
+                        )
+                    )()
             else:
-                # 卖开：优先买价（对手价），其次卖价，最后最新价
-                bid = md.get("BidPrice1", 0)
-                ask = md.get("AskPrice1", 0)
-                if bid > 0:
-                    limit_price = bid
-                elif ask > 0:
-                    limit_price = ask
+                if direction == tdapi.THOST_FTDC_D_Buy:
+                    ask = float(md.get("AskPrice1", 0) or 0)
+                    bid = float(md.get("BidPrice1", 0) or 0)
+                    limit_price = ask or bid or last_price
+                    step_tag = "aggressive-ask"
+                else:
+                    bid = float(md.get("BidPrice1", 0) or 0)
+                    ask = float(md.get("AskPrice1", 0) or 0)
+                    limit_price = bid or ask or last_price
+                    step_tag = "aggressive-bid"
 
             if limit_price <= 0:
                 self.print(f"[自动撤单] {instr} 无有效价格，跳过重挂")
                 continue
 
             new_replace_count = item["replace_count"] + 1
-            exchange_id = self._get_contract_info(instr).get("ExchangeID", "")
-
             self.print(
                 f"[自动重挂] {instr} {dname}开仓 {volume}手 "
-                f"限价={limit_price} (第 {new_replace_count} 次重挂)"
+                f"限价={limit_price} ({step_tag}) (第 {new_replace_count} 次重挂)"
             )
 
             # 重新下单
-            self._send_open_order(exchange_id, instr, direction, volume, limit_price)
+            self._send_open_order(info.get("ExchangeID", ""), instr, direction, volume, limit_price)
 
             # 更新追踪信息（新的 Ref 会在 _send_open_order 中创建）
-            # 标记原订单为已处理（不再监控）
             if orig_ref in self._local_orders:
-                self._local_orders[orig_ref]["submit_time"] = 0  # 标记为已完成
+                self._local_orders[orig_ref]["submit_time"] = 0  # 标记为已处理
 
             self._notify_async(
                 f"🔄 自动撤单重挂\n"
@@ -2247,6 +2302,7 @@ class PositionManagerUI(CTdSpiBase):
                 f"方向：{dname}\n"
                 f"手数：{volume}\n"
                 f"新价格：{limit_price}\n"
+                f"定价方式：{step_tag}\n"
                 f"重挂次数：{new_replace_count}"
             )
 

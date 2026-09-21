@@ -72,6 +72,89 @@ def _clamp_price_within_limits(price: float, md: Optional[dict]) -> float:
     return price
 
 
+def _ctp_order_elapsed_seconds(o: dict, now: Optional[float] = None) -> float:
+    """用订单 InsertDate+InsertTime 估算已挂单秒数；缺失时按 0 处理（保守允许撤单）。"""
+    if now is None:
+        now = time.time()
+    d = str(o.get("InsertDate", "") or "").strip()
+    t = str(o.get("InsertTime", "") or "").strip()
+    if len(d) < 8:
+        return 0.0
+    # InsertTime 常见格式：HH:MM:SS / HHMMSS / HH:MM:SS.mmm
+    tt = t.replace(":", "")
+    if len(tt) >= 6:
+        tt = tt[:6]
+    else:
+        return 0.0
+    try:
+        struct = time.strptime(f"{d} {tt}", "%Y%m%d %H%M%S")
+    except ValueError:
+        return 0.0
+    return max(0.0, now - time.mktime(struct))
+
+
+def _passive_next_tick_price(
+    direction: str,
+    current_order_price: float,
+    md: dict,
+    price_tick: float,
+) -> Tuple[float, str]:
+    """passive 模式下逐档咬盘口：向对手价方向"前进一步"重挂，但不超过对手价。
+    - buy 方向：当前挂 bid(买一) → 若 ask <= bid+tick 则直接吃 ask；否则挂 bid+tick。
+    - sell 方向：当前挂 ask(卖一) → 若 bid >= ask-tick 则直接吃 bid；否则挂 ask-tick。
+    返回 (new_price, 说明tag)
+    """
+    bid = _safe_price(md.get("BidPrice1", 0))
+    ask = _safe_price(md.get("AskPrice1", 0))
+    last = _safe_price(md.get("LastPrice", 0))
+    tick = float(price_tick) if price_tick > 0 else 1.0
+    if direction == "buy":
+        anchor = bid or current_order_price or last or 0.0
+        if not _is_valid_positive_price(anchor):
+            return float(current_order_price), "invalid-anchor(keep)"
+        proposed = anchor + tick
+        # 若 proposed 已触及卖一(ask)或以上：直接用 ask，一次吃到位
+        if ask and proposed >= ask:
+            return ask, "passive-step-reach-ask"
+        return proposed, "passive-step-bid+1tick"
+    else:  # sell
+        anchor = ask or current_order_price or last or 0.0
+        if not _is_valid_positive_price(anchor):
+            return float(current_order_price), "invalid-anchor(keep)"
+        proposed = anchor - tick
+        if bid and proposed <= bid:
+            return bid, "passive-step-reach-bid"
+        return proposed, "passive-step-ask-1tick"
+
+
+def _should_keep_pending_order(
+    self,
+    o: dict,
+    SYNC_COOLDOWN: int,
+) -> Tuple[bool, str]:
+    """判断一条 CTP 在途委托在 sync 入口阶段是否跳过撤销。
+
+    返回 (keep=True 不撤, 原因字符串)。
+    仅在"passive_mode 开仓挂单 且 挂单时长 < passive_wait 且 非 exclude/清仓/非被动"情况下保留；其他一律可撤。
+    """
+    use_passive = bool(getattr(self, '_passive_mode', False))
+    wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
+    offset_flag_raw = str(o.get("CombOffsetFlag", "") or "").strip()
+    is_open = offset_flag_raw in (
+        str(tdapi.THOST_FTDC_OF_Open),
+        chr(tdapi.THOST_FTDC_OF_Open) if isinstance(tdapi.THOST_FTDC_OF_Open, int) else "",
+        "0",
+    )
+    # 只有 passive 模式的开仓挂单才享受"挂单保留"；平仓/清仓/exclude 场景按旧逻辑优先撤
+    if not (use_passive and is_open):
+        return False, "not-passive-open"
+
+    elapsed = _ctp_order_elapsed_seconds(o, time.time())
+    if elapsed < wait_s:
+        return True, f"passive-open keep ({elapsed:.0f}s < {wait_s}s, cooldown={SYNC_COOLDOWN}s)"
+    return False, f"passive-open expired ({elapsed:.0f}s >= {wait_s}s)"
+
+
 def _calc_limit_price(
     direction: str,
     md: dict,
@@ -205,15 +288,26 @@ class PositionSyncManagerSync:
                 self.print("[错误] 加载合约信息失败")
                 return False
 
-            # 2. 查询在途委托并撤销所有（避免"已有委托在途"导致跳过）
+            # 2. 查询在途委托：仅撤销需要重挂/要立刻执行对齐的委托；
+            #    对 passive_mode 的开仓挂单，若挂单时长 < passive_wait_seconds，则跳过撤单。
             ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            kept_orders = []
+            cancelled_ctp = []
             if ctp_orders:
-                self.print(f"[撤销] 发现 {len(ctp_orders)} 条在途委托，先全部撤销...")
+                self.print(f"[撤销前] 共有 {len(ctp_orders)} 条在途委托，按 passive 规则决定是否保留...")
                 cancel_success = 0
                 for o in ctp_orders:
+                    keep, reason = _should_keep_pending_order(self, o, SYNC_COOLDOWN)
+                    if keep:
+                        kept_orders.append(o)
+                        inst = o.get("InstrumentID", "")
+                        elapsed = _ctp_order_elapsed_seconds(o)
+                        self.print(f"[保留在途] {inst} Ref={o.get('OrderRef','')} elapsed={elapsed:.0f}s -> {reason}")
+                        continue
                     order_sys_id = str(o.get("OrderSysID", "")).strip()
                     exchange_id = str(o.get("ExchangeID", "")).strip()
                     instrument_id = str(o.get("InstrumentID", "")).strip()
+                    cancelled_ctp.append(o)
                     if order_sys_id:
                         if self._cancel_order_by_sysid(order_sys_id, exchange_id, instrument_id):
                             cancel_success += 1
@@ -222,9 +316,10 @@ class PositionSyncManagerSync:
                         if self.cancel_order(order_ref):
                             cancel_success += 1
                     time.sleep(0.3)
-                self.print(f"[撤销] 已撤销 {cancel_success}/{len(ctp_orders)} 条委托")
-                # 等待撤单确认
-                time.sleep(2)
+                self.print(f"[撤销] 已撤销 {cancel_success}/{len(cancelled_ctp)} 条委托（保留 {len(kept_orders)} 条 passive 开仓挂单）")
+                # 等待撤单确认（只对主动撤销的部分；保留的挂单不等）
+                if cancelled_ctp:
+                    time.sleep(2)
             else:
                 self.print("[撤销] 无在途委托需要撤销")
 
@@ -509,6 +604,11 @@ class PositionSyncManagerSync:
                 # 检查在途委托
                 mo_upper = contract.upper()
                 need_new_order = True
+                wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
+                use_passive = bool(getattr(self, '_passive_mode', False))
+                info = self._get_contract_info(contract)
+                price_tick = info.get("PriceTick", 1.0) if info else 1.0
+
                 # 调试：打印所有 ctp_orders 中该合约的委托
                 for o in ctp_orders:
                     if o.get("InstrumentID", "").upper() == mo_upper:
@@ -518,15 +618,42 @@ class PositionSyncManagerSync:
                         and str(o.get("Direction", "")).strip() == (tdapi.THOST_FTDC_D_Buy if mo["direction"] == "buy" else tdapi.THOST_FTDC_D_Sell).strip()
                         and str(o.get("CombOffsetFlag", "")).strip() == str(tdapi.THOST_FTDC_OF_Open).strip()
                         and str(o.get("OrderStatus", "")).strip() in ("1", "3")):
-                        last_price = o.get("LimitPrice", 0)
-                        if mo["direction"] == "buy":
-                            current_price = _safe_price(md.get("AskPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
-                        else:
-                            current_price = _safe_price(md.get("BidPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
-                        info = self._get_contract_info(contract)
-                        price_tick = info.get("PriceTick", 1.0)
 
-                        # 检查是否需要撤单重挂：价格变化超过tick
+                        last_price = o.get("LimitPrice", 0)
+                        elapsed = _ctp_order_elapsed_seconds(o, time.time())
+
+                        # passive 开仓：挂单 < wait_s 秒 一律保留，不做"价格变了就撤"
+                        if use_passive and elapsed < wait_s:
+                            self.print(f"[开] {contract} passive挂单保留：{elapsed:.0f}s < {wait_s}s，价格{last_price}，等待排队")
+                            need_new_order = False
+                            skip_open[0] += 1
+                            break
+
+                        # 计算"当前应考虑的重挂价"：aggressive 直接对手价；passive 则逐档 +1 tick
+                        if mo["direction"] == "buy":
+                            agg_price = _safe_price(md.get("AskPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
+                            if use_passive:
+                                cur_price, step_tag = _passive_next_tick_price(
+                                    "buy", float(last_price or 0), md, price_tick
+                                )
+                                current_price = cur_price
+                            else:
+                                current_price = agg_price
+                                step_tag = "aggressive-ask"
+                        else:
+                            agg_price = _safe_price(md.get("BidPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
+                            if use_passive:
+                                cur_price, step_tag = _passive_next_tick_price(
+                                    "sell", float(last_price or 0), md, price_tick
+                                )
+                                current_price = cur_price
+                            else:
+                                current_price = agg_price
+                                step_tag = "aggressive-bid"
+
+                        # 是否需要撤单重挂：
+                        #  - passive 模式：超过 wait_s 且 价格变化 >= 1 tick 才重挂（逐档咬盘口）
+                        #  - aggressive：只要价格变化 >= 1 tick 就重挂（原来的语义）
                         price_changed = (
                             _is_valid_positive_price(last_price)
                             and _is_valid_positive_price(current_price)
@@ -534,7 +661,8 @@ class PositionSyncManagerSync:
                         )
 
                         if price_changed:
-                            self.print(f"[开] {contract} 价格变化 {last_price}->{current_price}，撤单重挂")
+                            self.print(f"[开] {contract} 撤单重挂: {last_price}->{current_price} ({step_tag})"
+                                       f" elapsed={elapsed:.0f}s passive={int(use_passive)}")
                             order_sys_id = o.get("OrderSysID", "")
                             exchange_id = o.get("ExchangeID", "")
                             if order_sys_id:
@@ -544,7 +672,7 @@ class PositionSyncManagerSync:
                             time.sleep(0.5)  # 等待撤单完成
                         else:
                             # 价格没变化，保持等待
-                            self.print(f"[开] {contract} 在途足够且价格未变，保持等待")
+                            self.print(f"[开] {contract} 在途足够且价格未变({step_tag})，保持等待 elapsed={elapsed:.0f}s")
                             need_new_order = False
                             skip_open[0] += 1
                         break
