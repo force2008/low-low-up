@@ -303,88 +303,281 @@ class PositionSyncManagerSync:
         target: dict,
         actual_agg: dict,
         pending_map: dict,
-    ) -> bool:
-        """F 总闸：True=安全、False=命中 abort。"""
+        # ---- 新增 3 个上下文参数：命中后回看历史缓存 → 重算 missing/excess 二次校验 ----
+        non_trading_contracts=None,
+        effective_actual: dict = None,
+        cooling_contracts=None,
+    ) -> tuple:
+        """F 总闸：返回 (ok_to_continue, rewritten_actual_agg, rewritten_missing_orders, rewritten_excess_orders)。
+
+        ok_to_continue=True：下游继续执行同步（安全或已被放行）；
+        ok_to_continue=False：下游 ABORT 全弃（兜底最后一道）。
+        当 ok_to_continue=True 且 rewritten_* 非 None 时，下游必须用 rewritten 的 actual/missing/excess 替换自己的局部变量
+        （表示本次 actual 被判定为脏空、已用历史缓存替换）。
+
+        2026-09-21 升级（承接用户反馈）：
+            之前的 F 总闸直接把「actual 突然很小（2合约/6手）+ target 很大（37合约/122手）」判 abort，
+            但用户在非交易时段手动在柜台平掉了 35 个合约（真清仓），这属于「actual 真变小，不是脏空」，
+            不应该把正常缺额补开（对齐到 hold-std.json）拦掉，不然同步永远追不上最新标准仓。
+        新逻辑：
+            1) 先跑原 3 条 F 总闸条件，判定是否命中；
+            2) 没命中 → 直接 return(True,None,None,None)（保持原逻辑安全兜底）；
+            3) 命中 → 进入【历史缓存二次判定】：
+                a) 没历史缓存（冷启动首轮）→ 判 abort 兜底（避免启动首轮真脏空漏拦）；
+                b) 历史中「连续 3 次」actual_agg 合约数/总手数 都 ≤ 本次的 1.3 倍（渐进式下降）
+                   → 真清仓放行；
+                c) 否则（历史上存在 至少 1 次 ≥ 本次 1.5 倍 + 2，陡降 → 脏空特征）
+                   → 取历史中「合约数×5+总手数」最大那次 actual_agg 替换当前 actual，
+                     重算 missing_orders/excess_orders → 再次跑 F 总闸原条件；
+                     第二次没命中 → 放行（脏空被修正，返回 rewritten）；
+                     第二次仍命中 → 真 abort（兜底最后一道）。
+        """
         target = target or {}
         actual_agg = actual_agg or {}
         pending_map = pending_map or {}
         missing_orders = missing_orders or []
         excess_orders = excess_orders or []
 
-        n_target_contracts = len(target)
-        total_target_hands = sum(target.values())
-        total_actual_hands = sum(actual_agg.values())
+        def _calc_stats(t: dict, a: dict, mis: list, exc: list):
+            n_target_contracts = len(t)
+            total_target_hands = sum(t.values())
+            total_actual_hands = sum(a.values())
+            total_missing_vol = sum(int(mo.get("volume", 0) or 0) for mo in (mis or []))
+            n_missing_contracts = len(mis or [])
+            return n_target_contracts, total_target_hands, total_actual_hands, total_missing_vol, n_missing_contracts
 
-        total_missing_vol = sum(int(mo.get("volume", 0) or 0) for mo in missing_orders)
-        n_missing_contracts = len(missing_orders)
+        def _check_f_hit(t: dict, a: dict, mis: list, exc: list):
+            """返回 (hit_f: bool, reason: str, stats: tuple)。hit_f=True 代表这组参数会触发 F 总闸 abort。"""
+            n_target_contracts, total_target_hands, total_actual_hands, total_missing_vol, n_missing_contracts = _calc_stats(t, a, mis, exc)
+            hit_f = False
+            reason = ""
+            if total_actual_hands > 0 and n_target_contracts > 0 and total_missing_vol > 0:
+                coverage_ratio = n_missing_contracts / max(1, n_target_contracts)
+                missing_frac = total_missing_vol / max(1, total_target_hands)
+                if coverage_ratio >= 0.5 and missing_frac >= 0.8:
+                    hit_f = True
+                    reason = (
+                        f"已持仓账户({total_actual_hands}手)突然缺 {n_missing_contracts}/{n_target_contracts}="
+                        f"{coverage_ratio*100:.0f}% 合约，缺手 {total_missing_vol}/{total_target_hands}="
+                        f"{missing_frac*100:.0f}%，数学上不可能成立"
+                    )
+            if not hit_f and total_missing_vol > 0 and total_target_hands > 0:
+                if total_missing_vol > total_target_hands * 1.1 + 2:
+                    hit_f = True
+                    reason = (
+                        f"缺额总手({total_missing_vol}) > 目标总手({total_target_hands}) × 1.1 + 2，"
+                        f"数学上不可能成立（maximum missing = target - actual ≤ target）"
+                    )
+            if not hit_f and n_target_contracts >= 5 and n_missing_contracts == n_target_contracts:
+                missing_frac = total_missing_vol / max(1, total_target_hands)
+                is_first_run = bool(getattr(self, '_is_first_run', True))
+                if missing_frac >= 0.95 and not is_first_run:
+                    hit_f = True
+                    reason = (
+                        f"非首次启动(已跑过多轮)却出现「全合约缺额」：缺{n_missing_contracts}/{n_target_contracts}="
+                        f"100%合约，缺手{total_missing_vol}/{total_target_hands}="
+                        f"{missing_frac*100:.0f}%。非冷启动场景 mathematical impossible，"
+                        f"必为 CTP query_positions 脏空（actual 被读成 0）"
+                    )
+            return hit_f, reason, (n_target_contracts, total_target_hands, total_actual_hands, total_missing_vol, n_missing_contracts)
 
-        hit_f = False
-        reason = ""
-        # 语义：跟单账户已经有实际仓位了（不是冷启动的真空状态）
-        if total_actual_hands > 0 and n_target_contracts > 0 and total_missing_vol > 0:
-            # 缺额合约数 / 目标合约数 占比（缺一半以上合约）
-            coverage_ratio = n_missing_contracts / max(1, n_target_contracts)
-            # 缺额手数 / 目标总手数（缺手数已达目标 ~= 全仓）
-            missing_frac = total_missing_vol / max(1, total_target_hands)
-            # 已经有持仓 + 缺额覆盖合约≥50% + 缺额手数已达目标80%以上
-            # => 数学上不可能：真的缺 50% 合约且缺 80% 手意味着账户应该是空仓才对，
-            #    但 actual>0 证明账户非空 → actual 被脏低估 100%
-            if coverage_ratio >= 0.5 and missing_frac >= 0.8:
-                hit_f = True
-                reason = (
-                    f"已持仓账户({total_actual_hands}手)突然缺 {n_missing_contracts}/{n_target_contracts}="
-                    f"{coverage_ratio*100:.0f}% 合约，缺手 {total_missing_vol}/{total_target_hands}="
-                    f"{missing_frac*100:.0f}%，数学上不可能成立"
-                )
+        def _recompute_missing_and_excess(t: dict, a: dict, pm: dict, non_trading: set, cooling: set, is_liq_mode: bool = False):
+            """用 t/a/pm/non_trading/cooling 重算 missing_orders/excess_orders（F 总闸命中后用「历史缓存 actual」重算差异用）"""
+            mis = []
+            exc = []
+            t = dict(t or {})
+            a = dict(a or {})
+            pm = dict(pm or {})
+            non_trading = set(str(c).strip().upper() for c in (non_trading or set()))
+            cooling = set(str(c).strip().upper() for c in (cooling or set()))
+            # effective_actual = a + pending_open
+            effective = {}
+            for key in set(a.keys()) | set(t.keys()):
+                contract, direction = key
+                p_open = pm.get((str(contract).upper(), direction, True), 0) if direction in (2, 3) else 0
+                effective[key] = a.get(key, 0) + int(p_open or 0)
+            # missing
+            for key, t_vol in t.items():
+                contract, direction = key
+                if direction not in (2, 3):
+                    continue
+                if str(contract).upper() in non_trading:
+                    continue
+                eff = effective.get(key, 0)
+                if t_vol > eff:
+                    a_check = a.get(key, 0)
+                    p_check = pm.get((str(contract).upper(), direction, True), 0) if direction in (2, 3) else 0
+                    if int(a_check or 0) + int(p_check or 0) >= t_vol:
+                        # C1 开软闸：actual+pending_open 已覆盖 target，不重复补开（与 _do_sync 主流程一致）
+                        continue
+                    mis.append({
+                        "contract": contract,
+                        "direction": "buy" if direction == 2 else "sell",
+                        "volume": int(t_vol - eff),
+                    })
+            # excess
+            for key, eff in effective.items():
+                contract, direction = key
+                if direction not in (2, 3):
+                    continue
+                if str(contract).upper() in non_trading:
+                    continue
+                t_vol = t.get(key, 0)
+                vol_to_close = eff - t_vol
+                if vol_to_close > 0:
+                    real_avail = a.get(key, 0)
+                    if real_avail <= 0:
+                        continue
+                    if vol_to_close > real_avail:
+                        vol_to_close = real_avail
+                    if vol_to_close <= 0:
+                        continue
+                    if str(contract).upper() in cooling:
+                        continue
+                    is_exclude_exit = bool(getattr(self, '_is_contract_excluded', lambda c: False)(contract))
+                    exc.append({
+                        "contract": contract,
+                        "direction": direction,
+                        "volume": int(vol_to_close),
+                        "is_liquidate_mode": bool(is_liq_mode),
+                        "is_exclude_exit": bool(is_exclude_exit),
+                    })
+            return mis, exc
 
-        # 第二道纯数学校验：缺额手数 > 目标总手 × 1.1（无论 actual 空不空都拦）
-        if not hit_f and total_missing_vol > 0 and total_target_hands > 0:
-            if total_missing_vol > total_target_hands * 1.1 + 2:
-                hit_f = True
-                reason = (
-                    f"缺额总手({total_missing_vol}) > 目标总手({total_target_hands}) × 1.1 + 2，"
-                    f"数学上不可能成立（maximum missing = target - actual ≤ target）"
-                )
+        # ---- 阶段 1：先跑原 F 总闸，判定是否命中 ----
+        first_hit, first_reason, first_stats = _check_f_hit(target, actual_agg, missing_orders, excess_orders)
+        if not first_hit:
+            return (True, None, None, None)
 
-        # 第三道：非首次启动 + 缺额覆盖合约=100% + 缺手数≥目标95% → 直接拦
-        #   非首次启动说明上一轮同步时 actual 还是正常的（或至少有过持仓），
-        #   本轮不可能突然所有合约全缺（missing=target 恒等于 actual=0 才会发生），
-        #   这就是 CTP 查仓脏空的精准签名（13:33 / 14:08 两次事故都命中本条件）。
-        if not hit_f and n_target_contracts >= 5 and n_missing_contracts == n_target_contracts:
-            missing_frac = total_missing_vol / max(1, total_target_hands)
-            is_first_run = bool(getattr(self, '_is_first_run', True))
-            if missing_frac >= 0.95 and not is_first_run:
-                hit_f = True
-                reason = (
-                    f"非首次启动(已跑过多轮)却出现「全合约缺额」：缺{n_missing_contracts}/{n_target_contracts}="
-                    f"100%合约，缺手{total_missing_vol}/{total_target_hands}="
-                    f"{missing_frac*100:.0f}%。非冷启动场景 mathematical impossible，"
-                    f"必为 CTP query_positions 脏空（actual 被读成 0）"
-                )
+        # ---- 阶段 2：命中了 → 进入【历史缓存二次判定】----
+        n_target_contracts0, total_target_hands0, total_actual_hands0, total_missing_vol0, n_missing_contracts0 = first_stats
+        is_liquidate_mode = bool(getattr(self, '_is_liquidate_mode', False))
+        _f2_rewrite = None  # (容器) 脏空替换成功后：存放 actual_agg/missing_orders/excess_orders 重算结果
 
-        if not hit_f:
-            return True
+        # 2a) 先拿历史缓存（copy 出来，避免锁内耗）
+        history_rows = []
+        try:
+            history_rows = list(self._peek_actual_positions_history() or [])
+        except Exception:
+            history_rows = []
+        # history_rows 里每条是 [ts, snap_list, n_contracts, total_hands]（由 _push_actual_positions_history 写）
+        # 去掉当前刚写入的本轮快照（避免「本轮陡降但历史里最新一条=本轮」的假阳性，把本条去掉后再回看 N-1 条）
+        # 去重：如果 history_rows 最后一条 total/合约数 与本次完全一致，视为「本轮刚写进的」，去掉它
+        hist_for_review = list(history_rows or [])
+        if hist_for_review:
+            last_row = hist_for_review[-1]
+            try:
+                if int(last_row[2]) == int(total_actual_hands0 * 0 + len(actual_agg)) and int(last_row[3]) == int(total_actual_hands0):
+                    hist_for_review = hist_for_review[:-1]
+            except Exception:
+                pass
 
-        # 统计 pending_map 开仓在途，用于诊断
+        # 2b) 没历史缓存（冷启动首轮）→ 真 abort 兜底
+        if not hist_for_review:
+            _should_abort = True
+            _f2_decision_tag = "F总闸-无历史缓存-按脏空兜底 abort"
+        else:
+            # 2c) 回看 hist_for_review，判断「连续 3 次小幅度下降（真清仓）」
+            latest_3 = list(hist_for_review[-3:])
+            cur_n = int(len(actual_agg))
+            cur_v = int(total_actual_hands0)
+
+            def _within_130(row):
+                # 历史某条的合约数/总手数 都 ≤ 本次的 1.3 倍 + 2（都处于同一量级，不是陡降）
+                try:
+                    h_n = int(row[2]); h_v = int(row[3])
+                except Exception:
+                    return False
+                n_ok = (h_n <= max(2, int(cur_n * 1.3 + 2))) or h_n <= cur_n
+                v_ok = (h_v <= max(4, int(cur_v * 1.3 + 2))) or h_v <= cur_v
+                return n_ok and v_ok
+
+            if len(latest_3) >= 3 and all(_within_130(r) for r in latest_3):
+                # 真清仓：连续 3 轮 actual 都处于同一小量级 → 放行
+                _should_abort = False
+                _f2_decision_tag = "F总闸-真清仓放行（连续3轮实际持仓处于同一小量级，非陡降脏空）"
+            else:
+                # 2d) 否则（陡降特征）→ 找历史最大 actual 替换当前 actual_agg 重算
+                # 打分：合约数 * 5 + 总手数（避免手数大合约少/合约多手数少互相抵消），取最大那条
+                def _score(row):
+                    try:
+                        return int(row[2]) * 5 + int(row[3])
+                    except Exception:
+                        return -1
+                best_row = max(hist_for_review, key=_score)
+                best_snap_list = best_row[1] if len(best_row) >= 2 else []
+                best_n = int(best_row[2]) if len(best_row) >= 3 else 0
+                best_v = int(best_row[3]) if len(best_row) >= 4 else 0
+                # 安全门槛：只有当 best 至少比本次大到「≥ 本次 × 1.5 + 2」时才认定脏空并替换，
+                # 避免「历史上某次真清仓」被误当成脏空（大一点点的噪声不替换）。
+                _n_big_enough = best_n >= int(max(1, cur_n) * 1.5 + 2)
+                _v_big_enough = best_v >= int(max(1, cur_v) * 1.5 + 2)
+                if not (_n_big_enough or _v_big_enough):
+                    # 历史也没有足够大的 actual 证明是脏空 → 保守：维持 abort（等下一轮刷新）
+                    _should_abort = True
+                    _f2_decision_tag = f"F总闸-历史缓存也无大actual兜底 abort（best={best_n}合约/{best_v}手，本次={cur_n}/{cur_v}，陡降特征弱→保守）"
+                else:
+                    # 替换：用 best_snap_list 还原 actual_agg_dict2
+                    actual_agg2 = dict(self._snapshot_list_to_agg(best_snap_list) or {})
+                    # 重算 missing_orders2 / excess_orders2
+                    missing2, excess2 = _recompute_missing_and_excess(
+                        target, actual_agg2, pending_map,
+                        non_trading=set(non_trading_contracts or set()),
+                        cooling=set(cooling_contracts or set()),
+                        is_liq_mode=is_liquidate_mode,
+                    )
+                    # 第二次跑 F 总闸原条件
+                    hit2, _reason2, _stats2 = _check_f_hit(target, actual_agg2, missing2, excess2)
+                    if not hit2:
+                        _should_abort = False
+                        _f2_decision_tag = (
+                            f"F总闸-已用历史缓存替换脏空actual重算-放行 "
+                            f"(best={best_n}合约/{best_v}手 替换 本次={cur_n}/{cur_v}；"
+                            f"重算后缺额={len(missing2)}合约/{sum(int(m.get('volume',0) or 0) for m in missing2)}手，"
+                            f"F 总闸二次条件未命中 → 认为本次 actual 为脏空被修正)"
+                        )
+                        # ✅ 关键副作用：把重算后的 missing2/excess2/actual_agg2 回写到当前 _fast_sync 的同名变量，
+                        # 下游并行查询行情 / 提交委托会用新的 missing2，不会再把「脏空替换后仍需补的 0 合约」误提交。
+                        _f2_rewrite = {
+                            "actual_agg": actual_agg2,
+                            "missing_orders": missing2,
+                            "excess_orders": excess2,
+                        }
+                    else:
+                        _should_abort = True
+                        _f2_decision_tag = (
+                            f"F总闸-替换脏空actual二次校验仍命中 abort（best={best_n}合约/{best_v}手；"
+                            f"二次校验仍触发: {_reason2}）"
+                        )
+
+        # ---- 阶段 3：未 abort → 返回 (True, rewrite?)；abort → 照旧打印通知并 return(False,...) ----
+        if not _should_abort:
+            self.print(f"[F总闸-决策] {_f2_decision_tag}：放行，继续执行同步")
+            if _f2_rewrite:
+                return (True, _f2_rewrite.get("actual_agg"), _f2_rewrite.get("missing_orders"), _f2_rewrite.get("excess_orders"))
+            return (True, None, None, None)
+
+        # 原 abort 路径照旧（打印通知 + 飞书）
         pending_open_hands = sum(
             v for k, v in pending_map.items()
             if len(k) >= 3 and k[2] and v > 0
         )
         msg_lines = [
             "🛡️ 最终提交总闸拦截（F 总闸已触发，本次缺额全部弃单）：",
-            f"  触发原因：{reason}",
-            f"  标准合约={n_target_contracts}个，标准总手={total_target_hands}手",
-            f"  实际聚合={len(actual_agg)}个合约/{total_actual_hands}手",
+            f"  首次判定原因：{first_reason}",
+            f"  二次决策：{_f2_decision_tag}",
+            f"  标准合约={n_target_contracts0}个，标准总手={total_target_hands0}手",
+            f"  实际聚合={len(actual_agg)}个合约/{total_actual_hands0}手",
             f"  在途开仓={pending_open_hands}手，在途映射条数={len(pending_map)}",
-            f"  缺额计划={n_missing_contracts}个合约/共{total_missing_vol}手：",
+            f"  缺额计划={n_missing_contracts0}个合约/共{total_missing_vol0}手：",
         ]
-        for i, mo in enumerate(missing_orders[:20]):
+        for i, mo in enumerate((missing_orders or [])[:20]):
             d = "买" if mo.get("direction") == "buy" else "卖"
             msg_lines.append(f"    #{i+1:02d} {mo.get('contract','')} {d} {mo.get('volume',0)}手")
-        if len(missing_orders) > 20:
+        if len(missing_orders or []) > 20:
             msg_lines.append(f"    ... 剩余 {len(missing_orders)-20} 个合约省略")
         if excess_orders:
-            ex_vol = sum(int(eo.get("volume",0) or 0) for eo in excess_orders)
+            ex_vol = sum(int(eo.get("volume",0) or 0) for eo in (excess_orders or []))
             msg_lines.append(f"  超额计划={len(excess_orders)}个合约/共{ex_vol}手（同样弃单）")
         msg_lines.append("  -> 本轮完全 ABORT，不提交任何委托，等待下一轮用干净数据重算。")
         msg = "\n".join(msg_lines)
@@ -393,7 +586,7 @@ class PositionSyncManagerSync:
             self._notify_async(msg)
         except Exception:
             pass
-        return False
+        return (False, None, None, None)
 
     # ------------------------------------------------------------------
     # 核心流程：持仓对比 + 快速同步
@@ -602,6 +795,12 @@ class PositionSyncManagerSync:
                 else f"ratio={_raw_ratio:g}对冲模式(方向反转)" if _raw_ratio < 0
                 else f"ratio={_raw_ratio:g}正跟单模式"
             )
+            # ============== 📖 actual 聚合快照写入环形缓存（F 总闸脏空兜底 + 真清仓放行）==============
+            # 每轮同步都写一次（哪怕 F 总闸不命中也留档），默认保留最近 8 次，1 小时以上陈腐自动丢弃。
+            try:
+                self._push_actual_positions_history(actual_agg)
+            except Exception:
+                pass
             t_5_done = time.time()
             self.print(f"[同步耗时] 步骤5(聚合+解析): {(t_5_done - t_phase)*1000:.0f}ms [{_sync_mode_tag}]"); t_phase = t_5_done
 
@@ -802,7 +1001,7 @@ class PositionSyncManagerSync:
 
                 self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
 
-                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map, cancelled_ctp=cancelled_ctp, hold_mtime=_hold_mtime)
+                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map, cancelled_ctp=cancelled_ctp, hold_mtime=_hold_mtime, non_trading_contracts=set(non_trading_contracts or set()), effective_actual=dict(effective_actual or {}), cooling_contracts=list(cooling_contracts or []))
                 t_end = time.time()
                 total = t_end - sync_entry_ts
                 pre_lag = (sync_entry_ts - _hold_mtime) if _hold_mtime > 0 else 0.0
@@ -838,7 +1037,7 @@ class PositionSyncManagerSync:
             traceback.print_exc()
             return False
 
-    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None, cancelled_ctp: list = None, hold_mtime: float = 0) -> bool:
+    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None, cancelled_ctp: list = None, hold_mtime: float = 0, non_trading_contracts=None, effective_actual: dict = None, cooling_contracts=None) -> bool:
         """快速同步：并行查询 + 批量提交"""
         if target is None:
             target = {}
@@ -860,16 +1059,44 @@ class PositionSyncManagerSync:
         #   只要外部事实(actual>0但缺全仓; 或缺手>目标×1.1)成立就直接 ABORT 全弃。
         #   任何未来新增的同步入口（哪怕绕过 sync_and_trade 直接调 _fast_sync）
         #   都被这道闸口兜住。
+        #   2026-09-21 升级：命中后先回看「actual 历史环形缓存」，
+        #     连续 3 轮处于同一小量级 → 真清仓放行；
+        #     历史有≥1.5×本次的大 actual → 替换 actual 重算 missing/excess 二次校验。
+        #     返回 (ok, rewritten_actual, rewritten_missing, rewritten_excess)。
         # ============================================================
-        if not self._guard_final_total_missing(
+        f_result = self._guard_final_total_missing(
             missing_orders=missing_orders,
             excess_orders=excess_orders,
             target=target,
             actual_agg=actual_agg,
             pending_map=pending_map,
-        ):
+            non_trading_contracts=non_trading_contracts,
+            effective_actual=effective_actual,
+            cooling_contracts=cooling_contracts,
+        )
+        f_ok = False
+        f_new_actual = None
+        f_new_missing = None
+        f_new_excess = None
+        try:
+            if isinstance(f_result, (list, tuple)) and len(f_result) >= 4:
+                f_ok = bool(f_result[0])
+                f_new_actual = f_result[1]
+                f_new_missing = f_result[2]
+                f_new_excess = f_result[3]
+            else:
+                f_ok = bool(f_result)
+        except Exception:
+            f_ok = False
+        if not f_ok:
             self.print("[F总闸] 🛡️ 本轮同步已被数学绝对拦截，完全 ABORT，不提交任何委托。")
             return False
+        if f_new_actual is not None:
+            actual_agg = dict(f_new_actual)
+        if f_new_missing is not None:
+            missing_orders = list(f_new_missing)
+        if f_new_excess is not None:
+            excess_orders = list(f_new_excess)
         # ============================================================
         # 🛡️ 冷启动额外保护（首仓防御）：
         #   若是 _is_first_run 且 missing_orders 合约数超过一半目标或>10个，

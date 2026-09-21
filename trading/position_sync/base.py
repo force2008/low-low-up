@@ -208,6 +208,21 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 首次运行标志：只在第一次执行同步时为 True
         self._is_first_run: bool = True
 
+        # ---------- 持仓实际聚合历史快照环形缓存（F 总闸脏空兜底 + 真清仓放行）----------
+        # 用户场景：手动在柜台平掉大部分合约（真清仓）后，同步工具本轮查仓返回的 actual_agg
+        # 合约数/手数突然很小（2 合约/6 手），F 总闸（缺额 95%合约/95%手）直接 ABORT，不让后续缺额开仓提交。
+        # 设计：每轮 sync_and_trade 成功聚合成 actual_agg 后，写一条到环形缓存，
+        #   - 容量默认最近 8 次（可调），60 分钟以上陈腐条目自动丢弃；
+        #   - F 总闸命中 abort 前先回看历史：
+        #       a) 没历史缓存（冷启动首轮）→ 判 abort 兜底；
+        #       b) 历史中"连续 3 次" actual_agg 都≤本次的 1.3 倍（渐进式下降）→ 真清仓放行；
+        #       c) 否则 → 找历史中"合约数+手数"最大那次 actual_agg 替换当前脏空 actual，
+        #                 重算 missing/excess 再过一遍 F 总闸，脏空就会被修正。
+        self._actual_positions_history_capacity: int = 8
+        self._actual_positions_history_lock = threading.RLock()
+        # 条目结构：(ts, actual_agg_dict, n_contracts, total_hands)，actual_agg 是快照 copy 避免外部突变
+        self._actual_positions_history: list = []
+
         # ---------- 次主力稀疏 tick 行情兜底：永久已知价缓存（磁盘持久化，跨时段/跨日/跨重启保留）----------
         # 次主力合约（SM701、xx701 等）可能 30 分钟以上才有一笔行情，
         # md_provider 3s 超时永远拿不到 tick，导致超仓平仓永久被跳过。
@@ -1425,6 +1440,79 @@ class PositionSyncManagerBase(CTdSpiBase):
             return False
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # 持仓实际聚合历史快照（环形缓存）：F 总闸脏空兜底 + 真清仓放行
+    # ------------------------------------------------------------------
+    _POSITIONS_HISTORY_STALE_SECONDS = 60 * 60  # 1 小时以上陈腐条目自动丢弃（防止几天前的旧数据误兜）
+
+    def _push_actual_positions_history(self, actual_agg_dict: dict) -> bool:
+        """每次 actual_agg 聚合完成后调用，把快照写进环形缓存。
+
+        写盘策略：纯内存 RLock 保护，不触发任何 I/O；
+        条目结构 (ts, snapshot_copy, n_contracts, total_hands)；
+        容量超出时丢弃最旧条目；1 小时以上陈腐条目 append 时顺便清理。
+        """
+        try:
+            now_ts = time.time()
+            agg = dict(actual_agg_dict or {})
+            total_hands = int(sum(max(0, int(v or 0)) for v in agg.values()))
+            n_contracts = len(agg)
+            # tuple key → list 转 jsonable（快照 copy 用 list of [contract_str, dir_int, vol_int] 存储）
+            snap_list = [
+                [str(k[0]) if isinstance(k, tuple) and len(k) >= 2 else "",
+                 int(k[1]) if isinstance(k, tuple) and len(k) >= 2 else 0,
+                 int(max(0, int(v or 0)))]
+                for k, v in agg.items()
+                if isinstance(k, tuple) and len(k) >= 2 and int(max(0, int(v or 0))) > 0
+            ]
+            cutoff = now_ts - self._POSITIONS_HISTORY_STALE_SECONDS
+            cap = int(max(3, getattr(self, '_actual_positions_history_capacity', 8) or 8))
+            with getattr(self, '_actual_positions_history_lock', None) or threading.RLock():
+                # 先清理陈腐 + 裁剪旧容量
+                buf = getattr(self, '_actual_positions_history', None) or []
+                cleaned = [row for row in buf if (isinstance(row, (list, tuple)) and len(row) >= 4 and float(row[0] or 0) > cutoff)]
+                if len(cleaned) >= cap:
+                    cleaned = cleaned[len(cleaned)-cap+1:]
+                cleaned.append((now_ts, snap_list, int(n_contracts), int(total_hands)))
+                self._actual_positions_history = cleaned
+            return True
+        except Exception:
+            return False
+
+    def _peek_actual_positions_history(self) -> list:
+        """返回当前缓存快照的 copy，调用方不会污染内部缓冲区。"""
+        try:
+            with getattr(self, '_actual_positions_history_lock', None) or threading.RLock():
+                buf = getattr(self, '_actual_positions_history', None) or []
+                return [list(row) for row in buf]
+        except Exception:
+            return []
+
+    @classmethod
+    def _snapshot_list_to_agg(cls, snap_list) -> dict:
+        """把 snap_list 还原成 actual_agg dict key=(contract, direction): volume"""
+        out = {}
+        if not snap_list:
+            return out
+        try:
+            for row in snap_list or []:
+                if not isinstance(row, (list, tuple)) or len(row) < 3:
+                    continue
+                c = str(row[0] or "").strip()
+                try:
+                    d = int(row[1])
+                except Exception:
+                    d = 0
+                try:
+                    v = int(max(0, int(row[2] or 0)))
+                except Exception:
+                    v = 0
+                if c and d in (2, 3) and v > 0:
+                    out[(c, d)] = v
+        except Exception:
+            pass
+        return out
 
     # ------------------------------------------------------------------
     # CTP 查询健康度：连续超时后主动断线重连
