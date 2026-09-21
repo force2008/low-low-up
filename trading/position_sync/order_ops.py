@@ -9,6 +9,7 @@
 - _calc_pending_from_ctp, _sync_ctp_orders_to_memory, _build_pending_map
 """
 
+import math
 import os
 import threading
 import time
@@ -20,6 +21,27 @@ if PROJECT_ROOT not in __import__('sys').path:
     __import__('sys').path.insert(0, PROJECT_ROOT)
 
 from ctp.base_tdapi import tdapi
+
+
+# CTP / TTS 在"合约未订阅 / 无行情"时会把 BidPrice1/AskPrice1 填成 DOUBLE_MAX=1.797...e+308，
+# 这里设一个明显合理的价格上界，超过即视为脏数据（同时防 NaN/Inf）。
+_INVALID_PRICE_MAX_CAP = 1e9
+
+
+def _is_valid_positive_price(v) -> bool:
+    if v is None:
+        return False
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fv):
+        return False
+    if fv <= 0:
+        return False
+    if fv >= _INVALID_PRICE_MAX_CAP:
+        return False
+    return True
 
 
 class PositionSyncManagerOrderOps:
@@ -63,11 +85,20 @@ class PositionSyncManagerOrderOps:
         volume: int,
         limit_price: float,
     ) -> Optional[str]:
-        """下限价单，返回 order_ref"""
+        """下限价单，返回 order_ref。在最终调用 CTP 前再做一次价格有效性兜底拦截。"""
         exact_id = self._standardize_contract(instrument_id)
         if exact_id.upper() in self._invalid_instruments:
             self.print(f"[跳过] {exact_id} 在无效合约列表中（1006），跳过报单")
             return None
+
+        if not _is_valid_positive_price(limit_price):
+            self.print(f"[价格拦截] {exact_id} {direction} {volume}手，限价无效：limit_price={limit_price!r}，跳过报单")
+            self._notify_async(
+                f"🛡️ 价格异常拦截（未报单）\n合约：{exact_id}\n方向：{direction}\n"
+                f"手数：{volume} 手\n限价：{limit_price!r}\n原因：NaN/Inf/非正/超上限"
+            )
+            return None
+
         order_ref = self._next_order_ref()
 
         req = tdapi.CThostFtdcInputOrderField()
@@ -141,11 +172,20 @@ class PositionSyncManagerOrderOps:
         offset_flag: int,
         is_liquidate_mode: bool = False,
     ) -> bool:
-        """通用下单方法，支持指定开平标志，返回 True/False"""
+        """通用下单方法，支持指定开平标志，返回 True/False。在最终调用 CTP 前做价格有效性兜底拦截。"""
         exact_id = self._standardize_contract(instrument_id)
         if exact_id.upper() in self._invalid_instruments:
             self.print(f"[跳过] {exact_id} 在无效合约列表中（1006），跳过报单")
             return False
+
+        if not _is_valid_positive_price(limit_price):
+            self.print(f"[价格拦截] {exact_id} {direction} {volume}手(offset={offset_flag})，限价无效：limit_price={limit_price!r}，跳过报单")
+            self._notify_async(
+                f"🛡️ 价格异常拦截（未报单）\n合约：{exact_id}\n方向：{direction}\n开平：{offset_flag}\n"
+                f"手数：{volume} 手\n限价：{limit_price!r}\n原因：NaN/Inf/非正/超上限"
+            )
+            return False
+
         order_ref = self._next_order_ref()
 
         req = tdapi.CThostFtdcInputOrderField()

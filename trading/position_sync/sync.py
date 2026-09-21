@@ -9,7 +9,9 @@
 """
 
 import json
+import math
 import os
+import sys
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +23,121 @@ if PROJECT_ROOT not in __import__('sys').path:
 
 from ctp.base_tdapi import tdapi
 from config.trading_time_config import get_contracts_trading_status
+
+
+# CTP / TTS 仿真接口在"合约未订阅 / 无行情"时，会把 BidPrice1/AskPrice1/LastPrice 等字段
+# 填充为 IEEE754 双精度最大值 = sys.float_info.max = 1.7976931348623157e+308。
+# 若不拦截，会直接以"双精度最大值"下限价单 → 服务器报单被拒绝，
+# 因此设定一个明显合理的上界（目前商品期货单价最高 ~ 1e6 量级足够），
+# 超过该上界一律视为脏数据，等同 <= 0 处理。
+_INVALID_PRICE_MAX_CAP = 1e9
+
+
+def _is_valid_positive_price(v) -> bool:
+    """判断一个行情价格字段是否为有效正数。
+
+    同时拦截：None / 非数值 / NaN / ±Inf / 负数 / 零 / sys.float_info.max 等 CTP 脏数据。
+    """
+    if v is None:
+        return False
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fv):
+        return False
+    if fv <= 0:
+        return False
+    if fv >= _INVALID_PRICE_MAX_CAP:
+        return False
+    return True
+
+
+def _safe_price(v, fallback=0.0) -> float:
+    return float(v) if _is_valid_positive_price(v) else float(fallback)
+
+
+def _clamp_price_within_limits(price: float, md: Optional[dict]) -> float:
+    """若 md 中带涨跌停价，将价格钳位在 (停板价±2tick) 之内，避免越界报单被拒。"""
+    if not _is_valid_positive_price(price):
+        return price
+    if not md:
+        return price
+    upper = _safe_price(md.get("UpperLimitPrice", 0))
+    lower = _safe_price(md.get("LowerLimitPrice", 0))
+    if upper > 0 and price > upper:
+        return upper
+    if lower > 0 and price < lower:
+        return lower
+    return price
+
+
+def _calc_limit_price(
+    direction: str,
+    md: dict,
+    mode: str,
+    contract: str = "",
+    price_tick: float = 1.0,
+    logger=None,
+) -> Tuple[float, str]:
+    """统一定价入口，返回 (limit_price, pricing_note)。
+
+    Args:
+        direction: "buy" 或 "sell"
+        md:        行情 dict（含 LastPrice/BidPrice1/AskPrice1/UpperLimitPrice/LowerLimitPrice）
+        mode:      "aggressive" 主动吃单（优先对手价）｜ "passive" 排队挂单（优先本方价）
+        contract:  仅用于日志
+        price_tick:合约最小变动价位，用于日志
+        logger:    回调 logger（调用 .print(msg) 即可，传 PositionSyncManager self）
+    """
+    last = _safe_price(md.get("LastPrice", 0))
+    bid = _safe_price(md.get("BidPrice1", 0))
+    ask = _safe_price(md.get("AskPrice1", 0))
+
+    note_parts: List[str] = [f"L={last:.4f}" if last else "L=None",
+                             f"B={bid:.4f}" if bid else "B=None",
+                             f"A={ask:.4f}" if ask else "A=None"]
+
+    def _pick_buy():
+        # buy 方向：对手价=ask(卖一)，本方价=bid(买一)
+        if mode == "aggressive":
+            pri = ask or bid or last
+            tag = "A" if ask else ("B" if bid else "L")
+        else:
+            pri = bid or ask or last
+            tag = "B" if bid else ("A" if ask else "L")
+        tag_mode = "agg" if mode == "aggressive" else "pas"
+        return pri, f"[{contract}] buy {tag_mode} -> {tag}"
+
+    def _pick_sell():
+        # sell 方向：对手价=bid(买一)，本方价=ask(卖一)
+        if mode == "aggressive":
+            pri = bid or ask or last
+            tag = "B" if bid else ("A" if ask else "L")
+        else:
+            pri = ask or bid or last
+            tag = "A" if ask else ("B" if bid else "L")
+        tag_mode = "agg" if mode == "aggressive" else "pas"
+        return pri, f"[{contract}] sell {tag_mode} -> {tag}"
+
+    if direction == "buy":
+        price, note = _pick_buy()
+    else:  # sell
+        price, note = _pick_sell()
+
+    if not _is_valid_positive_price(price):
+        price = 0.0
+        note = f"{note} **PRICE_INVALID** ({','.join(note_parts)})"
+    else:
+        price = _clamp_price_within_limits(price, md)
+        note = f"{note} => {price:.4f} (tick={price_tick})"
+
+    if logger is not None:
+        try:
+            logger.print(f"[定价] {note}")
+        except Exception:
+            pass
+    return float(price), note
 
 
 class PositionSyncManagerSync:
@@ -400,14 +517,18 @@ class PositionSyncManagerSync:
                         and str(o.get("OrderStatus", "")).strip() in ("1", "3")):
                         last_price = o.get("LimitPrice", 0)
                         if mo["direction"] == "buy":
-                            current_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                            current_price = _safe_price(md.get("AskPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
                         else:
-                            current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                            current_price = _safe_price(md.get("BidPrice1", 0)) or _safe_price(md.get("LastPrice", 0))
                         info = self._get_contract_info(contract)
                         price_tick = info.get("PriceTick", 1.0)
 
                         # 检查是否需要撤单重挂：价格变化超过tick
-                        price_changed = last_price > 0 and current_price > 0 and abs(current_price - last_price) >= price_tick
+                        price_changed = (
+                            _is_valid_positive_price(last_price)
+                            and _is_valid_positive_price(current_price)
+                            and abs(current_price - last_price) >= price_tick
+                        )
 
                         if price_changed:
                             self.print(f"[开] {contract} 价格变化 {last_price}->{current_price}，撤单重挂")
@@ -435,26 +556,26 @@ class PositionSyncManagerSync:
                 #       买开 = BidPrice1（买一排队价），卖开 = AskPrice1（卖一排队价）
                 #  - passive_mode=False（默认）：用 aggressive 主动吃单价，尽快成交
                 #       买开 = AskPrice1（卖一主动吃），卖开 = BidPrice1（买一主动吃）
-                if getattr(self, '_passive_mode', False):
-                    if mo["direction"] == "buy":
-                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
-                    else:
-                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
-                else:
-                    if mo["direction"] == "buy":
-                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
-                    else:
-                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
-
-                if limit_price <= 0:
-                    self.print(f"[开] {contract} 无有效价格")
-                    skip_open[0] += 1
-                    time.sleep(0.2)
-                    continue
-
                 info = self._get_contract_info(contract)
                 if not info:
                     self.print(f"[开] {contract} 获取合约信息失败，跳过")
+                    skip_open[0] += 1
+                    time.sleep(0.2)
+                    continue
+                price_tick = info.get("PriceTick", 1.0)
+
+                mode = "passive" if getattr(self, '_passive_mode', False) else "aggressive"
+                limit_price, pricing_note = _calc_limit_price(
+                    direction=mo["direction"],
+                    md=md,
+                    mode=mode,
+                    contract=contract,
+                    price_tick=price_tick,
+                    logger=self,
+                )
+
+                if not _is_valid_positive_price(limit_price):
+                    self.print(f"[开] {contract} 无有效价格 ({pricing_note})")
                     skip_open[0] += 1
                     time.sleep(0.2)
                     continue
@@ -549,6 +670,7 @@ class PositionSyncManagerSync:
                     continue
                 exchange_id = detail.get("ExchangeID", "") or info["ExchangeID"]
                 actual_pos = detail.get("Position", 0)
+                price_tick = info.get("PriceTick", 1.0)
 
                 # ========== 关键修复：平仓前先撤销所有相反方向的委托 ==========
                 # 如果有多头超额（需要平多），先撤销所有空头委托
@@ -646,29 +768,33 @@ class PositionSyncManagerSync:
                     is_exclude_exit = bool(eo.get("is_exclude_exit", False))
                     is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
                     use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
-                    if use_passive:
-                        # passive 模式：挂卖一 AskPrice1 排队价，不急成交多赚滑点
-                        #   · 包含：ratio=0 全仓清仓（原有语义不变）
-                        #   · 新增：passive_mode=1 套利跟单账户的普通对齐调仓
-                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
-                    else:
-                        # aggressive 模式：挂买一 BidPrice1 主动吃单，尽快成交
-                        #   · 包含：普通对齐调仓（默认行为不变）
-                        #   · 包含：exclude 品种退出平仓（时间优先，尽快退）
-                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
+                    mode = "passive" if use_passive else "aggressive"
+                    limit_price, pricing_note = _calc_limit_price(
+                        direction=close_direction,
+                        md=md,
+                        mode=mode,
+                        contract=contract,
+                        price_tick=price_tick,
+                        logger=self,
+                    )
                 else:  # 空头 → 买入平仓
                     close_direction = "buy"
                     is_exclude_exit = bool(eo.get("is_exclude_exit", False))
                     is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
                     use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
-                    if use_passive:
-                        # passive 模式：挂买一 BidPrice1 排队价，不急成交多赚滑点
-                        limit_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
-                    else:
-                        # aggressive 模式：挂卖一 AskPrice1 主动吃单，尽快成交
-                        limit_price = md.get("AskPrice1", 0) or md.get("LastPrice", 0)
+                    mode = "passive" if use_passive else "aggressive"
+                    limit_price, pricing_note = _calc_limit_price(
+                        direction=close_direction,
+                        md=md,
+                        mode=mode,
+                        contract=contract,
+                        price_tick=price_tick,
+                        logger=self,
+                    )
 
-                if limit_price <= 0:
+                if not _is_valid_positive_price(limit_price):
+                    tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
+                    self.print(f"{tag} {contract} 无有效价格 ({pricing_note})")
                     skip_close[0] += 1
                     time.sleep(0.2)
                     continue
