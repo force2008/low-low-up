@@ -1201,13 +1201,20 @@ def run_once() -> bool:
         return False
     logger.info("导出成功。")
 
-    time.sleep(1)
+    if t1 - t0 > 5:
+        # 导出本身已经花了 >5s（GUI 自动化 UI 窗口点击 OK + 导出），不再额外等 1s，
+        # 避免“总节奏=8s导出+1s额外+其他>10s”继续往上叠加。
+        extra_sleep = 0.15
+    else:
+        extra_sleep = 0.2
+    time.sleep(extra_sleep)
     step_t = time.time()
 
     logger.info(">>> 步骤 2/3: 生成持仓文件...")
+    t_gen_start = time.time()
     try:
         import compare_orders
-
+        hold_files_written = 0
         if ACCOUNT_TARGETS:
             # 多源账户模式：为每个源账户生成独立的 hold-std 文件
             for source_account in ACCOUNT_TARGETS.keys():
@@ -1216,6 +1223,7 @@ def run_once() -> bool:
                     account=source_account, output_path=output_path
                 )
                 if gen_ok:
+                    hold_files_written += 1
                     logger.info("标准持仓 %s 生成完成", os.path.basename(output_path))
                 else:
                     logger.warning("标准持仓 %s 生成失败", os.path.basename(output_path))
@@ -1223,6 +1231,7 @@ def run_once() -> bool:
             # 兼容旧模式：生成单个 hold-std.json
             gen_ok = compare_orders.generate_hold_std(account=ACCOUNT)
             if gen_ok:
+                hold_files_written += 1
                 logger.info("标准持仓 hold-std.json 生成完成")
             else:
                 logger.warning("标准持仓 hold-std.json 生成失败")
@@ -1234,14 +1243,43 @@ def run_once() -> bool:
     except Exception as e:
         logger.error("生成持仓文件异常: %s", e)
 
-    t2 = time.time()
-    logger.info("步骤2(生成持仓文件) 耗时: %.2fs", t2 - step_t)
-    step_t = t2
+    hold_gen_cost = time.time() - t_gen_start
+    hold_paths_for_log = []
+    try:
+        if ACCOUNT_TARGETS:
+            for sa in ACCOUNT_TARGETS.keys():
+                p = os.path.join(_CURR_DIR, f"hold-std-{sa}.json")
+                hold_paths_for_log.append(p)
+        else:
+            hold_paths_for_log.append(os.path.join(_CURR_DIR, "hold-std.json"))
+    except Exception:
+        hold_paths_for_log = []
+    hold_file_infos = []
+    for p in hold_paths_for_log:
+        try:
+            if os.path.exists(p):
+                import datetime as _dt
+                m = os.path.getmtime(p)
+                hold_file_infos.append(
+                    f"{os.path.basename(p)} mtime={_dt.datetime.fromtimestamp(m).strftime('%H:%M:%S')}"
+                )
+        except Exception:
+            pass
+    logger.info(
+        "步骤2(生成持仓文件) 耗时: %.2fs (文件数=%d)。hold-std 写入时刻: %s",
+        hold_gen_cost, hold_files_written, "；".join(hold_file_infos) if hold_file_infos else "<none>",
+    )
+    step_t = time.time()
 
     logger.info(">>> 步骤 3/3: 持仓差异将在同步时对比（由 PositionSyncManager 处理）")
 
     total_elapsed = time.time() - t0
-    logger.info("单次 run_once 总体耗时: %.2fs", total_elapsed)
+    logger.info("单次 run_once 总体耗时: %.2fs (导出=%.2fs + 中间sleep=%.2fs + 生成hold=%.2fs)",
+                total_elapsed,
+                t1 - t0,
+                extra_sleep,
+                hold_gen_cost,
+                )
     logger.info("=" * 50)
     # 不再在此处对比，返回 False 让 run_sync 处理对比逻辑
     return False

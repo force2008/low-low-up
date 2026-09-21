@@ -318,21 +318,42 @@ class PositionSyncManagerSync:
         if not cooldown_skip and current_time - last_sync < SYNC_COOLDOWN:
             self.print(f"[跳过] 距离上次同步仅 {current_time - last_sync:.0f} 秒，冷却中（{SYNC_COOLDOWN}秒）")
             return False
-        self._last_sync_time = current_time
+        sync_entry_ts = time.time()
+        self._last_sync_time = sync_entry_ts
         if _hold_mtime > 0:
             object.__setattr__(self, "_last_sync_hold_mtime", _hold_mtime)
         if bypass_reason:
             self.print(f"[同步加速] 绕过冷却（{bypass_reason}），立即同步")
+        # 埋点：hold-std 写入时刻 → sync 真正开工的延迟，用于拆分“导出阶段耗时”和“同步阶段耗时”
+        if _hold_mtime > 0:
+            import datetime as _dt
+            write_dt_str = _dt.datetime.fromtimestamp(_hold_mtime).strftime("%H:%M:%S")
+            lag_hold_to_sync = sync_entry_ts - _hold_mtime
+            self.print(
+                f"[链路埋点] hold-std 写入时刻={write_dt_str}，写入→sync启动延迟={lag_hold_to_sync:.1f}s"
+            )
 
+        t_phase = time.time()
         try:
             # 1. 加载合约信息
             if not self._load_contract_info():
                 self.print("[错误] 加载合约信息失败")
                 return False
+            t_1_done = time.time()
+            self.print(f"[同步耗时] 步骤1(加载合约信息): {(t_1_done-t_phase)*1000:.0f}ms"); t_phase = t_1_done
 
             # 2. 查询在途委托：仅撤销需要重挂/要立刻执行对齐的委托；
             #    对 passive_mode 的开仓挂单，若挂单时长 < passive_wait_seconds，则跳过撤单。
-            ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            #    当 _hold_changed=True（真的有新导出/新订单）时，缩短查询与等待时间。
+            if _hold_changed:
+                qry_order_timeout = 6
+                qry_pos_timeout = 8
+                qry_order2_timeout = 5
+            else:
+                qry_order_timeout = 10
+                qry_pos_timeout = 15
+                qry_order2_timeout = 10
+            ctp_orders = self.query_orders(timeout=qry_order_timeout, only_pending=True, today_only=True) or []
             kept_orders = []
             cancelled_ctp = []
             if ctp_orders:
@@ -357,29 +378,29 @@ class PositionSyncManagerSync:
                         order_ref = str(o.get("OrderRef", "")).strip()
                         if self.cancel_order(order_ref):
                             cancel_success += 1
-                    # 撤单之间的节流：每条 0.2s（原来是 0.3s，提速一点）
-                    time.sleep(0.2)
+                    time.sleep(0.15)
                 self.print(f"[撤销] 已撤销 {cancel_success}/{len(cancelled_ctp)} 条委托（保留 {len(kept_orders)} 条 passive 开仓挂单）")
-                # 等待撤单确认：只对真的发过撤单请求的那批；
-                #   - 撤 1 条等 0.4s；
-                #   - 撤 N 条最多等 2s（原来一刀切 2s，很多场景浪费 1.5s+）。
                 if cancelled_ctp:
-                    wait_s = min(max(0.4, 0.4 * len(cancelled_ctp)), 2.0)
-                    self.print(f"[撤销] 等待 {wait_s:.1f}s 让撤单回报落库")
+                    raw_wait = min(max(0.3, 0.3 * len(cancelled_ctp)), 1.6)
+                    wait_s = raw_wait * (0.7 if _hold_changed else 1.0)
+                    self.print(f"[撤销] 等待 {wait_s:.2f}s 让撤单回报落库")
                     time.sleep(wait_s)
             else:
                 self.print("[撤销] 无在途委托需要撤销")
+            t_2_done = time.time()
+            self.print(f"[同步耗时] 步骤2(查单+撤单): {(t_2_done - t_phase):.2f}s"); t_phase = t_2_done
 
             # 3. 查询持仓（同步前再次确认，基于最新数据）
-            # 只在本轮回撤过单的情况下才多等一点；否则 CTP 侧没有“刚有回报刷新”的负担，缩短等待。
             if cancelled_ctp:
-                time.sleep(0.8)
+                time.sleep(0.5 if _hold_changed else 0.8)
             else:
-                time.sleep(0.2)
-            positions = self.query_positions(timeout=15)
+                time.sleep(0.1 if _hold_changed else 0.2)
+            positions = self.query_positions(timeout=qry_pos_timeout)
             if positions is None:
                 self.print("[错误] 持仓查询失败")
                 return False
+            t_3_done = time.time()
+            self.print(f"[同步耗时] 步骤3(查询持仓): {(t_3_done - t_phase):.2f}s"); t_phase = t_3_done
 
             # 4. 加载标准持仓
             if not self._load_hold_std():
@@ -399,24 +420,64 @@ class PositionSyncManagerSync:
                     self.print("[错误] 无有效标准持仓")
                     return False
                 self._save_hold_std()
+            t_4_done = time.time()
+            self.print(f"[同步耗时] 步骤4(加载标准持仓): {(t_4_done - t_phase)*1000:.0f}ms"); t_phase = t_4_done
 
             # 5. 聚合持仓
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
-            # 记录本次是否清仓模式（ratio==0），用于区分平仓策略：
-            #   清仓模式 → passive 排队挂单；正常对齐 → aggressive 吃单
-            self._is_liquidate_mode = (getattr(self, '_position_ratio', 1.0) == 0)
+            _raw_ratio = float(getattr(self, '_position_ratio', 1.0))
+            self._is_liquidate_mode = abs(_raw_ratio) < 1e-9  # 浮点数 0 兼容 0.0/-0.0/非标准极小值
+            _sync_mode_tag = (
+                "ratio=0清仓模式" if self._is_liquidate_mode
+                else f"ratio={_raw_ratio:g}对冲模式(方向反转)" if _raw_ratio < 0
+                else f"ratio={_raw_ratio:g}正跟单模式"
+            )
+            t_5_done = time.time()
+            self.print(f"[同步耗时] 步骤5(聚合+解析): {(t_5_done - t_phase)*1000:.0f}ms [{_sync_mode_tag}]"); t_phase = t_5_done
+
+            # ========== 🛡️ 13:33 超仓事故硬闸 B1+B2：持仓查询脏空拦截 ==========
+            # B1: 查询返回 0 条记录 但 标准仓有合约 → 判脏空，禁止任何对齐
+            #     （在 ratio=0 清仓模式下，target 本身就是空 dict，n_target_contracts=0，B1 天然不命中，不误拦）
+            # B2: 实际总手=0 但 标准总手>0（positions有记录但每条手数=0的脏态）→ 同样拦截
+            #     （ratio=0 清仓模式下 total_target_hands=0，B2 条件里直接跳过；ratio 任何非 0 值都要硬拦）
+            n_pos_rows = len(positions) if positions is not None else 0
+            n_target_contracts = len(target)
+            total_target_hands = sum(target.values()) if target else 0
+            total_actual_hands = sum(actual_agg.values()) if actual_agg else 0
+            b1_hit = (n_pos_rows == 0 and n_target_contracts > 0)
+            b2_hit = (total_actual_hands == 0 and total_target_hands > 0 and not self._is_liquidate_mode)
+            if b1_hit or b2_hit:
+                hold_tag = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_hold_mtime)) if _hold_mtime > 0 else "N/A"
+                msg_lines = [
+                    "🛡️ 持仓查询脏空拦截（13:33事故硬闸，本轮对齐已终止）：",
+                    f"  模式：{_sync_mode_tag}",
+                    f"  触发条件：B1(返回0条且标准仓非空)={'✅命中' if b1_hit else '未触发'}  B2(实际总手=0且标准总手>0)={'✅命中' if b2_hit else '未触发'}",
+                    f"  持仓查询返回条数={n_pos_rows}，标准仓合约数={n_target_contracts}",
+                    f"  实际总仓={total_actual_hands}手，标准总仓={total_target_hands}手",
+                    f"  hold-std写入时刻={hold_tag}",
+                    f"  -> 拒绝本轮任何开/平仓，避免用 0 仓对齐非 0 标准仓导致翻倍超仓。",
+                ]
+                msg = "\n".join(msg_lines)
+                self.print(msg)
+                self._notify_async(msg)
+                return False
+            # ========== 硬闸结束 ==========
 
             # 6. 再次查询在途委托（撤销后的状态）
-            ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            ctp_orders = self.query_orders(timeout=qry_order2_timeout, only_pending=True, today_only=True) or []
             if ctp_orders:
                 self.print(f"[委托] 撤销后剩余 CTP 在途 {len(ctp_orders)} 条")
                 self._sync_ctp_orders_to_memory(ctp_orders)
             else:
                 self.print("[委托] 撤销后无在途委托")
+            t_6_done = time.time()
+            self.print(f"[同步耗时] 步骤6(二次查单): {(t_6_done - t_phase):.2f}s"); t_phase = t_6_done
 
             # 7. 构建在途映射
             pending_map = self._build_pending_map(ctp_orders)
+            t_7_done = time.time()
+            self.print(f"[同步耗时] 步骤7(构建在途映射): {(t_7_done - t_phase)*1000:.0f}ms"); t_phase = t_7_done
 
             # 8. 计算有效持仓
             # 修复：只在开仓方向扣减在途委托，不在平仓方向扣减
@@ -466,11 +527,23 @@ class PositionSyncManagerSync:
                     continue
                 effective_vol = effective_actual.get(key, 0)
                 if t_vol > effective_vol:
-                    self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 有效{effective_vol}, 缺额{t_vol - effective_vol}")
+                    # ========== 🛡️ 开软闸 C1：生成阶段再核对 actual_agg + pending_open 是否确实 < target ==========
+                    # 兜住「query_orders 超时 → pending_map 丢失 → effective_vol 被算低 → 重复补开」（如13:33:03 br2611前兆）
+                    a_vol_check = actual_agg.get(key, 0)
+                    p_open_check = pending_map.get((contract.upper(), direction, True), 0)
+                    if a_vol_check + p_open_check >= t_vol:
+                        self.print(
+                            f"[开软闸] {contract} {'多' if direction == 2 else '空'} "
+                            f"actual({a_vol_check}) + pending_open({p_open_check}) = {a_vol_check + p_open_check} "
+                            f">= target({t_vol})，跳过重复补开（effective_vol={effective_vol} 疑似因查询超时被低估）"
+                        )
+                        continue
+                    planned_vol = t_vol - effective_vol
+                    self.print(f"[缺额计算] {contract} {'多' if direction == 2 else '空'}: 标准{t_vol} vs 有效{effective_vol}, 缺额{planned_vol}")
                     missing_orders.append({
                         "contract": contract,
                         "direction": "buy" if direction == 2 else "sell",
-                        "volume": t_vol - effective_vol,
+                        "volume": planned_vol,
                     })
 
             # 计算超额（使用 effective_actual = actual_agg + pending_open）
@@ -482,6 +555,18 @@ class PositionSyncManagerSync:
                 t_vol = target.get(key, 0)
                 vol_to_close = effective_vol - t_vol
                 if vol_to_close > 0:
+                    # ========== 🛡️ 平软闸 D1：生成阶段用 actual_agg 兜底（不能计划平比实际持有的还多） ==========
+                    real_avail = actual_agg.get(key, 0)
+                    if real_avail <= 0:
+                        continue
+                    if vol_to_close > real_avail:
+                        self.print(
+                            f"[平软闸] {contract} {'多' if direction == 2 else '空'} "
+                            f"计划平{vol_to_close}截短到实际持有{real_avail}（effective_vol={effective_vol} 被高估）"
+                        )
+                        vol_to_close = real_avail
+                    if vol_to_close <= 0:
+                        continue
                     # 跳过1009冷却期内的合约
                     if contract.upper() in cooling_contracts:
                         self.print(f"[平] {contract} 在1009冷却期内（30秒），跳过本次平仓")
@@ -503,6 +588,8 @@ class PositionSyncManagerSync:
 
             # 10. 更新 hold.json
             self._update_hold_json_file()
+            t_10_done = time.time()
+            self.print(f"[同步耗时] 步骤8~10(计算差异+更新hold): {(t_10_done - t_phase):.2f}s"); t_phase = t_10_done
 
             # 11. 输出对比摘要
             skipped_contracts = sorted(non_trading_contracts)
@@ -555,12 +642,21 @@ class PositionSyncManagerSync:
 
                 self._notify_async("🔄 持仓差异检测到，准备同步：\n" + "\n".join(diff_lines))
 
-                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map)
+                success = self._fast_sync(missing_orders, excess_orders, ctp_orders, target, actual_agg, pending_map, cancelled_ctp=cancelled_ctp, hold_mtime=_hold_mtime)
+                t_end = time.time()
+                total = t_end - sync_entry_ts
+                pre_lag = (sync_entry_ts - _hold_mtime) if _hold_mtime > 0 else 0.0
+                self.print(
+                    f"[链路总耗时] hold-std写入→CTP报单完成 = 写→同步启动(前导)={pre_lag:.1f}s + 同步内部流程={total:.1f}s "
+                    f"= {pre_lag + total:.1f}s"
+                )
                 self.print("[结论] 同步完成（委托已提交）")
                 self._is_first_run = False
                 return success
             else:
                 self.print("[结论] 当前交易时段内持仓一致，无需操作")
+                t_end = time.time()
+                self.print(f"[同步耗时] 无差异路径总耗时: {t_end - sync_entry_ts:.1f}s")
                 # 这条消息与 base.py 中"15秒持仓巡检"心跳不同：
                 # 它表示"某一次实际进入 _do_sync 的完整同步流程（可能是文件变更触发、也可能是巡检触发）
                 # 跑完后发现仓位一致"，因此不写固定秒数，避免与巡检心跳秒数形成误导
@@ -582,7 +678,7 @@ class PositionSyncManagerSync:
             traceback.print_exc()
             return False
 
-    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None) -> bool:
+    def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None, cancelled_ctp: list = None, hold_mtime: float = 0) -> bool:
         """快速同步：并行查询 + 批量提交"""
         if target is None:
             target = {}
@@ -590,10 +686,13 @@ class PositionSyncManagerSync:
             actual_agg = {}
         if pending_map is None:
             pending_map = {}
+        if cancelled_ctp is None:
+            cancelled_ctp = []
 
         self.print("=" * 50)
         self.print("【快速同步模式】")
         self.print("=" * 50)
+        _t_fast_start = time.time()
 
         # ============================================================
         # 第一阶段：并行查询所有行情
@@ -732,6 +831,60 @@ class PositionSyncManagerSync:
                     time.sleep(0.2)
                     continue
 
+                # ========== 🛡️ Fix3 同合约短时间重开保护（防 double submit，如 br2611 前兆） ==========
+                # 同一合约同方向 <3s 内发生过撤单/拒绝 → 本轮不再立即补开，等下一轮同步（0.5s 扫描粒度会很快追上来）
+                # 【方向编码对齐 target/actual_agg/pending_map】：2=多/买入方向，3=空/卖出方向（CTP PosiDirection 枚举）
+                dir2 = 2 if mo["direction"] == "buy" else 3
+                now_ts = time.time()
+                recent_cancel_hit = False
+                recent_reason = ""
+                # 命中 a)：本轮回撤单列表 cancelled_ctp 中刚撤过相同方向的开仓
+                for co in cancelled_ctp:
+                    co_instr = str(co.get("InstrumentID", "")).upper()
+                    co_dir = str(co.get("Direction", "")).strip()
+                    co_offset = str(co.get("CombOffsetFlag", "")).strip()
+                    if co_instr != mo_upper:
+                        continue
+                    want_dir = (tdapi.THOST_FTDC_D_Buy if mo["direction"] == "buy" else tdapi.THOST_FTDC_D_Sell).strip()
+                    if co_dir == want_dir and co_offset == str(tdapi.THOST_FTDC_OF_Open).strip():
+                        recent_cancel_hit = True
+                        recent_reason = "本轮刚撤过该合约同方向开仓(cancelled_ctp)"
+                        break
+                # 命中 b)：本地 _orders 内存中近 3s 内的撤单 / 拒绝记录
+                if not recent_cancel_hit:
+                    with self._order_lock:
+                        for _ref, _info in list(self._orders.items()):
+                            if str(_info.get("instr", "")).upper() != mo_upper:
+                                continue
+                            _info_dir = _info.get("direction", "")
+                            _info_offset = _info.get("offset_flag", "")
+                            if _info_dir != mo["direction"]:
+                                continue
+                            if _info_offset != tdapi.THOST_FTDC_OF_Open:
+                                continue
+                            _status = str(_info.get("OrderStatus", "")).strip()
+                            _status_time = float(_info.get("status_ts", 0) or 0)
+                            # 5: 已撤单 / a: 拒单 / 4: 撤单中（兼容状态码）
+                            if _status in ("5", "a", "6", "4") and (now_ts - _status_time) < 3.0:
+                                recent_cancel_hit = True
+                                recent_reason = f"本地_orders 3s内状态={_status} elapsed={now_ts - _status_time:.1f}s"
+                                break
+                # 命中 c)：_last_1009_reject 中该合约仍在冷却（虽然生成段已有，但提交端兜底）
+                if not recent_cancel_hit and hasattr(self, '_last_1009_reject'):
+                    rej_ts = self._last_1009_reject.get(mo_upper, 0)
+                    if 0 < (now_ts - rej_ts) < SYNC_COOLDOWN:
+                        recent_cancel_hit = True
+                        recent_reason = f"1009拒绝冷却期内 {now_ts - rej_ts:.1f}s<{SYNC_COOLDOWN}s"
+                if recent_cancel_hit:
+                    self.print(
+                        f"[重开保护🛡️] {contract} {mo['direction']} vol={mo['volume']} → 本轮跳过不补开 "
+                        f"（原因: {recent_reason}）→ 等下一轮同步再核对"
+                    )
+                    skip_open[0] += 1
+                    time.sleep(0.2)
+                    continue
+                # ========== Fix3 结束 ==========
+
                 # 下单
                 # 开仓定价策略：
                 #  - passive_mode=True（套利跟单被动模式）：用被动排队价，挂买一/卖一排队，赚滑点
@@ -758,6 +911,20 @@ class PositionSyncManagerSync:
 
                 if not _is_valid_positive_price(limit_price):
                     self.print(f"[开] {contract} 无有效价格 ({pricing_note})")
+                    skip_open[0] += 1
+                    time.sleep(0.2)
+                    continue
+
+                # ========== 🛡️ 开软闸 C2：提交端再兜底（actual_agg + pending_open >= target 就不提交） ==========
+                key_check = (contract, dir2)
+                a_check2 = actual_agg.get(key_check, 0)
+                p_check2 = pending_map.get((mo_upper, dir2, True), 0)
+                t_check2 = target.get(key_check, 0)
+                if t_check2 > 0 and a_check2 + p_check2 >= t_check2:
+                    self.print(
+                        f"[开软闸] {contract} {mo['direction']} actual={a_check2} + pending_open={p_check2} "
+                        f"= {a_check2 + p_check2} >= target={t_check2}，跳过重复补开（提交端兜底）"
+                    )
                     skip_open[0] += 1
                     time.sleep(0.2)
                     continue
@@ -796,6 +963,7 @@ class PositionSyncManagerSync:
         submitted_close = [0]
         skip_close = [0]
         close_orders = []  # 记录已提交的平仓委托
+        clipped_cases = []  # 记录所有🛡️软闸截短的案例（开+平），末尾发汇总
 
         def _submit_close_serial():
             """串行提交平仓委托（与 PositionManagerUI.py 的 _do_close_all_batch 保持一致）"""
@@ -908,10 +1076,10 @@ class PositionSyncManagerSync:
                     self.print(f"[平] {contract} 有 {len(opposite_orders_to_cancel)} 笔相反方向委托，先全部撤销")
                     for pending_ref in opposite_orders_to_cancel:
                         self.cancel_order(pending_ref)
-                        time.sleep(0.5)  # 增加等待时间，确保撤单完成
+                        time.sleep(0.2)  # 原来 0.5s，压缩到 0.2s
                     # 重要：撤销后重新查询持仓，确保平仓量基于最新数据
                     self.print(f"[平] {contract} 撤销完成，重新查询持仓...")
-                    time.sleep(1)  # 等待 CTP 更新持仓数据
+                    time.sleep(0.5)  # 原来 1s，压缩到 0.5s
                     # 重新查询持仓（这是关键！）
                     new_positions = self.query_positions(timeout=5)
                     if new_positions:
@@ -933,6 +1101,13 @@ class PositionSyncManagerSync:
                     time.sleep(0.2)
                     continue
 
+                # ========== 🛡️ 平软闸 D2a：按可用持仓截短（不允许计划平出比实际还多的量） ==========
+                if eo["volume"] > available:
+                    clipped_cases.append(f"[平软闸D2a] {contract} 计划{eo['volume']}→截短到{available}（实际持仓上限）")
+                    self.print(
+                        f"[平软闸🛡️] {contract} {'多' if pos_dir == 2 else '空'} 计划平仓{eo['volume']}手 "
+                        f"→ 截短到可用持仓{available}手（effective_vol被高估）"
+                    )
                 diff = min(eo["volume"], available)
                 self.print(f"[平调试] {contract} diff初始值={diff}")
                 if diff <= 0:
@@ -994,7 +1169,8 @@ class PositionSyncManagerSync:
                     continue
                 # 如果最新持仓小于计划平仓量，以最新持仓为准
                 if latest_pos < diff:
-                    self.print(f"[平] {contract} 持仓变化: {diff} -> {latest_pos}")
+                    clipped_cases.append(f"[平软闸D2b] {contract} diff{diff}→截短到最新持仓{latest_pos}（提交前二次查询）")
+                    self.print(f"[平软闸🛡️] {contract} 二次查询截短: 计划{diff}手 → 最新持仓{latest_pos}手，按{latest_pos}手提交")
                     diff = latest_pos
 
                 is_shfe = exchange_id in ("SHFE", "INE")
@@ -1122,7 +1298,21 @@ class PositionSyncManagerSync:
                 lines.append("⚠️ 请检查日志查看跳过原因（可能：查不到行情/合约信息/持仓已为0）")
             self._notify_async("\n".join(lines))
 
+        # ========== 🛡️ 软闸截短汇总（命中则单独发飞书） ==========
+        if clipped_cases:
+            hold_tag = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(hold_mtime)) if hold_mtime > 0 else "N/A"
+            clip_lines = [
+                f"🛡️ 本轮同步风控软闸共命中 {len(clipped_cases)} 次（已全部自动截短，未超量提交）：",
+                f"  hold-std写入时刻={hold_tag}",
+                f"  标准仓={total_target}手 实际CTP={total_actual}手 提交={total_submit} 跳过开={skip_open[0]} 跳过平={skip_close[0]}",
+            ]
+            for idx, case in enumerate(clipped_cases, 1):
+                clip_lines.append(f"  [{idx}] {case}")
+            self._notify_async("\n".join(clip_lines))
+            self.print("\n".join(clip_lines))
+
         self.print(f"[快速] 完成: 开仓 {submitted_open[0]}/{len(missing_orders)} 平仓 {submitted_close[0]}/{len(excess_orders)}")
+        self.print(f"[快速同步耗时] 总耗时={time.time() - _t_fast_start:.2f}s")
         print("=" * 50)
         return True
 
