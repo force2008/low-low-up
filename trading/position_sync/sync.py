@@ -242,12 +242,36 @@ class PositionSyncManagerSync:
 
         self._is_syncing = True
         try:
-            return self._do_sync(trade_volume, timeout, position_ratio=position_ratio, lock_held=True)
+            # 在拿到锁之后、进入 _do_sync 之前，先检查 hold-std 有没有更新。
+            #
+            # 因为 sync_and_trade 有两个来源：
+            #   A) run_position_sync_loop 明确感知 hold 文件 mtime 触发 → 这时 hold 文件肯定有变更；
+            #   B) _check_position_diff 定时巡检 / 关键时点 force_sync → 这时 hold 文件不一定变不变。
+            # 只有 B 的情况下"同一份 hold 配置如果 15s 内反复触发，才需要 SYNC_COOLDOWN 拦住（CTP 持仓查询本身有刷新延迟）；
+            # A 的情况下，hold 文件一旦有变更，必须立刻放行，否则就会出现“源账户下单 → 等 15s 才同步”这种 37s 级滑点。
+            hold_std_path = getattr(self, "hold_std_path", None)
+            hold_mtime_now = 0.0
+            if hold_std_path and os.path.exists(str(hold_std_path)):
+                try:
+                    hold_mtime_now = os.path.getmtime(str(hold_std_path))
+                except OSError:
+                    hold_mtime_now = 0.0
+            hold_changed = False
+            last_hold_mtime = getattr(self, "_last_sync_hold_mtime", 0.0)
+            if hold_mtime_now > 0 and last_hold_mtime > 0 and hold_mtime_now > last_hold_mtime:
+                hold_changed = True
+            # 记住本次看到的 mtime，作为下次比较基线（哪怕这次被 cooldown 跳过，也不更新，保证下一轮 hold 变了还能判断“又变过”）
+            object.__setattr__(self, "_last_sync_hold_mtime_seen", hold_mtime_now)
+            return self._do_sync(
+                trade_volume, timeout, position_ratio=position_ratio, lock_held=True,
+                _hold_mtime=hold_mtime_now, _hold_changed=hold_changed,
+            )
         finally:
             self._is_syncing = False
             self._sync_lock.release()
 
-    def _do_sync(self, trade_volume: int = 1, timeout: int = 30, position_ratio: float = None, lock_held: bool = False) -> bool:
+    def _do_sync(self, trade_volume: int = 1, timeout: int = 30, position_ratio: float = None, lock_held: bool = False,
+                 _hold_mtime: float = 0.0, _hold_changed: bool = False) -> bool:
         """执行同步：加载数据 -> 对比 -> 快速同步
 
         position_ratio 参数语义（2026-09-11 升级后）：
@@ -256,6 +280,9 @@ class PositionSyncManagerSync:
           - 非 None：
               · 浮点数非法（NaN / inf） → 忽略，保持现有 ratio 不变
               · 合法实数：覆盖 self._position_ratio，可能 >0 跟单 =0 清仓 <0 对冲
+
+        _hold_mtime/_hold_changed：
+          仅在 sync_and_trade 调用时注入；用于区分“真的有新 hold 文件”和“定时巡检/关键时点的重复触发”。
         """
         if position_ratio is not None:
             try:
@@ -273,14 +300,29 @@ class PositionSyncManagerSync:
         self.print(f"【持仓比例】{self._position_ratio}")
         self.print("=" * 60)
 
-        # 检查冷却期：上次同步后15秒内不再同步（避免CTP持仓数据滞后导致重复下单）
+        # 冷却门：
+        #   · hold 文件有变更 → 立即放行（哪怕上次同步才几秒钟前；
+        #   · 否则用同一份 hold 配置在 15 秒内被重复调用 → 保留 15 秒冷却（防CTP昨/今仓刷新延迟导致的重复下单）。
         current_time = time.time()
         last_sync = getattr(self, '_last_sync_time', 0)
-        SYNC_COOLDOWN = 15  # 15秒冷却（加速对齐，减少滑点；若1009拒绝增多可调回20-25）
-        if current_time - last_sync < SYNC_COOLDOWN:
+        SYNC_COOLDOWN = 15  # 同一份配置连续触发时的冷却（秒数；hold有变则完全绕过。
+        bypass_reason = ""
+        if _hold_changed and _hold_mtime > 0:
+            # 明确 hold 文件有新变更 → 跳过 cooldown，让同步立刻执行。
+            cooldown_skip = True
+            bypass_reason = f"hold-std changed (hold_mtime=%.3f vs last=%.3f)" % (_hold_mtime, getattr(self, "_last_sync_hold_mtime", 0.0))
+        elif last_sync <= 0:
+            cooldown_skip = True
+        else:
+            cooldown_skip = False
+        if not cooldown_skip and current_time - last_sync < SYNC_COOLDOWN:
             self.print(f"[跳过] 距离上次同步仅 {current_time - last_sync:.0f} 秒，冷却中（{SYNC_COOLDOWN}秒）")
             return False
         self._last_sync_time = current_time
+        if _hold_mtime > 0:
+            object.__setattr__(self, "_last_sync_hold_mtime", _hold_mtime)
+        if bypass_reason:
+            self.print(f"[同步加速] 绕过冷却（{bypass_reason}），立即同步")
 
         try:
             # 1. 加载合约信息
@@ -315,16 +357,25 @@ class PositionSyncManagerSync:
                         order_ref = str(o.get("OrderRef", "")).strip()
                         if self.cancel_order(order_ref):
                             cancel_success += 1
-                    time.sleep(0.3)
+                    # 撤单之间的节流：每条 0.2s（原来是 0.3s，提速一点）
+                    time.sleep(0.2)
                 self.print(f"[撤销] 已撤销 {cancel_success}/{len(cancelled_ctp)} 条委托（保留 {len(kept_orders)} 条 passive 开仓挂单）")
-                # 等待撤单确认（只对主动撤销的部分；保留的挂单不等）
+                # 等待撤单确认：只对真的发过撤单请求的那批；
+                #   - 撤 1 条等 0.4s；
+                #   - 撤 N 条最多等 2s（原来一刀切 2s，很多场景浪费 1.5s+）。
                 if cancelled_ctp:
-                    time.sleep(2)
+                    wait_s = min(max(0.4, 0.4 * len(cancelled_ctp)), 2.0)
+                    self.print(f"[撤销] 等待 {wait_s:.1f}s 让撤单回报落库")
+                    time.sleep(wait_s)
             else:
                 self.print("[撤销] 无在途委托需要撤销")
 
             # 3. 查询持仓（同步前再次确认，基于最新数据）
-            time.sleep(1)  # 等待 CTP 更新
+            # 只在本轮回撤过单的情况下才多等一点；否则 CTP 侧没有“刚有回报刷新”的负担，缩短等待。
+            if cancelled_ctp:
+                time.sleep(0.8)
+            else:
+                time.sleep(0.2)
             positions = self.query_positions(timeout=15)
             if positions is None:
                 self.print("[错误] 持仓查询失败")

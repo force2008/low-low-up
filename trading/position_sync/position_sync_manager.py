@@ -339,11 +339,11 @@ def run_position_sync_loop(
                 else:
                     # 文件没变，使用 stop_event 等待以便能及时响应退出信号
                     _wait_event = stop_event if stop_event is not None else threading.Event()
-                    _wait_event.wait(timeout=2)
+                    _wait_event.wait(timeout=0.5)
             else:
                 # 文件不存在，使用 stop_event 等待以便能及时响应退出信号
                 _wait_event = stop_event if stop_event is not None else threading.Event()
-                _wait_event.wait(timeout=2)
+                _wait_event.wait(timeout=0.5)
 
     except Exception as e:
         _log(f"[异常] 同步循环出错: {e}")
