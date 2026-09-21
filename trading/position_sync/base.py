@@ -1489,6 +1489,60 @@ class PositionSyncManagerBase(CTdSpiBase):
         except Exception:
             return []
 
+    def _fallback_actual_positions_from_history(self, max_stale_seconds: int = 900) -> dict:
+        """当 query_positions 超时返回 None 时，从历史环形缓存取最新一条有效 actual_agg。
+
+        返回值：actual_agg_dict（空 dict 表示没有可用 fallback）。
+        max_stale_seconds 默认 15 分钟；超过时间的快照不用，防止隔夜或关盘后几小时还在用旧持仓。
+        副作用：会把还原出来的持仓列表写回 self._actual_positions（让 _aggregate_actual_positions() 正常聚合），
+                 否则聚合会读到空列表，相当于「查超时就当持仓 0」和原来的逻辑一样反而更危险。
+        """
+        try:
+            buf = self._peek_actual_positions_history() or []
+            if not buf:
+                return {}
+            now_ts = time.time()
+            cutoff = now_ts - max(60, int(max_stale_seconds or 900))
+            # 找最新的一条（时间倒序），时间 > cutoff 就用
+            usable = [r for r in buf if isinstance(r, (list, tuple)) and len(r) >= 4 and float(r[0] or 0) > cutoff]
+            if not usable:
+                return {}
+            latest = usable[-1]
+            ts = float(latest[0] or 0)
+            snap = latest[1] if len(latest) >= 2 else None
+            n = int(latest[2]) if len(latest) >= 3 else 0
+            v = int(latest[3]) if len(latest) >= 4 else 0
+            agg = dict(self._snapshot_list_to_agg(snap) or {})
+            if not agg:
+                return {}
+            # 还原成 self._actual_positions 列表（这样 _aggregate_actual_positions() 能正确读取合约方向和手数）
+            restored_rows = []
+            try:
+                for (contract, direction), vol in agg.items():
+                    d_str = "2" if int(direction or 0) == 2 else "3"
+                    restored_rows.append({
+                        "InstrumentID": str(contract or "").strip().upper(),
+                        "PosiDirection": int(d_str),
+                        "Position": int(max(0, int(vol or 0))),
+                        "TodayPosition": int(max(0, int(vol or 0))),
+                        "YdPosition": 0,
+                    })
+            except Exception:
+                restored_rows = []
+            if restored_rows:
+                try:
+                    object.__setattr__(self, '_actual_positions', list(restored_rows))
+                except Exception:
+                    self._actual_positions = list(restored_rows)
+            stale_min = (now_ts - ts) / 60.0 if ts > 0 else 0.0
+            self.print(
+                f"[历史缓存-查仓超时兜底] 本次 query_positions 超时返回 None，用 {stale_min:.1f} 分钟前的历史快照继续执行："
+                f"{n} 合约 / {v} 手"
+            )
+            return dict(agg)
+        except Exception:
+            return {}
+
     @classmethod
     def _snapshot_list_to_agg(cls, snap_list) -> dict:
         """把 snap_list 还原成 actual_agg dict key=(contract, direction): volume"""
@@ -1680,10 +1734,17 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         try:
             # 查询 CTP 实际持仓
-            positions = self.query_positions(timeout=10)
+            positions = self.query_positions(timeout=15)
             if positions is None:
-                self.print("[监控] 持仓查询失败")
-                return
+                # 15 秒巡检：查超时就用历史 15 分钟内快照继续对比，避免「锁被占用 5 秒 + 查询超时 → 连续丢多轮巡检，差异隐瞒不报」
+                self.print("[监控] 持仓查询超时返回 None，尝试用历史实际持仓快照继续对比")
+                fallback_agg = dict(self._fallback_actual_positions_from_history(max_stale_seconds=900) or {})
+                if not fallback_agg:
+                    self.print("[监控] 无可用历史快照，本次巡检跳过")
+                    return
+                self._positions_source_tag = "fallback_history_monitor"
+            else:
+                self._positions_source_tag = "live_monitor"
 
             # 加载标准持仓
             if not self._load_hold_std():

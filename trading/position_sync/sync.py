@@ -707,13 +707,15 @@ class PositionSyncManagerSync:
             # 2. 查询在途委托：仅撤销需要重挂/要立刻执行对齐的委托；
             #    对 passive_mode 的开仓挂单，若挂单时长 < passive_wait_seconds，则跳过撤单。
             #    当 _hold_changed=True（真的有新导出/新订单）时，缩短查询与等待时间。
+            # 2026-09-21 超时优化：今日 100+ 超时与「qry_pos_timeout 8/15s 过短」有关，
+            #   统一加 4s：hold 变 8→12s，不变 15→20s；默认 retries 仍 2 次 → 单轮最大等待 36s/60s
             if _hold_changed:
                 qry_order_timeout = 6
-                qry_pos_timeout = 8
+                qry_pos_timeout = 12
                 qry_order2_timeout = 5
             else:
                 qry_order_timeout = 10
-                qry_pos_timeout = 15
+                qry_pos_timeout = 20
                 qry_order2_timeout = 10
             ctp_orders = self.query_orders(timeout=qry_order_timeout, only_pending=True, today_only=True) or []
             kept_orders = []
@@ -759,8 +761,17 @@ class PositionSyncManagerSync:
                 time.sleep(0.1 if _hold_changed else 0.2)
             positions = self.query_positions(timeout=qry_pos_timeout)
             if positions is None:
-                self.print("[错误] 持仓查询失败")
-                return False
+                # ============== 查询超时兜底：查环形缓存里最近 15 分钟内的历史 actual_agg 继续执行 ==============
+                self.print("[错误] 持仓查询超时返回 None，尝试用历史实际持仓快照继续执行（不立即 abort）")
+                fallback_agg = dict(self._fallback_actual_positions_from_history(max_stale_seconds=900) or {})
+                if not fallback_agg:
+                    self.print("[错误] 无可用历史快照，本次同步 abort（等下一轮查询恢复）")
+                    return False
+                # 用 fallback 生成的列表继续走（_aggregate_actual_positions 会读到恢复后的 self._actual_positions）
+                # 打一条 tag 方便追踪：本次 actual 是历史缓存，非实时
+                self._positions_source_tag = "fallback_history"
+            else:
+                self._positions_source_tag = "live"
             t_3_done = time.time()
             self.print(f"[同步耗时] 步骤3(查询持仓): {(t_3_done - t_phase):.2f}s"); t_phase = t_3_done
 
