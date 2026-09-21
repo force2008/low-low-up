@@ -1175,8 +1175,14 @@ def force_sync():
             logger.info("已释放交易锁: 强制同步结束")
 
 
-def run_once():
-    """单次执行：导出 -> 为所有配置源账户生成持仓文件"""
+def run_once() -> bool:
+    """单次执行：导出 -> 为所有配置源账户生成持仓文件。
+
+    返回 True 表示本次导出+文件生成成功；False 表示中途失败。
+    调用方会按“返回时刻 + 耗时”打日志，便于用户核对“从点击OK 按钮算起到下一次OK”的节奏。
+    """
+    t0 = time.time()
+    step_t = t0
     logger.info("=" * 50)
     logger.info("开始执行: 导出 -> 持仓差异对比")
     logger.info(">>> 步骤 1/3: 执行自动导出...")
@@ -1186,13 +1192,17 @@ def run_once():
     except Exception as e:
         logger.error("导出步骤异常: %s", e)
         success = False
+    t1 = time.time()
+    logger.info("步骤1(自动导出) 耗时: %.2fs 结果=%s", t1 - step_t, "OK" if success else "FAIL")
+    step_t = t1
 
     if not success:
-        logger.warning("导出失败，中断后续流程。")
+        logger.warning("导出失败，中断后续流程。总体耗时: %.2fs", time.time() - t0)
         return False
     logger.info("导出成功。")
 
     time.sleep(1)
+    step_t = time.time()
 
     logger.info(">>> 步骤 2/3: 生成持仓文件...")
     try:
@@ -1224,38 +1234,92 @@ def run_once():
     except Exception as e:
         logger.error("生成持仓文件异常: %s", e)
 
+    t2 = time.time()
+    logger.info("步骤2(生成持仓文件) 耗时: %.2fs", t2 - step_t)
+    step_t = t2
+
     logger.info(">>> 步骤 3/3: 持仓差异将在同步时对比（由 PositionSyncManager 处理）")
 
+    total_elapsed = time.time() - t0
+    logger.info("单次 run_once 总体耗时: %.2fs", total_elapsed)
     logger.info("=" * 50)
     # 不再在此处对比，返回 False 让 run_sync 处理对比逻辑
     return False
 
 
 def export_loop():
-    """导出线程：每CHECK_INTERVAL秒执行导出+同步
+    """导出线程：严格按 CHECK_INTERVAL 节奏启动 run_once（不随执行耗时漂移）。
 
-    持仓对齐完全由 PositionSyncManager.sync_and_trade() 处理：
-    - 直接计算 target vs actual_agg → missing_orders / excess_orders
-    - 批量并行下单，不受时间限制
-    - 支持首次建仓一次性挂出所有合约的委托
+    之前的节奏 = run_once 实际耗时(8~12s, 主要是点OK + UI 导出) + 固定 sleep(CHECK_INTERVAL)
+               ≈ 18~22s，所以你计时“从OK按钮到下一次OK”接近 20s。
+    现在的节奏 = 下一次 run_once 启动时刻 = max(上一次启动时刻 + CHECK_INTERVAL, 当前时刻)
+               → 即使 run_once 自己吃掉了 8-12s，间隔也只会补到 10s，不会叠加到 20s。
     """
-    logger.info("[导出线程] 启动")
+    logger.info("[导出线程] 启动 (目标节奏: 每 %ds 启动 1 次 run_once)", CHECK_INTERVAL)
     last_heartbeat = time.time()
+    # 记录上一次 run_once 的“启动时刻”，用于严格按间隔调度
+    next_run_at = 0.0  # 0 表示下一轮立即执行（不额外等）
 
     while not shutdown_event.is_set():
         try:
-            if is_in_trading_time() or SKIP_TRADING_TIME_CHECK:
-                # 检查关键时间点提醒
+            # ------ 计算本轮需要等多久才能启动 run_once ------
+            now = time.time()
+            if next_run_at <= 0:
+                sleep_until_next = 0.0  # 第一轮 / 重置后：立即跑
+            else:
+                sleep_until_next = max(0.0, next_run_at - now)
+
+            # 为了保证 shutdown_event 能被及时响应，用 1 秒粒度切分等待。
+            waited = 0.0
+            while waited < sleep_until_next and not shutdown_event.is_set():
+                chunk = min(1.0, sleep_until_next - waited)
+                if shutdown_event.wait(timeout=chunk):
+                    break
+                waited += chunk
+                # 等待过程中，仍按 10s 节奏打心跳日志
+                if time.time() - last_heartbeat >= 10:
+                    logger.info(
+                        "[导出线程] 心跳 - 仍在运行 (距下次 run_once=%.1fs)",
+                        max(0.0, next_run_at - time.time()),
+                    )
+                    last_heartbeat = time.time()
+
+            if shutdown_event.is_set():
+                break
+
+            # ------ 交易时段判断：只在交易时段/跳过时段时真正执行导出 ------
+            in_session = is_in_trading_time() or SKIP_TRADING_TIME_CHECK
+            run_start_ts = time.time()
+            next_run_at = run_start_ts + CHECK_INTERVAL  # 严格按“启动时刻 + 间隔”推进下一次
+            # 本轮执行完立刻预写下一次启动时间：哪怕 run_once 异常退出，节奏也不漂移。
+
+            if in_session:
+                # 关键时间点提醒（该函数自身幂等，重复调只会提醒一次）
                 check_key_time_and_alert()
 
-                has_diff = run_once()
+                t0_one = time.time()
+                run_once()  # 返回值 true/false 都不影响下一次节奏
+                one_cost = time.time() - t0_one
+
+                # 若本次 run_once 自己就用了超过 CHECK_INTERVAL（极端 10s+），
+                # 则下一轮不再额外 sleep，立刻跑（让节奏追赶预期，最多允许落后 1 轮）。
+                if one_cost >= CHECK_INTERVAL:
+                    next_run_at = time.time()
                 last_heartbeat = time.time()
 
-                # 注意：同步由 sync_loop() 持续监控，不需要定时调用
+                # 打印一次“从本次OK到下一次OK理论间隔”，用户对照自己计时即可验证是不是 10s 节奏
+                logger.info(
+                    "[导出线程] 本轮 run_once 耗时=%.2fs，下一次启动预计 %.1fs 后 "
+                    "(总节奏≈%ds，不再叠加执行耗时与固定 sleep)",
+                    one_cost, max(0.0, next_run_at - time.time()), CHECK_INTERVAL,
+                )
             else:
                 now_time = datetime.datetime.now().time()
                 wait_sec = seconds_until_next_session()
-                logger.info("[导出线程] 非交易时间，距离下次开盘还有 %d 分 %d 秒", wait_sec // 60, wait_sec % 60)
+                logger.info(
+                    "[导出线程] 非交易时间，距离下次开盘还有 %d 分 %d 秒",
+                    wait_sec // 60, wait_sec % 60,
+                )
 
                 # 多时段定时任务模式：每个任务只跑启动时确定的负责时段，
                 # 到该时段结束时间后即退出，等待下一个定时任务启动。
@@ -1275,18 +1339,29 @@ def export_loop():
 
                 last_heartbeat = time.time()
 
-            # 等待下一个周期，定期输出心跳
-            for _ in range(CHECK_INTERVAL):
-                if shutdown_event.wait(timeout=1):
-                    break
-                if time.time() - last_heartbeat >= 10:
-                    logger.info("[导出线程] 心跳 - 仍在运行")
-                    last_heartbeat = time.time()
+                # 非交易时段不推进 next_run_at（进入交易时段立即执行一轮），
+                # 把下一次启动时间置 0，保证切时段后立即触发。
+                next_run_at = 0.0
+
+            # 每轮结束都补一次心跳兜底（避免 10s 心跳在“切时段/异常”时漏掉）
+            if time.time() - last_heartbeat >= 10:
+                logger.info("[导出线程] 心跳 - 仍在运行")
+                last_heartbeat = time.time()
+
         except Exception as e:
             logger.error("[导出线程] 异常: %s", e)
             import traceback
             logger.error(traceback.format_exc())
-            time.sleep(CHECK_INTERVAL)
+            # 异常后也不能让节奏漂移：仍然按“本次启动 + CHECK_INTERVAL”推进下次
+            try:
+                now = time.time()
+                if next_run_at <= now:
+                    next_run_at = now + CHECK_INTERVAL
+            except Exception:
+                pass
+            # 兜底短 sleep 1s，避免异常死循环打爆 CPU
+            if shutdown_event.wait(timeout=1):
+                break
 
     logger.info("[导出线程] 退出")
 
