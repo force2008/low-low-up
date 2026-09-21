@@ -1353,29 +1353,31 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.print("[监控] 自动撤单重挂监控线程已停止")
 
     def _replace_monitor_loop(self):
-        """监控循环：每 30 秒做一次仓位对比，发现差异则同步"""
+        """监控循环：每 CHECK_INTERVAL 秒做一次仓位对比，发现差异则同步"""
         self.print("[监控] 监控线程启动，等待首次检查...")
-        CHECK_INTERVAL = 30  # 检查间隔
+        CHECK_INTERVAL = 15  # 巡检心跳间隔（秒）；与 SYNC_COOLDOWN=15 配套，减少消息误导
+        # 巡检期间的文案统一使用这个标题前缀，避免再出现"间隔15秒还写30秒"的硬编码误报
+        monitor_tag = f"{CHECK_INTERVAL}秒持仓巡检"
         while not self._replace_stop_event.is_set():
             self._replace_stop_event.wait(CHECK_INTERVAL)
             if self._replace_stop_event.is_set():
                 self.print("[监控] 收到停止信号，退出循环")
                 break
             try:
-                self.print(f"[监控] 开始第 N 次检查 (间隔 {CHECK_INTERVAL} 秒)")
+                self.print(f"[监控] 开始下一轮巡检 (间隔 {CHECK_INTERVAL} 秒)")
                 # 1. 先检查未成交委托是否需要撤单重挂
                 self._check_and_replace_pending_orders()
 
                 # 2. 做一次仓位对比
-                self._check_position_diff()
-                self.print("[监控] 本次检查完成")
+                self._check_position_diff(CHECK_INTERVAL=CHECK_INTERVAL, monitor_tag=monitor_tag)
+                self.print("[监控] 本次巡检完成")
             except Exception as e:
                 import traceback
                 self.print(f"[监控异常] 监控检查出错: {e}")
                 self.print(traceback.format_exc())
 
-    def _check_position_diff(self):
-        """检查仓位差异，有差异则同步"""
+    def _check_position_diff(self, CHECK_INTERVAL: int = 15, monitor_tag: str = "持仓巡检"):
+        """检查仓位差异，有差异则同步。monitor_tag 用于飞书通知标题，避免硬编码时间。"""
         lock_acquired = False
         # 获取锁，防止与 sync_and_trade 并发
         if self._sync_lock.acquire(blocking=True, timeout=5):
@@ -1448,7 +1450,7 @@ class PositionSyncManagerBase(CTdSpiBase):
 
             if missing or excess:
                 # 有差异，发送通知并执行同步
-                lines = ["🔄 30秒检测到仓位差异，准备同步："]
+                lines = [f"🔄 {monitor_tag}检测到仓位差异，准备同步："]
                 if missing:
                     total_missing = sum(mo["volume"] for mo in missing)
                     lines.append(f"📈 缺额开仓 ({len(missing)} 个合约，共 {total_missing} 手):")
@@ -1470,7 +1472,7 @@ class PositionSyncManagerBase(CTdSpiBase):
                     lines.append(f"  {', '.join(skipped_sorted)}")
 
                 self._notify_async("\n".join(lines))
-                self.print(f"[监控] 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个")
+                self.print(f"[监控] {monitor_tag} 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个")
 
                 # 执行同步（已持有锁，传入 lock_held=True）
                 self._do_sync(trade_volume=1, lock_held=True)
@@ -1490,15 +1492,15 @@ class PositionSyncManagerBase(CTdSpiBase):
 
                 if total_target != total_actual:
                     self._notify_async(
-                        f"⚠️ 30秒持仓检测\n"
+                        f"⚠️ {monitor_tag}\n"
                         f"可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手\n"
                         f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手\n"
                         f"状态: 手数不一致 ⚠️"
                     )
-                    self.print(f"[监控] 30秒检测: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual})")
+                    self.print(f"[监控] {monitor_tag}: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual})")
                 else:
                     lines = [
-                        f"✅ 30秒持仓检测",
+                        f"✅ {monitor_tag}",
                         f"当前可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手",
                         f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手",
                         f"状态: 当前交易时段内仓位一致 ✓",
@@ -1507,7 +1509,7 @@ class PositionSyncManagerBase(CTdSpiBase):
                         lines.append(f"⏸️ 以下 {len(skipped_sorted)} 个合约当前非交易时段，已跳过对齐：")
                         lines.append(f"  {', '.join(skipped_sorted)}")
                     self._notify_async("\n".join(lines))
-                    self.print("[监控] 30秒检测: 当前交易时段内仓位一致")
+                    self.print(f"[监控] {monitor_tag}: 当前交易时段内仓位一致")
 
         except Exception as e:
             import traceback

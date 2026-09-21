@@ -304,7 +304,7 @@ class PositionSyncManagerSync:
             missing_orders = []
             excess_orders = []
 
-            # 检查是否有合约在 1009 冷却期（与入口 SYNC_COOLDOWN=25 一致：避免"昨仓/今仓"划分未更新时重复报持仓不足）
+            # 检查是否有合约在 1009 冷却期（与入口 SYNC_COOLDOWN 保持一致：避免"昨仓/今仓"划分未更新时重复报持仓不足）
             current_time = time.time()
             cooling_contracts = []
             if hasattr(self, '_last_1009_reject'):
@@ -415,8 +415,11 @@ class PositionSyncManagerSync:
                 return success
             else:
                 self.print("[结论] 当前交易时段内持仓一致，无需操作")
+                # 这条消息与 base.py 中"15秒持仓巡检"心跳不同：
+                # 它表示"某一次实际进入 _do_sync 的完整同步流程（可能是文件变更触发、也可能是巡检触发）
+                # 跑完后发现仓位一致"，因此不写固定秒数，避免与巡检心跳秒数形成误导
                 aligned_lines = [
-                    f"✅ 启动持仓检测",
+                    f"✅ 对齐流程校验通过（{SYNC_COOLDOWN}秒冷却门内）",
                     f"标准持仓: {len(target)} 个合约, {total_target} 手",
                     f"实际持仓: {len(actual_agg)} 个合约, {total_actual} 手",
                     f"状态: 当前交易时段内仓位一致 ✓",
