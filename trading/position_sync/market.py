@@ -284,6 +284,21 @@ class PositionSyncManagerMarket:
     ) -> Optional[List[dict]]:
         """查询当日委托。支持过滤：only_pending 只保留未成交/部分成交；today_only 只保留当天
         超时返回 None，以便调用方区分"查询失败"与"确实无委托"。"""
+        _env_qo = str(getattr(self, '_env_name', '') or '').strip() or None
+        _uid_qo = str(getattr(self, '_user_id', '') or '').strip() or None
+        _bid_qo = str(getattr(self, '_broker_id', '') or '').strip() or None
+        _pre_qo = "".join(
+            [p for p in [f"[{_env_qo}]" if _env_qo else None, f"[{_uid_qo}]" if _uid_qo else None] if p]
+        )
+        _suf_qo = f" (BrokerID={_bid_qo}, InvestorID={_uid_qo})" if (_bid_qo or _uid_qo) else ""
+
+        def _fmt_qo(body: str) -> str:
+            if not body:
+                return ""
+            out = f"{body}{_suf_qo}".rstrip()
+            return f"{_pre_qo} {out}" if _pre_qo else out
+
+        self.print((_fmt_qo("[委托查询] 开始查询...") or "").strip())
         event = threading.Event()
         self._orders_query_event = event
         self._orders_raw_query = []
@@ -293,7 +308,7 @@ class PositionSyncManagerMarket:
         self._api.ReqQryOrder(req, 0)
         ok = event.wait(timeout=timeout)
         if not ok:
-            self.print("[警告] 委托查询超时")
+            self.print((_fmt_qo("[警告] 委托查询超时") or "").strip())
             self._on_query_timeout(source="委托查询")
             return None
         self._reset_query_health()
@@ -306,6 +321,7 @@ class PositionSyncManagerMarket:
             ]
         if only_pending:
             result = [o for o in result if o.get("OrderStatus", "") in ("1", "3")]
+        self.print((_fmt_qo(f"[委托查询] 成功，返回 {len(result)} 条记录") or "").strip())
         return result
 
     def _update_hold_json_file(self):

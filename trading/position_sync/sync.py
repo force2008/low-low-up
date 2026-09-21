@@ -245,6 +245,18 @@ class PositionSyncManagerSync:
         B3：positions 返回条数 与 self._actual_positions 当前缓存长度 差>1 且两边非 0 →
             说明查询返回对象和聚合用的不是同一份数据（重试乱序/竞态污染），同样判脏
         """
+        _env = str(getattr(self, '_env_name', '') or '').strip() or None
+        _uid = str(getattr(self, '_user_id', '') or '').strip() or None
+        _bid = str(getattr(self, '_broker_id', '') or '').strip() or None
+        _acct_parts = []
+        if _env:
+            _acct_parts.append(f"[{_env}]")
+        if _uid:
+            _acct_parts.append(f"[{_uid}]")
+        _acct_prefix = "".join(_acct_parts)
+        _acct_suffix = (
+            f" (BrokerID={_bid}, InvestorID={_uid})" if (_bid or _uid) else ""
+        )
         n_pos_rows = len(positions) if positions is not None else 0
         n_cache_rows = len(getattr(self, '_actual_positions', []) or [])
         n_target_contracts = len(target or {})
@@ -271,8 +283,11 @@ class PositionSyncManagerSync:
             detail_lines.append(
                 f"  B3(查询返回条数={n_pos_rows} 与 缓存条数={n_cache_rows} 严重不一致)=✅命中"
             )
+        _header = "🛡️ 持仓查询脏空拦截（硬闸已触发，本轮对齐已终止）"
+        if _acct_prefix:
+            _header = f"{_acct_prefix} {_header}"
         msg_lines = [
-            "🛡️ 持仓查询脏空拦截（硬闸已触发，本轮对齐已终止）：",
+            f"{_header}：{_acct_suffix}".rstrip(),
             f"  模式：{sync_mode_tag}",
             *detail_lines,
             f"  持仓查询返回条数={n_pos_rows}，缓存聚合源条数={n_cache_rows}",
@@ -337,6 +352,15 @@ class PositionSyncManagerSync:
         pending_map = pending_map or {}
         missing_orders = missing_orders or []
         excess_orders = excess_orders or []
+
+        # 账号前缀（F 总闸 2 类日志 + 决策日志 全加，多账号排查直接看首段）
+        _env_f = str(getattr(self, '_env_name', '') or '').strip() or None
+        _uid_f = str(getattr(self, '_user_id', '') or '').strip() or None
+        _bid_f = str(getattr(self, '_broker_id', '') or '').strip() or None
+        _acct_prefix_f = "".join([p for p in [f"[{_env_f}]" if _env_f else None, f"[{_uid_f}]" if _uid_f else None] if p])
+        _acct_suffix_f = (
+            f" (BrokerID={_bid_f}, InvestorID={_uid_f})" if (_bid_f or _uid_f) else ""
+        )
 
         def _calc_stats(t: dict, a: dict, mis: list, exc: list):
             n_target_contracts = len(t)
@@ -552,7 +576,10 @@ class PositionSyncManagerSync:
 
         # ---- 阶段 3：未 abort → 返回 (True, rewrite?)；abort → 照旧打印通知并 return(False,...) ----
         if not _should_abort:
-            self.print(f"[F总闸-决策] {_f2_decision_tag}：放行，继续执行同步")
+            _line = f"[F总闸-决策] {_f2_decision_tag}：放行，继续执行同步{_acct_suffix_f}"
+            if _acct_prefix_f:
+                _line = f"{_acct_prefix_f} {_line}"
+            self.print(_line.rstrip())
             if _f2_rewrite:
                 return (True, _f2_rewrite.get("actual_agg"), _f2_rewrite.get("missing_orders"), _f2_rewrite.get("excess_orders"))
             return (True, None, None, None)
@@ -562,8 +589,11 @@ class PositionSyncManagerSync:
             v for k, v in pending_map.items()
             if len(k) >= 3 and k[2] and v > 0
         )
+        _header_f = "🛡️ 最终提交总闸拦截（F 总闸已触发，本次缺额全部弃单）"
+        if _acct_prefix_f:
+            _header_f = f"{_acct_prefix_f} {_header_f}"
         msg_lines = [
-            "🛡️ 最终提交总闸拦截（F 总闸已触发，本次缺额全部弃单）：",
+            f"{_header_f}：{_acct_suffix_f}".rstrip(),
             f"  首次判定原因：{first_reason}",
             f"  二次决策：{_f2_decision_tag}",
             f"  标准合约={n_target_contracts0}个，标准总手={total_target_hands0}手",

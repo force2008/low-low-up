@@ -1535,10 +1535,18 @@ class PositionSyncManagerBase(CTdSpiBase):
                 except Exception:
                     self._actual_positions = list(restored_rows)
             stale_min = (now_ts - ts) / 60.0 if ts > 0 else 0.0
-            self.print(
+            _env_h = str(getattr(self, '_env_name', '') or '').strip() or None
+            _uid_h = str(getattr(self, '_user_id', '') or '').strip() or None
+            _bid_h = str(getattr(self, '_broker_id', '') or '').strip() or None
+            _pre_h = "".join([p for p in [f"[{_env_h}]" if _env_h else None, f"[{_uid_h}]" if _uid_h else None] if p])
+            _suf_h = f" (BrokerID={_bid_h}, InvestorID={_uid_h})" if (_bid_h or _uid_h) else ""
+            _line_h = (
                 f"[历史缓存-查仓超时兜底] 本次 query_positions 超时返回 None，用 {stale_min:.1f} 分钟前的历史快照继续执行："
-                f"{n} 合约 / {v} 手"
+                f"{n} 合约 / {v} 手{_suf_h}"
             )
+            if _pre_h:
+                _line_h = f"{_pre_h} {_line_h}"
+            self.print(_line_h.rstrip())
             return dict(agg)
         except Exception:
             return {}
@@ -1735,12 +1743,24 @@ class PositionSyncManagerBase(CTdSpiBase):
         try:
             # 查询 CTP 实际持仓
             positions = self.query_positions(timeout=15)
+            _env_m = str(getattr(self, '_env_name', '') or '').strip() or None
+            _uid_m = str(getattr(self, '_user_id', '') or '').strip() or None
+            _bid_m = str(getattr(self, '_broker_id', '') or '').strip() or None
+            _pre_m = "".join([p for p in [f"[{_env_m}]" if _env_m else None, f"[{_uid_m}]" if _uid_m else None] if p])
+            _suf_m = f" (BrokerID={_bid_m}, InvestorID={_uid_m})" if (_bid_m or _uid_m) else ""
+
+            def _fmt_m(s: str) -> str:
+                if not s:
+                    return ""
+                body = f"{s}{_suf_m}".rstrip()
+                return f"{_pre_m} {body}" if _pre_m else body
+
             if positions is None:
                 # 15 秒巡检：查超时就用历史 15 分钟内快照继续对比，避免「锁被占用 5 秒 + 查询超时 → 连续丢多轮巡检，差异隐瞒不报」
-                self.print("[监控] 持仓查询超时返回 None，尝试用历史实际持仓快照继续对比")
+                self.print(_fmt_m("[监控] 持仓查询超时返回 None，尝试用历史实际持仓快照继续对比") or "")
                 fallback_agg = dict(self._fallback_actual_positions_from_history(max_stale_seconds=900) or {})
                 if not fallback_agg:
-                    self.print("[监控] 无可用历史快照，本次巡检跳过")
+                    self.print(_fmt_m("[监控] 无可用历史快照，本次巡检跳过") or "")
                     return
                 self._positions_source_tag = "fallback_history_monitor"
             else:
@@ -1775,7 +1795,9 @@ class PositionSyncManagerBase(CTdSpiBase):
                 trading_status = get_contracts_trading_status(list(all_contracts))
                 non_trading_contracts = {c.upper() for c, trading in trading_status.items() if not trading}
             elif all_contracts:
-                self.print(f"[巡检] _skip_trading_time_check=True：跳过交易时段过滤（7x24/simu/--force），共 {len(all_contracts)} 个合约参与对比")
+                _line_s = _fmt_m(f"[巡检] _skip_trading_time_check=True：跳过交易时段过滤（7x24/simu/--force），共 {len(all_contracts)} 个合约参与对比") or ""
+                if _line_s:
+                    self.print(_line_s)
 
             missing = []
             excess = []
@@ -1807,7 +1829,9 @@ class PositionSyncManagerBase(CTdSpiBase):
 
             if missing or excess:
                 # 有差异，发送通知并执行同步
-                lines = [f"🔄 {monitor_tag}检测到仓位差异，准备同步："]
+                lines = [f"🔄 {monitor_tag}检测到仓位差异，准备同步：{_suf_m}".rstrip()]
+                if _pre_m:
+                    lines[0] = f"{_pre_m} {lines[0]}"
                 if missing:
                     total_missing = sum(mo["volume"] for mo in missing)
                     lines.append(f"📈 缺额开仓 ({len(missing)} 个合约，共 {total_missing} 手):")
@@ -1829,7 +1853,7 @@ class PositionSyncManagerBase(CTdSpiBase):
                     lines.append(f"  {', '.join(skipped_sorted)}")
 
                 self._notify_async("\n".join(lines))
-                self.print(f"[监控] {monitor_tag} 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个")
+                self.print((_fmt_m(f"[监控] {monitor_tag} 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个") or "").strip())
 
                 # 执行同步（已持有锁，传入 lock_held=True）
                 self._do_sync(trade_volume=1, lock_held=True)
@@ -1872,25 +1896,30 @@ class PositionSyncManagerBase(CTdSpiBase):
                         rest = len(diff_lines) - MAX_SHOW
                         shown.append(f"  ... 共 {len(diff_lines)} 个合约有差异" if rest > 0 else f"  共 {len(diff_lines)} 个合约有差异")
                         diff_preview = "\n差异明细（可交易，diff=标准-实际，+缺/-超）:\n" + "\n".join(shown)
+                    header = f"⚠️ {monitor_tag}{_suf_m}".rstrip()
+                    if _pre_m:
+                        header = f"{_pre_m} {header}"
                     self._notify_async(
-                        f"⚠️ {monitor_tag}\n"
+                        f"{header}\n"
                         f"可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手\n"
                         f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手\n"
                         f"状态: 手数不一致 ⚠️{diff_preview}"
                     )
-                    self.print(f"[监控] {monitor_tag}: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual}，差异合约数={len(diff_lines)})")
+                    self.print((_fmt_m(f"[监控] {monitor_tag}: 手数不一致 (可交易标准:{total_target} vs 实际:{total_actual}，差异合约数={len(diff_lines)})") or "").strip())
                 else:
                     lines = [
-                        f"✅ {monitor_tag}",
+                        f"✅ {monitor_tag}{_suf_m}".rstrip(),
                         f"当前可交易合约: 标准 {total_target} 手, 实际 {total_actual} 手",
                         f"全部合约: 标准 {all_total_target} 手, 实际 {all_total_actual} 手",
                         f"状态: 当前交易时段内仓位一致 ✓",
                     ]
+                    if _pre_m:
+                        lines[0] = f"{_pre_m} {lines[0]}"
                     if skipped_sorted:
                         lines.append(f"⏸️ 以下 {len(skipped_sorted)} 个合约当前非交易时段，已跳过对齐：")
                         lines.append(f"  {', '.join(skipped_sorted)}")
                     self._notify_async("\n".join(lines))
-                    self.print(f"[监控] {monitor_tag}: 当前交易时段内仓位一致")
+                    self.print((_fmt_m(f"[监控] {monitor_tag}: 当前交易时段内仓位一致") or "").strip())
 
         except Exception as e:
             import traceback
