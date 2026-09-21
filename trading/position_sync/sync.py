@@ -227,6 +227,175 @@ class PositionSyncManagerSync:
     """持仓同步管理器 - 同步逻辑部分"""
 
     # ------------------------------------------------------------------
+    # 风控公共闸口（B1+B2 + 数据一致性双端校验）
+    #   凡是"持仓查询结果已经拿到、actual_agg 也聚合好了、target 也解析好了"
+    #   的任何入口，都必须先调用本方法，任何一个条件命中都直接 return False abort。
+    # ------------------------------------------------------------------
+    def _guard_post_query_positions(
+        self,
+        positions: list,
+        actual_agg: dict,
+        target: dict,
+        hold_mtime: float,
+        sync_mode_tag: str,
+    ) -> bool:
+        """B1+B2 硬闸 + 双端一致性校验。返回 True=安全可继续、False=命中拦截需 abort。
+        B1：positions 查询返回 0 条 但 target 有合约 → 脏空拦截
+        B2：actual 总手=0 但 target 总手>0（非清仓模式）→ 脏空/脏0拦截
+        B3：positions 返回条数 与 self._actual_positions 当前缓存长度 差>1 且两边非 0 →
+            说明查询返回对象和聚合用的不是同一份数据（重试乱序/竞态污染），同样判脏
+        """
+        n_pos_rows = len(positions) if positions is not None else 0
+        n_cache_rows = len(getattr(self, '_actual_positions', []) or [])
+        n_target_contracts = len(target or {})
+        total_target_hands = sum((target or {}).values())
+        total_actual_hands = sum((actual_agg or {}).values())
+        _raw_ratio = float(getattr(self, '_position_ratio', 1.0))
+        is_liquidate_mode = abs(_raw_ratio) < 1e-9
+
+        b1_hit = (n_pos_rows == 0 and n_target_contracts > 0)
+        b2_hit = (total_actual_hands == 0 and total_target_hands > 0 and not is_liquidate_mode)
+        _big_gap = abs(n_pos_rows - n_cache_rows) > 1 and n_pos_rows > 0 and n_cache_rows > 0
+        b3_hit = _big_gap and n_target_contracts > 0
+
+        if not (b1_hit or b2_hit or b3_hit):
+            return True
+
+        hold_tag = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(hold_mtime)) if hold_mtime > 0 else "N/A"
+        detail_lines = []
+        if b1_hit:
+            detail_lines.append("  B1(返回0条且标准仓非空)=✅命中")
+        if b2_hit:
+            detail_lines.append("  B2(实际总手=0且标准总手>0)=✅命中")
+        if b3_hit:
+            detail_lines.append(
+                f"  B3(查询返回条数={n_pos_rows} 与 缓存条数={n_cache_rows} 严重不一致)=✅命中"
+            )
+        msg_lines = [
+            "🛡️ 持仓查询脏空拦截（硬闸已触发，本轮对齐已终止）：",
+            f"  模式：{sync_mode_tag}",
+            *detail_lines,
+            f"  持仓查询返回条数={n_pos_rows}，缓存聚合源条数={n_cache_rows}",
+            f"  标准仓合约数={n_target_contracts}，标准总仓={total_target_hands}手",
+            f"  实际聚合合约数={len(actual_agg or {})}，实际总仓={total_actual_hands}手",
+            f"  hold-std写入时刻={hold_tag}",
+            f"  -> 拒绝本轮任何开/平仓，避免用脏数据对齐导致翻倍超仓或平过头。",
+        ]
+        msg = "\n".join(msg_lines)
+        self.print(msg)
+        try:
+            self._notify_async(msg)
+        except Exception:
+            pass
+        return False
+
+    # ------------------------------------------------------------------
+    # F 总闸：最终提交前的绝对数学不可能成立拦截
+    #   就算 B1~B3 + C1/C2 + D1/D2 + Fix3 全部漏过（极不可能），
+    #   只要「账户已经有实际持仓 + 本次缺额覆盖目标合约≥50% + 缺额手数≈目标总手」
+    #   就直接 abort：数学上已持仓的账户不可能突然又缺全仓，只能是 actual 被脏空/脏低。
+    #   独立于所有上游计算逻辑，纯靠外部事实判断。
+    # ------------------------------------------------------------------
+    def _guard_final_total_missing(
+        self,
+        missing_orders: list,
+        excess_orders: list,
+        target: dict,
+        actual_agg: dict,
+        pending_map: dict,
+    ) -> bool:
+        """F 总闸：True=安全、False=命中 abort。"""
+        target = target or {}
+        actual_agg = actual_agg or {}
+        pending_map = pending_map or {}
+        missing_orders = missing_orders or []
+        excess_orders = excess_orders or []
+
+        n_target_contracts = len(target)
+        total_target_hands = sum(target.values())
+        total_actual_hands = sum(actual_agg.values())
+
+        total_missing_vol = sum(int(mo.get("volume", 0) or 0) for mo in missing_orders)
+        n_missing_contracts = len(missing_orders)
+
+        hit_f = False
+        reason = ""
+        # 语义：跟单账户已经有实际仓位了（不是冷启动的真空状态）
+        if total_actual_hands > 0 and n_target_contracts > 0 and total_missing_vol > 0:
+            # 缺额合约数 / 目标合约数 占比（缺一半以上合约）
+            coverage_ratio = n_missing_contracts / max(1, n_target_contracts)
+            # 缺额手数 / 目标总手数（缺手数已达目标 ~= 全仓）
+            missing_frac = total_missing_vol / max(1, total_target_hands)
+            # 已经有持仓 + 缺额覆盖合约≥50% + 缺额手数已达目标80%以上
+            # => 数学上不可能：真的缺 50% 合约且缺 80% 手意味着账户应该是空仓才对，
+            #    但 actual>0 证明账户非空 → actual 被脏低估 100%
+            if coverage_ratio >= 0.5 and missing_frac >= 0.8:
+                hit_f = True
+                reason = (
+                    f"已持仓账户({total_actual_hands}手)突然缺 {n_missing_contracts}/{n_target_contracts}="
+                    f"{coverage_ratio*100:.0f}% 合约，缺手 {total_missing_vol}/{total_target_hands}="
+                    f"{missing_frac*100:.0f}%，数学上不可能成立"
+                )
+
+        # 第二道纯数学校验：缺额手数 > 目标总手 × 1.1（无论 actual 空不空都拦）
+        if not hit_f and total_missing_vol > 0 and total_target_hands > 0:
+            if total_missing_vol > total_target_hands * 1.1 + 2:
+                hit_f = True
+                reason = (
+                    f"缺额总手({total_missing_vol}) > 目标总手({total_target_hands}) × 1.1 + 2，"
+                    f"数学上不可能成立（maximum missing = target - actual ≤ target）"
+                )
+
+        # 第三道：非首次启动 + 缺额覆盖合约=100% + 缺手数≥目标95% → 直接拦
+        #   非首次启动说明上一轮同步时 actual 还是正常的（或至少有过持仓），
+        #   本轮不可能突然所有合约全缺（missing=target 恒等于 actual=0 才会发生），
+        #   这就是 CTP 查仓脏空的精准签名（13:33 / 14:08 两次事故都命中本条件）。
+        if not hit_f and n_target_contracts >= 5 and n_missing_contracts == n_target_contracts:
+            missing_frac = total_missing_vol / max(1, total_target_hands)
+            is_first_run = bool(getattr(self, '_is_first_run', True))
+            if missing_frac >= 0.95 and not is_first_run:
+                hit_f = True
+                reason = (
+                    f"非首次启动(已跑过多轮)却出现「全合约缺额」：缺{n_missing_contracts}/{n_target_contracts}="
+                    f"100%合约，缺手{total_missing_vol}/{total_target_hands}="
+                    f"{missing_frac*100:.0f}%。非冷启动场景 mathematical impossible，"
+                    f"必为 CTP query_positions 脏空（actual 被读成 0）"
+                )
+
+        if not hit_f:
+            return True
+
+        # 统计 pending_map 开仓在途，用于诊断
+        pending_open_hands = sum(
+            v for k, v in pending_map.items()
+            if len(k) >= 3 and k[2] and v > 0
+        )
+        msg_lines = [
+            "🛡️ 最终提交总闸拦截（F 总闸已触发，本次缺额全部弃单）：",
+            f"  触发原因：{reason}",
+            f"  标准合约={n_target_contracts}个，标准总手={total_target_hands}手",
+            f"  实际聚合={len(actual_agg)}个合约/{total_actual_hands}手",
+            f"  在途开仓={pending_open_hands}手，在途映射条数={len(pending_map)}",
+            f"  缺额计划={n_missing_contracts}个合约/共{total_missing_vol}手：",
+        ]
+        for i, mo in enumerate(missing_orders[:20]):
+            d = "买" if mo.get("direction") == "buy" else "卖"
+            msg_lines.append(f"    #{i+1:02d} {mo.get('contract','')} {d} {mo.get('volume',0)}手")
+        if len(missing_orders) > 20:
+            msg_lines.append(f"    ... 剩余 {len(missing_orders)-20} 个合约省略")
+        if excess_orders:
+            ex_vol = sum(int(eo.get("volume",0) or 0) for eo in excess_orders)
+            msg_lines.append(f"  超额计划={len(excess_orders)}个合约/共{ex_vol}手（同样弃单）")
+        msg_lines.append("  -> 本轮完全 ABORT，不提交任何委托，等待下一轮用干净数据重算。")
+        msg = "\n".join(msg_lines)
+        self.print(msg)
+        try:
+            self._notify_async(msg)
+        except Exception:
+            pass
+        return False
+
+    # ------------------------------------------------------------------
     # 核心流程：持仓对比 + 快速同步
     # ------------------------------------------------------------------
     def sync_and_trade(
@@ -436,31 +605,16 @@ class PositionSyncManagerSync:
             t_5_done = time.time()
             self.print(f"[同步耗时] 步骤5(聚合+解析): {(t_5_done - t_phase)*1000:.0f}ms [{_sync_mode_tag}]"); t_phase = t_5_done
 
-            # ========== 🛡️ 13:33 超仓事故硬闸 B1+B2：持仓查询脏空拦截 ==========
-            # B1: 查询返回 0 条记录 但 标准仓有合约 → 判脏空，禁止任何对齐
-            #     （在 ratio=0 清仓模式下，target 本身就是空 dict，n_target_contracts=0，B1 天然不命中，不误拦）
-            # B2: 实际总手=0 但 标准总手>0（positions有记录但每条手数=0的脏态）→ 同样拦截
-            #     （ratio=0 清仓模式下 total_target_hands=0，B2 条件里直接跳过；ratio 任何非 0 值都要硬拦）
-            n_pos_rows = len(positions) if positions is not None else 0
-            n_target_contracts = len(target)
-            total_target_hands = sum(target.values()) if target else 0
-            total_actual_hands = sum(actual_agg.values()) if actual_agg else 0
-            b1_hit = (n_pos_rows == 0 and n_target_contracts > 0)
-            b2_hit = (total_actual_hands == 0 and total_target_hands > 0 and not self._is_liquidate_mode)
-            if b1_hit or b2_hit:
-                hold_tag = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_hold_mtime)) if _hold_mtime > 0 else "N/A"
-                msg_lines = [
-                    "🛡️ 持仓查询脏空拦截（13:33事故硬闸，本轮对齐已终止）：",
-                    f"  模式：{_sync_mode_tag}",
-                    f"  触发条件：B1(返回0条且标准仓非空)={'✅命中' if b1_hit else '未触发'}  B2(实际总手=0且标准总手>0)={'✅命中' if b2_hit else '未触发'}",
-                    f"  持仓查询返回条数={n_pos_rows}，标准仓合约数={n_target_contracts}",
-                    f"  实际总仓={total_actual_hands}手，标准总仓={total_target_hands}手",
-                    f"  hold-std写入时刻={hold_tag}",
-                    f"  -> 拒绝本轮任何开/平仓，避免用 0 仓对齐非 0 标准仓导致翻倍超仓。",
-                ]
-                msg = "\n".join(msg_lines)
-                self.print(msg)
-                self._notify_async(msg)
+            # ========== 🛡️ 13:33/14:08 两次超仓事故硬闸 B1+B2+B3：持仓查询脏空拦截 ==========
+            # 调用公共闸口方法，保证所有入口（sync_and_trade / 巡检 / 冷启动 initial 分支）
+            # 只要进入了"聚合完成、对比之前"的同一阶段，都走同一套拦截逻辑。
+            if not self._guard_post_query_positions(
+                positions=positions,
+                actual_agg=actual_agg,
+                target=target,
+                hold_mtime=_hold_mtime,
+                sync_mode_tag=_sync_mode_tag,
+            ):
                 return False
             # ========== 硬闸结束 ==========
 
@@ -693,6 +847,94 @@ class PositionSyncManagerSync:
         self.print("【快速同步模式】")
         self.print("=" * 50)
         _t_fast_start = time.time()
+
+        # ============================================================
+        # 🛡️ F 总闸：最终提交前的绝对数学不可能成立拦截
+        #   独立于 B1~B3 / C1~C2 / D1~D2 / Fix3 全部上游逻辑，
+        #   只要外部事实(actual>0但缺全仓; 或缺手>目标×1.1)成立就直接 ABORT 全弃。
+        #   任何未来新增的同步入口（哪怕绕过 sync_and_trade 直接调 _fast_sync）
+        #   都被这道闸口兜住。
+        # ============================================================
+        if not self._guard_final_total_missing(
+            missing_orders=missing_orders,
+            excess_orders=excess_orders,
+            target=target,
+            actual_agg=actual_agg,
+            pending_map=pending_map,
+        ):
+            self.print("[F总闸] 🛡️ 本轮同步已被数学绝对拦截，完全 ABORT，不提交任何委托。")
+            return False
+        # ============================================================
+        # 🛡️ 冷启动额外保护（首仓防御）：
+        #   若是 _is_first_run 且 missing_orders 合约数超过一半目标或>10个，
+        #   - 等 3 秒让 CTP 持仓刷新延迟稳定下来（避免首秒脏空）
+        #   - 独立再查一次 positions，重新聚合同 actual_agg2，
+        #     如果 actual_agg2 的总手数 > 传入 actual_agg 的 1.5 倍或合约数多>5，
+        #     说明传入的 actual_agg 明显被低估了，本轮 ABORT 等待下一轮。
+        # ============================================================
+        if bool(getattr(self, '_is_first_run', True)) and len(missing_orders) >= 10:
+            self.print(
+                f"[🔒首仓防御] 首次运行且批量缺额合约={len(missing_orders)} 个，"
+                f"等待3s让CTP持仓刷新稳定后再重查一次..."
+            )
+            time.sleep(3.0)
+            try:
+                re_positions = self.query_positions(timeout=10, retries=2) or []
+            except Exception as _re:
+                self.print(f"[🔒首仓防御] 重查持仓异常：{_re}，本轮保守弃单")
+                return False
+            actual_agg2 = {}
+            try:
+                _saved = getattr(self, '_actual_positions', [])
+                # 临时替换缓存以聚合最新查仓结果
+                object.__setattr__(self, '_actual_positions', re_positions)
+                actual_agg2 = self._aggregate_actual_positions() or {}
+                object.__setattr__(self, '_actual_positions', _saved)
+            except Exception:
+                try:
+                    object.__setattr__(self, '_actual_positions', _saved)
+                except Exception:
+                    pass
+            _total2 = sum(actual_agg2.values())
+            _total_orig = sum((actual_agg or {}).values())
+            _n2 = len(actual_agg2)
+            _n_orig = len(actual_agg or {})
+            self.print(
+                f"[🔒首仓防御] 重查结果：原聚合={_n_orig}合约/{_total_orig}手 "
+                f"重查聚合={_n2}合约/{_total2}手"
+            )
+            # 严重不一致：重查比原来多 5 合约以上 OR 多 50% 手数以上
+            _bad_n = (_n2 - _n_orig) >= 5
+            _bad_v = (_total_orig > 0 and _total2 >= _total_orig * 1.5 + 2) or (_total_orig == 0 and _total2 > 10)
+            if _bad_n or _bad_v:
+                lines = [
+                    "🛡️ 首仓防御：重查持仓发现原聚合严重低估，本轮弃单：",
+                    f"  原聚合={_n_orig}合约/{_total_orig}手",
+                    f"  重查聚合={_n2}合约/{_total2}手",
+                    "  -> 拒绝首轮大批量补开，等待下一轮用新持仓重新计算。",
+                ]
+                m = "\n".join(lines)
+                self.print(m)
+                try:
+                    self._notify_async(m)
+                except Exception:
+                    pass
+                return False
+            # 首仓分批：如果 missing_orders > 目标的 60% 合约数（即接近全仓首开），
+            # 先只开一半，另一半留给下一轮，避免一次性压 38 合约触发 CTP 风控或报单流控。
+            n_target = len(target or {})
+            if n_target > 10 and len(missing_orders) >= int(n_target * 0.6):
+                half = max(1, len(missing_orders) // 2)
+                dropped = missing_orders[half:]
+                missing_orders[:] = missing_orders[:half]
+                dropped_names = [(m.get("contract",""), m.get("direction",""), m.get("volume",0)) for m in dropped]
+                tag_msg = (
+                    f"[🔒首仓分批] 首运行缺{len(missing_orders)+len(dropped)}个合约已达"
+                    f"目标{n_target}的60%以上，先开一半({len(missing_orders)})，"
+                    f"留{len(dropped)}个到下一轮：{dropped_names[:10]}"
+                    + ("..." if len(dropped_names) > 10 else "")
+                )
+                self.print(tag_msg)
 
         # ============================================================
         # 第一阶段：并行查询所有行情
