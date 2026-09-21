@@ -807,6 +807,21 @@ class PositionSyncManagerOrderOps:
             if not current_price or current_price <= 0:
                 continue
 
+            # ===== 🛡️ 哨兵值过滤：防止 7x24/simu 环境 MD 返回 float_max / 超天价 误触发撤单重挂死循环 =====
+            # 合法正价：>0 且 有限 且 <1e9（任何商品期货/股指都不可能超过 1e9/手）
+            def _sane_price(v):
+                try:
+                    fv = float(v)
+                    return bool(fv > 0 and math.isfinite(fv) and fv < 1e9)
+                except Exception:
+                    return False
+            if not _sane_price(current_price):
+                self.print(f"[监控-哨兵拦截] {contract} 当前价={current_price!r} 非法（float_max/NaN/超天价），跳过本次价格偏离判断，保留原挂单等待成交")
+                continue
+            if not _sane_price(last_price):
+                # 原挂单价存的就是乱的 sentinel，也不触发价格偏离重挂，只继续保留原挂单
+                continue
+
             # 获取 price tick
             info_obj = self._get_contract_info(contract.lower())
             price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
@@ -932,6 +947,25 @@ class PositionSyncManagerOrderOps:
                         current_price = md.get("BidPrice1", 0) or md.get("LastPrice", 0)
             else:
                 current_price = new_price
+
+        # ===== 🛡️ 重挂限价 sentinel 兜底：任何分支生成的 current_price 必须合法才能重挂 =====
+        # 任何乱价（float_max / NaN / 非正 / 超 1e9 天价）都直接 return，不撤单也不重挂，保留原挂单等待
+        def _rp_valid(v):
+            try:
+                fv = float(v)
+                return bool(fv > 0 and math.isfinite(fv) and fv < 1e9)
+            except Exception:
+                return False
+        if not _rp_valid(current_price):
+            self.print(f"[监控-重挂限价无效] {contract} 生成重挂限价={current_price!r} 非法，跳过本次撤单重挂（保留原挂单等待自然成交）")
+            return
+        try:
+            from trading.position_sync.order_ops import _is_valid_positive_price
+            if not bool(_is_valid_positive_price(current_price)):
+                self.print(f"[监控-重挂限价无效] {contract} 生成重挂限价={current_price!r} 未通过订单价格闸，跳过本次撤单重挂（保留原挂单等待自然成交）")
+                return
+        except Exception:
+            pass
 
         # 获取交易所
         if info_obj:
