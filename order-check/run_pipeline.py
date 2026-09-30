@@ -836,12 +836,39 @@ _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
 
 def _reload_account_targets_module():
-    """reload account_targets.py，返回 ACCOUNT_TARGETS dict。
+    """reload account_targets.py，返回 ACCOUNT_TARGETS dict（CPU 优化：文件 stat 没变化不 reload）
 
     加载失败（import error / reload error / 语法错误）时：回退到全局内存中的 ACCOUNT_TARGETS，
     不影响现有正在运行的同步线程。
     """
     global ACCOUNT_TARGETS, _at_module
+    # ============== CPU 优化：文件 stat 没变（mtime/size/inode）就跳过 py_compile + module exec ==============
+    # account_targets.py 在三账号模式下每 10s 热加载一次，importlib.reload 的 py_compile + exec 是 CPU 大头
+    # 绝大多数时间用户都没改这个文件，所以 stat 不变就直接返缓存 dict，完全不碰 importlib
+    try:
+        if 'account_targets' in sys.modules:
+            _file_path = getattr(sys.modules['account_targets'], '__file__', None)
+        else:
+            try:
+                import account_targets as _tmp_pre
+                _file_path = getattr(_tmp_pre, '__file__', None)
+            except Exception:
+                _file_path = None
+        if _file_path and os.path.exists(_file_path):
+            _st = os.stat(_file_path)
+            _sig = (int(_st.st_ino or 0), int(_st.st_size or 0), int(_st.st_mtime_ns if hasattr(_st, 'st_mtime_ns') else int(_st.st_mtime * 1_000_000_000)))
+            _cached = getattr(_reload_account_targets_module, '_cached', None) or (None, None, None)
+            _prev_sig, _prev_cfg, _prev_mod = _cached
+            if _prev_sig and _prev_sig == _sig and isinstance(_prev_cfg, dict) and _prev_mod is not None:
+                _at_module = _prev_mod
+                if ACCOUNT_TARGETS is None or not ACCOUNT_TARGETS:
+                    ACCOUNT_TARGETS = dict(_prev_cfg)
+                return dict(_prev_cfg)
+        else:
+            _sig = None
+    except Exception:
+        _sig = None
+
     # 首次调用时通过 sys.modules 或者直接 import 找到模块对象
     try:
         if _at_module is None:
@@ -867,6 +894,15 @@ def _reload_account_targets_module():
     _at_module = _at_module_2
     if isinstance(new_cfg, dict):
         ACCOUNT_TARGETS = new_cfg
+    if _sig is not None:
+        try:
+            object.__setattr__(_reload_account_targets_module, '_cached',
+                               (_sig, dict(ACCOUNT_TARGETS or {}), _at_module_2))
+        except Exception:
+            try:
+                _reload_account_targets_module._cached = (_sig, dict(ACCOUNT_TARGETS or {}), _at_module_2)
+            except Exception:
+                pass
     return dict(ACCOUNT_TARGETS or {})
 
 

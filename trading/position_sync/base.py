@@ -609,15 +609,37 @@ class PositionSyncManagerBase(CTdSpiBase):
         }
 
     def _notify_async(self, text: str):
-        """异步发送飞书通知，完全不阻塞
+        """异步发送飞书通知，完全不阻塞（CPU 优化：短时间相同内容去重，避免重复创建线程/飞书 HTTP）
 
         多账户同步时，自动在消息头部加上当前实例的环境标识（env_name），
         以便在飞书消息中区分不同目标账户的同步情况。
         """
+        if not text:
+            return
         account_label = getattr(self, "env_name", None) or "default"
         # 如果消息本身没有以账户标识开头，则自动加上
         if not text.startswith(f"[{account_label}]"):
             text = f"[{account_label}]\n{text}"
+        # CPU 优化 1：相同内容 10 秒内去重（巡检/监控哨兵每秒可能重复触发相同的警告）
+        try:
+            import hashlib
+            _now_ns = __import__('time').time_ns() if hasattr(__import__('time'), 'time_ns') else int(__import__('time').time() * 1e9)
+            _hash = int.from_bytes(hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest(), "little", signed=False)
+            _dedupe = getattr(self, '_notify_dedupe', None) or {}
+            _last_ts = int(_dedupe.get(_hash, 0) or 0)
+            if _last_ts > 0 and (_now_ns - _last_ts) < 10_000_000_000:
+                return  # 10 秒内重复，直接丢弃，不建线程不发 HTTP
+            _dedupe[_hash] = _now_ns
+            # 懒清理：超过 100 条时删掉 1/2 最旧的，内存无泄漏
+            if len(_dedupe) > 100:
+                _cutoff = sorted(_dedupe.values())[49] if len(_dedupe) >= 50 else 0
+                _dedupe = {k: v for k, v in _dedupe.items() if v > _cutoff}
+            try:
+                object.__setattr__(self, '_notify_dedupe', _dedupe)
+            except Exception:
+                self._notify_dedupe = _dedupe
+        except Exception:
+            pass
 
         def _send():
             try:
@@ -1447,7 +1469,7 @@ class PositionSyncManagerBase(CTdSpiBase):
     _POSITIONS_HISTORY_STALE_SECONDS = 60 * 60  # 1 小时以上陈腐条目自动丢弃（防止几天前的旧数据误兜）
 
     def _push_actual_positions_history(self, actual_agg_dict: dict) -> bool:
-        """每次 actual_agg 聚合完成后调用，把快照写进环形缓存。
+        """每次 actual_agg 聚合完成后调用，把快照写进环形缓存（CPU 优化：空聚合不遍历）。
 
         写盘策略：纯内存 RLock 保护，不触发任何 I/O；
         条目结构 (ts, snapshot_copy, n_contracts, total_hands)；
@@ -1455,33 +1477,70 @@ class PositionSyncManagerBase(CTdSpiBase):
         """
         try:
             now_ts = time.time()
-            agg = dict(actual_agg_dict or {})
-            total_hands = int(sum(max(0, int(v or 0)) for v in agg.values()))
-            n_contracts = len(agg)
-            # tuple key → list 转 jsonable（快照 copy 用 list of [contract_str, dir_int, vol_int] 存储）
-            snap_list = [
-                [str(k[0]) if isinstance(k, tuple) and len(k) >= 2 else "",
-                 int(k[1]) if isinstance(k, tuple) and len(k) >= 2 else 0,
-                 int(max(0, int(v or 0)))]
-                for k, v in agg.items()
-                if isinstance(k, tuple) and len(k) >= 2 and int(max(0, int(v or 0))) > 0
-            ]
+            agg = actual_agg_dict or {}
+            if not agg:
+                total_hands = 0
+                n_contracts = 0
+                snap_list = []
+            else:
+                n_contracts = 0
+                total_hands = 0
+                snap_rows = []
+                for k, v in agg.items():
+                    if not isinstance(k, tuple) or len(k) < 2:
+                        continue
+                    try:
+                        vol = int(v or 0)
+                    except Exception:
+                        vol = 0
+                    if vol <= 0:
+                        continue
+                    vol_safe = int(vol) if vol > 0 else 0
+                    if vol_safe <= 0:
+                        continue
+                    n_contracts += 1
+                    total_hands += vol_safe
+                    c_raw = k[0]
+                    d_raw = k[1]
+                    c_str = str(c_raw) if c_raw is not None else ""
+                    try:
+                        d_int = int(d_raw)
+                    except Exception:
+                        d_int = 0
+                    snap_rows.append([c_str, d_int, vol_safe])
+                snap_list = snap_rows
             cutoff = now_ts - self._POSITIONS_HISTORY_STALE_SECONDS
             cap = int(max(3, getattr(self, '_actual_positions_history_capacity', 8) or 8))
-            with getattr(self, '_actual_positions_history_lock', None) or threading.RLock():
-                # 先清理陈腐 + 裁剪旧容量
+            lock = getattr(self, '_actual_positions_history_lock', None)
+            if lock is None:
+                lock = threading.RLock()
+            with lock:
                 buf = getattr(self, '_actual_positions_history', None) or []
-                cleaned = [row for row in buf if (isinstance(row, (list, tuple)) and len(row) >= 4 and float(row[0] or 0) > cutoff)]
+                if buf:
+                    cleaned = []
+                    for row in buf:
+                        if isinstance(row, (list, tuple)) and len(row) >= 4:
+                            try:
+                                if float(row[0] or 0) > cutoff:
+                                    cleaned.append(row)
+                            except Exception:
+                                continue
+                else:
+                    cleaned = []
                 if len(cleaned) >= cap:
                     cleaned = cleaned[len(cleaned)-cap+1:]
                 cleaned.append((now_ts, snap_list, int(n_contracts), int(total_hands)))
-                self._actual_positions_history = cleaned
-            # 只要成功写入一次环形缓存（说明本轮 CTP 查仓真实成功，actual_agg 不是 None/空），
-            # 就把冷启动首轮标记清掉 → 下一轮巡检/同步允许启用空账号跳过。
+                try:
+                    object.__setattr__(self, '_actual_positions_history', cleaned)
+                except Exception:
+                    self._actual_positions_history = cleaned
             try:
                 object.__setattr__(self, '_is_first_run', False)
             except Exception:
-                self._is_first_run = False
+                try:
+                    self._is_first_run = False
+                except Exception:
+                    pass
             return True
         except Exception:
             return False
@@ -1507,11 +1566,9 @@ class PositionSyncManagerBase(CTdSpiBase):
             (should_skip: bool, skip_reason: str)
         判定逻辑（全部满足才跳，任何一条不满足都走正常查仓/查单，保守不冒翻倍风险）：
           1) 非清仓模式（ratio == 0 模式不跳，真清仓需要精确对齐到 0）；
-          2) 冷启动首轮不跳（self._is_first_run=True，至少得先查一次 CTP 把 actual 落到环形缓存里，
-             否则永远拿不到「跟单已知空仓」的事实，就会永久误跳）；
-          3) 源账号 target = 空（解析 hold-std.json，全 0 手 / 0 合约）；
-          4) 跟单账号 actual = 已知空（最近 60 分钟内成功查过一次 CTP，环形缓存里那条 total_hands==0，
-             即「已知最近一次真实查仓就是 0」，不是冷启动的 0 也不是脏空判出来的 0）。
+          2) 冷启动首轮不跳（self._is_first_run=True，至少得先查一次 CTP 把 actual 落到环形缓存里）；
+          3) 源账号 target = 空；
+          4) 跟单账号 actual = 已知空（最近 60 分钟内环形缓存最新条 total_hands==0）。
         """
         _tag = f"[{tag}]" if tag else ""
         try:
@@ -1525,29 +1582,52 @@ class PositionSyncManagerBase(CTdSpiBase):
                 if not self._load_hold_std():
                     return False, f"{_tag} _load_hold_std 失败，不跳过（安全兜底走正常流程）"
                 target = self._parse_hold_std() or {}
-                src_total = int(sum(max(0, int(v or 0)) for v in target.values()))
-                src_empty = (len(target) == 0 or src_total <= 0)
+                src_n = len(target)
+                if src_n == 0:
+                    src_empty = True
+                    src_total = 0
+                else:
+                    src_total = 0
+                    for v in target.values():
+                        try:
+                            src_total += int(max(0, int(v or 0)))
+                        except Exception:
+                            continue
+                    src_empty = src_total <= 0
             except Exception:
                 return False, f"{_tag} 解析源标准持仓异常，不跳过（安全兜底）"
             if not src_empty:
-                return False, f"{_tag} 源账号有仓位（{len(target)}合约，{src_total}手），正常同步/巡检"
-            buf = self._peek_actual_positions_history() or []
+                return False, f"{_tag} 源账号有仓位（{src_n}合约，{src_total}手），正常同步/巡检"
+            buf = getattr(self, '_actual_positions_history', None) or []
             if not buf:
                 return False, f"{_tag} 源空但跟单历史环形缓存为空（未成功查过 CTP），不跳过"
             now_ts = time.time()
             cutoff = now_ts - self._POSITIONS_HISTORY_STALE_SECONDS
-            usable = [r for r in buf if isinstance(r, (list, tuple)) and len(r) >= 4 and float(r[0] or 0) > cutoff]
-            if not usable:
+            latest = None
+            for i in range(len(buf) - 1, -1, -1):
+                r = buf[i]
+                if isinstance(r, (list, tuple)) and len(r) >= 4:
+                    try:
+                        if float(r[0] or 0) > cutoff:
+                            latest = r
+                            break
+                    except Exception:
+                        continue
+            if latest is None:
                 return False, f"{_tag} 源空但跟单环形缓存都超 {int(self._POSITIONS_HISTORY_STALE_SECONDS/60)} 分钟陈腐，不跳过"
-            latest = usable[-1]
-            latest_total = int(latest[3]) if len(latest) >= 4 else -1
-            latest_n = int(latest[2]) if len(latest) >= 3 else -1
-            latest_ts = float(latest[0] or 0)
+            try:
+                latest_total = int(latest[3]) if len(latest) >= 4 else -1
+                latest_n = int(latest[2]) if len(latest) >= 3 else -1
+                latest_ts = float(latest[0] or 0)
+            except Exception:
+                latest_total = -1
+                latest_n = -1
+                latest_ts = 0.0
             follower_empty = (latest_total <= 0 and latest_n <= 0)
             if not follower_empty:
                 return False, f"{_tag} 源空但跟单仍有持仓（{int(latest_n)}合约，{int(latest_total)}手），正常同步/巡检"
             stale_min = (now_ts - latest_ts) / 60.0 if latest_ts > 0 else 0.0
-            reason = (f"{_tag} 源账号空仓（{len(target)}合约，{src_total}手）"
+            reason = (f"{_tag} 源账号空仓（{src_n}合约，{src_total}手）"
                       f" + 跟单账号已知空仓（{stale_min:.1f}分钟前真实查仓 0合约/0手），跳过本轮查仓查单")
             return True, reason
         except Exception:
