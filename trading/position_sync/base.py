@@ -1476,6 +1476,12 @@ class PositionSyncManagerBase(CTdSpiBase):
                     cleaned = cleaned[len(cleaned)-cap+1:]
                 cleaned.append((now_ts, snap_list, int(n_contracts), int(total_hands)))
                 self._actual_positions_history = cleaned
+            # 只要成功写入一次环形缓存（说明本轮 CTP 查仓真实成功，actual_agg 不是 None/空），
+            # 就把冷启动首轮标记清掉 → 下一轮巡检/同步允许启用空账号跳过。
+            try:
+                object.__setattr__(self, '_is_first_run', False)
+            except Exception:
+                self._is_first_run = False
             return True
         except Exception:
             return False
@@ -1488,6 +1494,64 @@ class PositionSyncManagerBase(CTdSpiBase):
                 return [list(row) for row in buf]
         except Exception:
             return []
+
+    # ------------------------------------------------------------------
+    # 空账号快速跳过（性能优化）：源账号 target 空 + 跟单实际仓位已知空 → 不做查仓/查单
+    # 严格对齐用户原话：「如果源账号的持仓为0，他的跟单账号可以不做去做任务操作，如巡检，查询持仓等，
+    #                    如果跟单账号有持仓的才去做这个工作」
+    # ------------------------------------------------------------------
+    def _should_skip_on_source_empty(self, tag: str = "") -> tuple:
+        """判断是否满足「源账号0仓+跟单账号已知0仓 → 本轮跳过」。
+
+        Returns:
+            (should_skip: bool, skip_reason: str)
+        判定逻辑（全部满足才跳，任何一条不满足都走正常查仓/查单，保守不冒翻倍风险）：
+          1) 非清仓模式（ratio == 0 模式不跳，真清仓需要精确对齐到 0）；
+          2) 冷启动首轮不跳（self._is_first_run=True，至少得先查一次 CTP 把 actual 落到环形缓存里，
+             否则永远拿不到「跟单已知空仓」的事实，就会永久误跳）；
+          3) 源账号 target = 空（解析 hold-std.json，全 0 手 / 0 合约）；
+          4) 跟单账号 actual = 已知空（最近 60 分钟内成功查过一次 CTP，环形缓存里那条 total_hands==0，
+             即「已知最近一次真实查仓就是 0」，不是冷启动的 0 也不是脏空判出来的 0）。
+        """
+        _tag = f"[{tag}]" if tag else ""
+        try:
+            ratio = float(getattr(self, '_position_ratio', 1.0))
+            is_liquidate = abs(ratio) < 1e-9
+            if is_liquidate:
+                return False, f"{_tag} ratio=0 清仓模式，不启用空账号跳过"
+            if bool(getattr(self, '_is_first_run', True)):
+                return False, f"{_tag} 冷启动首轮，先查一次 CTP 打底环形缓存，不跳过"
+            try:
+                if not self._load_hold_std():
+                    return False, f"{_tag} _load_hold_std 失败，不跳过（安全兜底走正常流程）"
+                target = self._parse_hold_std() or {}
+                src_total = int(sum(max(0, int(v or 0)) for v in target.values()))
+                src_empty = (len(target) == 0 or src_total <= 0)
+            except Exception:
+                return False, f"{_tag} 解析源标准持仓异常，不跳过（安全兜底）"
+            if not src_empty:
+                return False, f"{_tag} 源账号有仓位（{len(target)}合约，{src_total}手），正常同步/巡检"
+            buf = self._peek_actual_positions_history() or []
+            if not buf:
+                return False, f"{_tag} 源空但跟单历史环形缓存为空（未成功查过 CTP），不跳过"
+            now_ts = time.time()
+            cutoff = now_ts - self._POSITIONS_HISTORY_STALE_SECONDS
+            usable = [r for r in buf if isinstance(r, (list, tuple)) and len(r) >= 4 and float(r[0] or 0) > cutoff]
+            if not usable:
+                return False, f"{_tag} 源空但跟单环形缓存都超 {int(self._POSITIONS_HISTORY_STALE_SECONDS/60)} 分钟陈腐，不跳过"
+            latest = usable[-1]
+            latest_total = int(latest[3]) if len(latest) >= 4 else -1
+            latest_n = int(latest[2]) if len(latest) >= 3 else -1
+            latest_ts = float(latest[0] or 0)
+            follower_empty = (latest_total <= 0 and latest_n <= 0)
+            if not follower_empty:
+                return False, f"{_tag} 源空但跟单仍有持仓（{int(latest_n)}合约，{int(latest_total)}手），正常同步/巡检"
+            stale_min = (now_ts - latest_ts) / 60.0 if latest_ts > 0 else 0.0
+            reason = (f"{_tag} 源账号空仓（{len(target)}合约，{src_total}手）"
+                      f" + 跟单账号已知空仓（{stale_min:.1f}分钟前真实查仓 0合约/0手），跳过本轮查仓查单")
+            return True, reason
+        except Exception:
+            return False, f"{_tag} 判断异常，不跳过（安全兜底走正常流程）"
 
     def _fallback_actual_positions_from_history(self, max_stale_seconds: int = 900) -> dict:
         """当 query_positions 超时返回 None 时，从历史环形缓存取最新一条有效 actual_agg。
@@ -1741,8 +1805,8 @@ class PositionSyncManagerBase(CTdSpiBase):
             return
 
         try:
-            # 查询 CTP 实际持仓
-            positions = self.query_positions(timeout=15)
+            # ========== 空账号快速跳过（源0仓+跟0仓 → 不查仓不查单）==========
+            _skip_ok, _skip_reason = self._should_skip_on_source_empty("监控")
             _env_m = str(getattr(self, '_env_name', '') or '').strip() or None
             _uid_m = str(getattr(self, '_user_id', '') or '').strip() or None
             _bid_m = str(getattr(self, '_broker_id', '') or '').strip() or None
@@ -1754,6 +1818,15 @@ class PositionSyncManagerBase(CTdSpiBase):
                     return ""
                 body = f"{s}{_suf_m}".rstrip()
                 return f"{_pre_m} {body}" if _pre_m else body
+            if _skip_ok:
+                _log_line = _fmt_m(f"[监控加速] {_skip_reason}") or ""
+                if _log_line:
+                    self.print(_log_line)
+                return
+            # ========== 空账号跳过结束 ==========
+
+            # 查询 CTP 实际持仓
+            positions = self.query_positions(timeout=15)
 
             if positions is None:
                 # 15 秒巡检：查超时就用历史 15 分钟内快照继续对比，避免「锁被占用 5 秒 + 查询超时 → 连续丢多轮巡检，差异隐瞒不报」

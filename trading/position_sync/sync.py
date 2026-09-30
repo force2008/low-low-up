@@ -727,6 +727,30 @@ class PositionSyncManagerSync:
 
         t_phase = time.time()
         try:
+            _env_s = str(getattr(self, '_env_name', '') or '').strip() or None
+            _uid_s = str(getattr(self, '_user_id', '') or '').strip() or None
+            _bid_s = str(getattr(self, '_broker_id', '') or '').strip() or None
+            _pre_s = "".join([p for p in [f"[{_env_s}]" if _env_s else None, f"[{_uid_s}]" if _uid_s else None] if p])
+            _suf_s = f" (BrokerID={_bid_s}, InvestorID={_uid_s})" if (_bid_s or _uid_s) else ""
+            def _fmt_s(msg: str) -> str:
+                if not msg:
+                    return ""
+                body = f"{msg}{_suf_s}".rstrip()
+                return f"{_pre_s} {body}" if _pre_s else body
+
+            # ========== 空账号快速跳过（源0仓+跟0仓 → 不查仓不查单，性能优化）==========
+            # 仅在 hold 没变（_hold_changed=False）时启用。
+            # hold 变了哪怕全0也得正常走同步：用户可能刚在源账号平完全仓（hold 全0），但跟单账号还有仓位，需要同步平仓。
+            if not bool(_hold_changed):
+                _skip_ok, _skip_reason = self._should_skip_on_source_empty("同步")
+                if _skip_ok:
+                    _line = _fmt_s(f"[同步加速] {_skip_reason}") or ""
+                    if _line:
+                        self.print(_line)
+                    # 不更新 _last_sync_time / _last_sync_hold_mtime（本论没同步，保留原冷却状态）
+                    return False
+            # ========== 空账号跳过结束 ==========
+
             # 1. 加载合约信息
             if not self._load_contract_info():
                 self.print("[错误] 加载合约信息失败")
