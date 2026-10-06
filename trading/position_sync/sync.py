@@ -1349,7 +1349,12 @@ class PositionSyncManagerSync:
                     except Exception:
                         _async_submitted = False
                     _async_tag = "；已启动后台异步行情回填订阅，下一轮同步时命中缓存" if _async_submitted else ""
-                    self.print(f"[开跳过] {contract}({exact}) {_dir}{_vol}手: 第一阶段行情查询失败，已尝试：1) prefer_cached=True 再查 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；仍空 => 启动后从未收到过此合约 tick，建议确认合约是否正确/行情前置是否订阅到该合约{_async_tag}")
+                    self.print(
+                        f"[开跳过] {contract}({exact}) {_dir}{_vol}手: 第一阶段行情查询失败，"
+                        f"已尝试：1) prefer_cached=True 再查 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；"
+                        f"仍空 => 开仓属于选择性收益端，不启用涨跌停超价兜底（避免无行情时乱入仓），建议下一轮重试或人工确认。"
+                        f"{_async_tag}"
+                    )
                     skip_open[0] += 1
                     continue
                 elif _open_cache_fallback:
@@ -1669,8 +1674,7 @@ class PositionSyncManagerSync:
                 if not md:
                     if eo.get("is_exclude_exit"):
                         self.print(f"[exclude-退出] {contract} 无行情，跳过退出平仓（下次同步重试）")
-                    # 当前轮拿不到 md 就立刻启动一个后台异步 MdApi 订阅线程（不阻塞本轮同步主流程）
-                    # 后台线程长等 60s 拿首 tick，回填缓存后下一轮 sync/巡检直接命中 prefer_cached + 永久已知价
+                    # 当前轮拿不到 md，先启动后台异步回填，再走 TD/涨跌停兜底
                     _async_sub_close = False
                     try:
                         if hasattr(self, 'submit_async_market_fetch'):
@@ -1678,13 +1682,126 @@ class PositionSyncManagerSync:
                     except Exception:
                         _async_sub_close = False
                     _async_tg = "；已启动后台异步行情回填订阅，下一轮同步时命中缓存" if _async_sub_close else ""
-                    _sk_reason = ("第一阶段行情查询未返回，已尝试：1) prefer_cached=True 再查一次 2) md_provider._quotes 历史缓存回退 3) _last_known_prices 永久已知价缓存；"
-                                  "仍空 => 启动后从未收到过此合约 tick，请确认合约是否正确/行情前置是否有此合约（可能真的非主力或映射错）%s" % _async_tg)
-                    _tag_dir = "多" if pos_dir == 2 else "空"
-                    self.print("[平跳过] %s %s %s手: %s" % (contract, _tag_dir, eo_volume, _sk_reason))
-                    skip_close[0] += 1
-                    time.sleep(0.2)
-                    continue
+
+                    # ========== 新增：第 5/6/7 层兜底，避免「4 层全空就永远平不掉」 ==========
+                    # 第 5 层：立刻走 TD 接口 ReqQryDepthMarketData 强制查询（独立柜台路由，Md 断时 TD 经常还活着）
+                    _md_via_td = None
+                    try:
+                        if hasattr(self, "query_market_data"):
+                            _md_via_td = self.query_market_data(
+                                contract, timeout=7, max_retries=1,
+                                prefer_cached=False, force_td_fallback=True,
+                            )
+                    except Exception:
+                        _md_via_td = None
+                    if isinstance(_md_via_td, dict) and _md_via_td:
+                        md = _md_via_td
+                        self.print(
+                            f"[信息][平仓兜底第5层] {contract} 通过 TD ReqQryDepthMarketData "
+                            f"拿到行情 Last={md.get('LastPrice')} Bid={md.get('BidPrice1')} Ask={md.get('AskPrice1')}"
+                        )
+
+                    # 第 6 层：把永久已知价 + 持仓 SettlementPrice 合起来构造一个伪 md
+                    if not md:
+                        try:
+                            _k3 = str(contract).strip().upper()
+                            _lkt2 = getattr(self, '_last_known_prices', None) or {}
+                            _lk3 = _lkt2.get(_k3) or {}
+                            _det2 = self._get_position_detail(contract, pos_dir) or {}
+                            import math as _syncm2
+                            def _sp(x):
+                                try:
+                                    v = float(x)
+                                    return v if (_syncm2.isfinite(v) and 0 < v < 1e9) else 0.0
+                                except Exception:
+                                    return 0.0
+                            _settle = _sp(_det2.get("SettlementPrice")) or _sp(_det2.get("PreSettlementPrice")) or _sp(_det2.get("OpenPrice"))
+                            _lkt_last = _sp(_lk3.get("LastPrice"))
+                            _lkt_bid = _sp(_lk3.get("BidPrice1"))
+                            _lkt_ask = _sp(_lk3.get("AskPrice1"))
+                            base = _lkt_last or _settle
+                            if base > 0:
+                                md = {
+                                    "InstrumentID": contract,
+                                    "LastPrice": base,
+                                    "BidPrice1": _lkt_bid if _lkt_bid > 0 else base,
+                                    "AskPrice1": _lkt_ask if _lkt_ask > 0 else base,
+                                    "UpperLimitPrice": 0.0,
+                                    "LowerLimitPrice": 0.0,
+                                }
+                                self.print(
+                                    f"[信息][平仓兜底第6层] {contract} 用永久已知价/结算价构造伪 md: "
+                                    f"Last={md['LastPrice']:.4f} Bid={md['BidPrice1']:.4f} Ask={md['AskPrice1']:.4f} "
+                                    f"(来源: {'永久已知价' if _lkt_last > 0 else '持仓结算价'})"
+                                )
+                        except Exception:
+                            md = None
+
+                    # 第 7 层（终极兜底）：仍然没拿到有效 md → 走涨跌停超价兜底
+                    _use_limit_price_fallback = False
+                    _limit_price = None
+                    _limit_note = None
+                    if not md:
+                        try:
+                            _info7 = self._get_contract_info(contract)
+                            if hasattr(self, "_get_limit_price_fallback"):
+                                _lp, _note = self._get_limit_price_fallback(
+                                    contract, pos_dir, info=_info7, md=None
+                                )
+                                if _lp is not None and _lp > 0:
+                                    _use_limit_price_fallback = True
+                                    _limit_price = float(_lp)
+                                    _limit_note = _note or ""
+                                    self.print(
+                                        f"[紧急][平仓兜底第7层-涨跌停超价] {contract} 采用涨跌停超价限价: "
+                                        f"{_limit_note}"
+                                    )
+                                    # 构造一个只含限价的伪 md，_calc_limit_price 里 Last/Bid/Ask 只用于
+                                    # aggressive/passive 决策，但我们会强制用 _limit_price 覆盖
+                                    _tick = float(_info7.get("PriceTick")) if isinstance(_info7, dict) else 1.0
+                                    _tick = _tick if _tick > 0 else 1.0
+                                    md = {
+                                        "InstrumentID": contract,
+                                        "LastPrice": _limit_price,
+                                        "BidPrice1": _limit_price,
+                                        "AskPrice1": _limit_price,
+                                    }
+                        except Exception as e7:
+                            self.print(f"[警告] 涨跌停超价兜底异常: {e7}")
+
+                    if not md:
+                        _sk_reason = (
+                            "第一阶段行情查询未返回，已尝试：1) prefer_cached=True 再查一次 2) md_provider._quotes 历史缓存回退 "
+                            "3) _last_known_prices 永久已知价缓存；新增兜底：4) TD ReqQryDepthMarketData 强制查询 "
+                            "5) 结算价构造伪md 6) 涨跌停超价限价；仍全部失败 => 建议立即人工介入，确认合约有效性/柜台路由/权限"
+                            + _async_tg
+                        )
+                        _tag_dir = "多" if pos_dir == 2 else "空"
+                        self.print("[平跳过] %s %s %s手: %s" % (contract, _tag_dir, eo_volume, _sk_reason))
+                        try:
+                            if hasattr(self, '_notify_async'):
+                                self._notify_async(
+                                    f"🚨 超仓平仓被跳过需人工介入\n"
+                                    f"合约：{contract}\n方向：{_tag_dir}\n手数：{eo_volume}\n"
+                                    f"原因：7层行情定价兜底全部失败\n"
+                                    f"BrokerID={getattr(self,'_broker_id','')} "
+                                    f"InvestorID={getattr(self,'_user_id','')} "
+                                    f"Env={getattr(self,'env_name','')}"
+                                )
+                        except Exception:
+                            pass
+                        skip_close[0] += 1
+                        time.sleep(0.2)
+                        continue
+                    elif _use_limit_price_fallback:
+                        # 涨跌停超价兜底成功：下面 _calc_limit_price 正常跑但会被我们覆盖
+                        self.print(
+                            f"[信息][平仓兜底第7层生效] {contract} 将使用涨跌停超价限价 "
+                            f"{_limit_price:.4f} 提交平仓"
+                        )
+                        # 强制保存下来，后面 _calc_limit_price 返回后直接覆盖限价
+                        eo["_limit_price_override"] = _limit_price
+                        eo["_limit_price_override_note"] = _limit_note or ""
                 elif _cache_hard_fallback:
                     self.print("[信息] %s 使用 md_provider._quotes 历史缓存行情定价（次主力无最新 tick，历史价仍可用）。" % contract)
                 elif _last_known_fallback:
@@ -1819,11 +1936,6 @@ class PositionSyncManagerSync:
 
                 if pos_dir == 2:  # 多头 → 卖出平仓
                     close_direction = "sell"
-                    # 定价策略（优先级从高到低）：
-                    #  ① exclude 品种老仓退出 (is_exclude_exit=True) → 永远 aggressive 主动吃盘（时间优先，尽快退干净）
-                    #  ② ratio==0 全仓清仓模式 (is_liquidate_mode=True) → 永远 passive 排队挂单（不急成交多赚滑点）
-                    #  ③ passive_mode=True（套利跟单账户）→ 普通对齐调仓也走 passive 排队价（赚滑点优先）
-                    #  ④ 默认（普通对齐调仓 + passive_mode=False）→ aggressive 主动吃盘（尽快对齐）
                     is_exclude_exit = bool(eo.get("is_exclude_exit", False))
                     is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
                     use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
@@ -1850,6 +1962,23 @@ class PositionSyncManagerSync:
                         price_tick=price_tick,
                         logger=self,
                     )
+
+                # ====== 涨跌停超价兜底：如果本合约标记了 _limit_price_override，强制覆盖定价 ======
+                _lpo = eo.get("_limit_price_override")
+                if _lpo is not None:
+                    try:
+                        import math as _lpom
+                        _lpof = float(_lpo)
+                        if _lpom.isfinite(_lpof) and _lpof > 0 and _lpof < _INVALID_PRICE_MAX_CAP:
+                            _lpo_note = str(eo.get("_limit_price_override_note") or "")
+                            self.print(
+                                f"[平仓兜底-涨跌停超价覆盖] {contract} 原定价={limit_price:.4f}（{pricing_note}）→ "
+                                f"强制限价={_lpof:.4f}（{_lpo_note}）"
+                            )
+                            limit_price = _lpof
+                            pricing_note = pricing_note + " | + 涨跌停超价兜底覆盖=" + _lpo_note
+                    except Exception as _e_override:
+                        self.print(f"[警告] {contract} 应用 _limit_price_override 失败: {_e_override}")
 
                 if not _is_valid_positive_price(limit_price):
                     tag = "[exclude-退出]" if eo.get("is_exclude_exit") else "[平]"
