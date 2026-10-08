@@ -55,19 +55,37 @@ PASSWORD_INPUT_METHOD = "typewrite"
 
 
 def _launch_program():
-    """优先通过路径启动；失败再尝试桌面图标双击。"""
+    """
+    启动融航风控端。
+    关键：必须把「工作目录」切换到 exe 所在目录后再启动，否则软件会读取脚本运行目录下的配置，
+    导致用户名/参数等一切都不对（例如出现用户名是 123）。
+    """
     if PROGRAM_EXE_PATH and os.path.exists(PROGRAM_EXE_PATH):
+        exe_dir = os.path.dirname(os.path.abspath(PROGRAM_EXE_PATH))
+        print(f"[启动] 切换工作目录到: {exe_dir}")
         print(f"[启动] os.startfile: {PROGRAM_EXE_PATH}")
         try:
+            # 保存原始 CWD，启动后恢复（避免脚本后续工作目录被污染）
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(exe_dir)
+            except Exception as e:
+                print(f"  [调试] chdir 失败(非致命): {e}")
+            # 用 cwd=exe_dir 语义启动，等价于在文件夹里双击
             os.startfile(PROGRAM_EXE_PATH)
+            # 启动完立刻把 CWD 切回原目录，防止影响脚本后续路径
+            try:
+                os.chdir(original_cwd)
+            except Exception:
+                pass
             return True
         except Exception as e:
             print(f"  [警告] 路径启动失败: {e}，尝试图标双击")
-    # 兜底：图标双击
+
+    # 兜底：桌面图标双击（这种方式 Windows 会以快捷方式/图标所在目录为 CWD，通常不会有配置读取问题）
     if DESKTOP_ICON_COORDS and DESKTOP_ICON_COORDS != (0, 0):
         print(f"[启动] 尝试双击桌面图标 {DESKTOP_ICON_COORDS}")
         try:
-            # 先按 Win+D 显示桌面，防止被其他窗口遮挡
             pyautogui.hotkey("win", "d")
             time.sleep(1.2)
             pyautogui.doubleClick(*DESKTOP_ICON_COORDS)
