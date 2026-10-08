@@ -30,13 +30,14 @@ PROGRAM_EXE_PATH = r"E:\Program Files\融航资管交易平台风控端\RohonSer
 # 登录窗口标题关键字（pygetwindow 会用 contains 匹配）
 LOGIN_WINDOW_TITLE_KEYWORD = "风控"          # 例：综合交易平台风控终端 / 融航资管...
 
-# 三个点击位置坐标（直接从 record_coordinates.py / export/coordinates.txt 复制）
+# 四个点击位置坐标（直接从 record_coordinates.py / export/coordinates.txt 复制）
 PASSWORD_INPUT_COORDS = (1832, 1948)        # 密码输入框中心
 CONFIRM_BUTTON_COORDS   = (1256, 1602)      # 确定按钮中心
+CLOSE_BUTTON_COORDS     = (0, 0)            # 登录窗口右上角「×」关闭按钮（自行录入坐标；0,0 表示未配置，会走 .close()/taskkill 降级）
 DESKTOP_ICON_COORDS     = (2653, 688)       # 备用：桌面图标坐标（路径启动失败时用）
 
 # 密码
-PASSWORD = "283200"
+PASSWORD = "2832002"
 
 # ============================================================
 # 时间配置（云主机较慢，等待时间给得稍长，稳定第一）
@@ -45,13 +46,147 @@ WAIT_PROGRAM_LAUNCH   = 10   # 启动 exe 后，等登录窗口出现（秒）
 WAIT_WINDOW_ACTIVATE  = 1.0  # 激活窗口后等待稳定
 WAIT_CLICK_SETTLE     = 0.6  # 点击密码框后等待焦点
 WAIT_TYPE_SETTLE      = 0.8  # 输入完密码后等待
-WAIT_AFTER_CONFIRM    = 3    # 点确定后等待主界面
+WAIT_AFTER_CONFIRM    = 3    # 点确定后等待主界面（短时间观察）
+
+# ---------- 登录失败自动关闭（非交易日等情况） ----------
+AUTO_CLOSE_ON_LOGIN_FAIL = True     # True=登录窗口还没消失就自动关了它
+WAIT_LOGIN_RESULT        = 10       # 点确定后多少秒内仍有登录窗口 → 判定失败
+FORCE_KILL_ON_FAIL       = True     # 优雅关闭/坐标点击失败时，是否用 taskkill 强杀 RohonServerRiskControl.exe
 
 # 密码输入方式：
 #   "typewrite"  ->  pyautogui.typewrite（推荐，纯数字密码够用）
 #   "clipboard"  ->  写入剪贴板后 Ctrl+V（密码含特殊字符时使用，若风控禁粘贴则不可用）
 #   "press_each" ->  pyautogui.press 逐个按键（与 typewrite 差异不大）
 PASSWORD_INPUT_METHOD = "typewrite"
+
+
+def _is_login_window_still_visible(win):
+    """
+    判断「登录窗口是否还存在/可见」。
+    传入 _activate_login_window 返回的窗口对象（可能是 None）。
+    逻辑：尝试按关键字重新查一次，并且检查窗口是否可见、没有最小化、尺寸正常。
+    """
+    if win is None:
+        # 没传窗口对象，就重新按关键字查是否还存在登录窗口
+        for kw in [LOGIN_WINDOW_TITLE_KEYWORD, "融航", "登录", "Risk", "综合交易平台"]:
+            if not kw:
+                continue
+            try:
+                wins = pyautogui.getWindowsWithTitle(kw)
+            except Exception:
+                wins = []
+            for w in wins:
+                if (w and getattr(w, "title", "")
+                        and not getattr(w, "isMinimized", True)
+                        and getattr(w, "width", 0) > 100
+                        and getattr(w, "height", 0) > 100):
+                    return w  # 返回命中的登录窗口
+        return None
+    # 传入了登录窗口对象：判断它是否还活着且可见
+    try:
+        if getattr(win, "isMinimized", True):
+            return None
+        if not getattr(win, "visible", True):
+            return None
+        w = getattr(win, "width", 0); h = getattr(win, "height", 0)
+        if w <= 50 or h <= 50:
+            return None
+        # 再确认一次标题还在（有些软件登录成功后会把同一窗口改名）
+        title = getattr(win, "title", "")
+        for kw in [LOGIN_WINDOW_TITLE_KEYWORD, "融航", "登录", "Risk", "综合交易平台"]:
+            if kw and kw in title:
+                return win
+        return None
+    except Exception:
+        # 窗口对象已失效 → 登录窗口基本就是关了
+        return None
+
+
+def _close_login_window(login_win):
+    """
+    尝试关闭登录窗口，优先级：
+    1) 点窗口对象的 .close()（优雅关闭）
+    2) 用窗口的 left/top/width/height 算右上角关闭按钮坐标，pyautogui.click
+    3) taskkill /F /IM 进程名 强杀
+    """
+    if login_win is None:
+        # 没有记录登录窗口对象，重新按关键字搜索一次
+        for kw in [LOGIN_WINDOW_TITLE_KEYWORD, "融航", "登录", "Risk", "综合交易平台"]:
+            if not kw:
+                continue
+            try:
+                wins = pyautogui.getWindowsWithTitle(kw)
+            except Exception:
+                wins = []
+            for w in wins:
+                if (w and getattr(w, "title", "")
+                        and getattr(w, "width", 0) > 100
+                        and getattr(w, "height", 0) > 100):
+                    login_win = w
+                    break
+            if login_win is not None:
+                break
+    if login_win is None:
+        print("  未找到要关闭的登录窗口，可能已经自行关闭了")
+        return True
+
+    # 步骤1: 优雅关闭
+    closed = False
+    title = getattr(login_win, "title", "<unknown>")
+    print(f"[关闭] 准备关闭登录窗口: '{title}'")
+    try:
+        login_win.close()
+        time.sleep(1.0)
+        closed_after = _is_login_window_still_visible(login_win) is None
+        if closed_after:
+            closed = True
+            print("  [关闭] 调用 .close() 成功")
+    except Exception as e:
+        print(f"  [关闭] .close() 异常: {e}")
+
+    # 步骤2: 用你手动录入的固定坐标，点登录窗口右上角的「×」按钮
+    if not closed and CLOSE_BUTTON_COORDS and CLOSE_BUTTON_COORDS != (0, 0):
+        cx, cy = CLOSE_BUTTON_COORDS
+        print(f"  [关闭] 尝试按固定坐标点击关闭按钮: ({cx},{cy})")
+        try:
+            # 先激活到前台，防止点到别的窗口上
+            try:
+                login_win.activate()
+                time.sleep(0.3)
+            except Exception:
+                pass
+            pyautogui.click(cx, cy)
+            time.sleep(1.5)
+            closed_after = _is_login_window_still_visible(login_win) is None
+            if closed_after:
+                closed = True
+                print("  [关闭] 点击关闭按钮成功")
+            else:
+                print("  [关闭] 点击关闭按钮后窗口仍存在（可能是坐标偏了，可重录 CLOSE_BUTTON_COORDS）")
+        except Exception as e:
+            print(f"  [关闭] 点击关闭按钮异常: {e}")
+    elif not closed:
+        print("  [关闭] 未配置 CLOSE_BUTTON_COORDS（当前为 (0,0)），跳过坐标点击")
+
+    # 步骤3: taskkill 强杀进程
+    if not closed and FORCE_KILL_ON_FAIL:
+        print("  [关闭] 尝试 taskkill 强杀进程 RohonServerRiskControl.exe")
+        import subprocess
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "RohonServerRiskControl.exe", "/T"],
+                capture_output=True, timeout=8
+            )
+            time.sleep(1.5)
+            if _is_login_window_still_visible(login_win) is None:
+                closed = True
+                print("  [关闭] taskkill 强杀成功")
+            else:
+                print("  [关闭] taskkill 后窗口仍存在，请手动关闭")
+        except Exception as e:
+            print(f"  [关闭] taskkill 异常: {e}")
+
+    return closed
 
 
 def _launch_program():
@@ -213,6 +348,8 @@ def main():
     print(f"  窗口关键字: {LOGIN_WINDOW_TITLE_KEYWORD}")
     print(f"  密码框坐标: {PASSWORD_INPUT_COORDS}")
     print(f"  确定按钮  : {CONFIRM_BUTTON_COORDS}")
+    print(f"  关闭按钮× : {CLOSE_BUTTON_COORDS}"
+          f"{'   (未配置，会跳过坐标点击)' if CLOSE_BUTTON_COORDS == (0, 0) else ''}")
     print()
 
     # 快速校验坐标：如果坐标超过当前屏幕分辨率就提醒
@@ -220,6 +357,7 @@ def main():
     print(f"[屏幕] 当前分辨率: {sw} x {sh}")
     for name, (x, y) in [("密码框", PASSWORD_INPUT_COORDS),
                          ("确定按钮", CONFIRM_BUTTON_COORDS),
+                         ("关闭按钮×", CLOSE_BUTTON_COORDS),
                          ("桌面图标", DESKTOP_ICON_COORDS)]:
         if (x, y) == (0, 0):
             continue
@@ -279,14 +417,67 @@ def main():
     print("  确定完成")
     print()
 
+    # ----------------------------------------------------------
+    # 步骤5：检测登录结果，失败则 10s 超时后自动关闭登录窗口
+    # ----------------------------------------------------------
+    login_succeeded = False
+    if AUTO_CLOSE_ON_LOGIN_FAIL:
+        print(f"[登录检测] 等待 {WAIT_LOGIN_RESULT} 秒观察登录窗口是否消失 ...")
+        deadline = time.time() + WAIT_LOGIN_RESULT
+        checked_win = win   # 用之前 _activate_login_window 保存下来的登录窗口对象
+        last_reported = None
+        while time.time() < deadline:
+            remaining = int(deadline - time.time())
+            still = _is_login_window_still_visible(checked_win)
+            if still is None:
+                login_succeeded = True
+                print(f"  ✓ 登录窗口已消失，判定登录成功（剩余 {remaining}s）")
+                # 如果对象是新命中的（返回了新窗口句柄），记录一下方便后续关闭
+                break
+            # 如果本轮返回的是「新的窗口对象」而不是旧的，更新引用
+            if still is not None and still is not checked_win:
+                checked_win = still
+            # 每 2 秒或状态变化时打一条状态
+            status = (still is not None)
+            if status != last_reported or remaining % 2 == 0:
+                title = getattr(still, "title", "")
+                print(f"  · 还剩 {remaining}s → 登录窗口仍存在: '{title[:30]}'")
+                last_reported = status
+            time.sleep(0.5)
+        print()
+
+        if not login_succeeded:
+            print(f"[登录检测] ✗ {WAIT_LOGIN_RESULT} 秒内登录窗口未消失，判定为登录失败（非交易日/密码错误/网络等原因）")
+            print("  开始自动关闭登录窗口 ...")
+            ok = _close_login_window(checked_win)
+            if ok:
+                print("[关闭] ✓ 登录窗口已成功关闭")
+            else:
+                print("[关闭] ✗ 未能成功关闭登录窗口，请手动处理")
+            print()
+            # 标记为失败，退出码非 0 便于上游脚本感知
+            final_exit_code = 5
+        else:
+            final_exit_code = 0
+    else:
+        final_exit_code = 0
+
     print("=" * 50)
-    print("自动登录流程结束，请确认风控端是否成功进入主界面")
+    if login_succeeded or not AUTO_CLOSE_ON_LOGIN_FAIL:
+        print("自动登录流程结束，请确认风控端是否成功进入主界面")
+    else:
+        print("自动登录流程结束：登录未成功，已触发自动关闭（可能是非交易日/网络/密码等原因）")
     print("=" * 50)
     print("常见问题：")
     print("  1) 坐标超出范围：在云主机里重新运行 record_coordinates.py 录一次，直接填进来即可")
     print("  2) 密码没输进去：把 PASSWORD_INPUT_METHOD 改为 'clipboard' 再试")
     print("  3) 窗口没激活：把 LOGIN_WINDOW_TITLE_KEYWORD 改成日志里打印的实际标题")
-    print("  4) 紧急中止：把鼠标指针甩到屏幕最左上角（pyautogui FAILSAFE）")
+    print("  4) 登录成功但被判定为失败：确认登录成功后原窗口标题是否还含'风控/登录'等关键字；若含，把超时 WAIT_LOGIN_RESULT 调大或加新关键字排除")
+    print("  5) 关闭按钮×没点中/没生效：用 record_coordinates.py 重新录一次 CLOSE_BUTTON_COORDS（一定要点到登录窗口右上角那个红色的 ×）")
+    print("  6) 不想手动录关闭按钮：把 CLOSE_BUTTON_COORDS 保持 (0,0)，脚本会用 .close() 和 taskkill 自动兜底")
+    print("  7) 紧急中止：把鼠标指针甩到屏幕最左上角（pyautogui FAILSAFE）")
+    if final_exit_code != 0:
+        sys.exit(final_exit_code)
 
 
 if __name__ == "__main__":
