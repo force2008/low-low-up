@@ -169,30 +169,41 @@ class MdQuoteProvider(CMdSpiBase):
             self._quotes[inst.upper()] = data
 
     def subscribe(self, instrument_id: str):
-        """订阅指定合约行情（幂等）"""
+        """订阅指定合约行情（幂等）
+
+        修复 P0 永久黑名单 bug：
+        原流程：先加入 _subscribed 集合 → 等登录 → [登录失败就 return] → CTP 订阅永不发起
+        新流程：先查集合 → 等登录 → 真正发起 CTP 订阅 ret=0 后 → 才加入 _subscribed
+        这样早期登录未就绪时调用 subscribe() 不会把合约锁死在「已订阅」状态里。
+        """
         exact_id = instrument_id.strip()
         key = exact_id.upper()
         with self._quotes_lock:
             if key in self._subscribed:
                 return
-            self._subscribed.add(key)
 
         if not self._is_login:
-            # 等待登录完成（最多 10 秒）
             self._login_event.wait(timeout=10)
         if not self._is_login:
-            self.print(f"[MdQuoteProvider] 行情未登录，无法订阅 {exact_id}")
+            self.print(f"[MdQuoteProvider] 行情未登录，本次跳过订阅 {exact_id}（下轮重试）")
             return
 
         try:
             encoded = [exact_id.encode("utf-8")]
             ret = self._api.SubscribeMarketData(encoded, 1)
+            if ret == 0:
+                with self._quotes_lock:
+                    self._subscribed.add(key)
             self.print(f"[MdQuoteProvider] 订阅 {exact_id} ret={ret}")
         except Exception as e:
             self.print(f"[MdQuoteProvider] 订阅 {exact_id} 异常: {e}")
 
     def subscribe_many(self, instrument_ids: list):
-        """批量订阅多个合约行情（幂等，线程安全）"""
+        """批量订阅多个合约行情（幂等，线程安全）
+
+        修复 P0 永久黑名单 bug：真正发起 CTP 订阅 ret=0 后才加入 _subscribed，
+        避免登录未就绪时把合约锁进「已订阅」状态但没真正订阅。
+        """
         if not instrument_ids:
             return
 
@@ -203,7 +214,6 @@ class MdQuoteProvider(CMdSpiBase):
                 exact_id = inst.strip()
                 key = exact_id.upper()
                 if key not in self._subscribed:
-                    self._subscribed.add(key)
                     to_subscribe.append(exact_id)
 
         if not to_subscribe:
@@ -212,12 +222,16 @@ class MdQuoteProvider(CMdSpiBase):
         if not self._is_login:
             self._login_event.wait(timeout=10)
         if not self._is_login:
-            self.print(f"[MdQuoteProvider] 行情未登录，无法订阅 {to_subscribe}")
+            self.print(f"[MdQuoteProvider] 行情未登录，本次跳过批量订阅 {to_subscribe}（下轮重试）")
             return
 
         try:
             encoded = [i.encode("utf-8") for i in to_subscribe]
             ret = self._api.SubscribeMarketData(encoded, len(encoded))
+            if ret == 0:
+                with self._quotes_lock:
+                    for exact_id in to_subscribe:
+                        self._subscribed.add(exact_id.upper())
             self.print(f"[MdQuoteProvider] 批量订阅 {len(to_subscribe)} 个合约 ret={ret}")
         except Exception as e:
             self.print(f"[MdQuoteProvider] 批量订阅异常: {e}")

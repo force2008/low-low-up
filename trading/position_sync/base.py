@@ -1020,12 +1020,9 @@ class PositionSyncManagerBase(CTdSpiBase):
         bIsLast: bool,
     ):
         if pInvestorPosition:
-            # 总持仓为 0 的不算持仓
             if pInvestorPosition.Position == 0:
                 pass
             else:
-                # 统一 PosiDirection 类型（CTP 可能返回 str / bytes / int，且常带 \0 结尾）
-                # openctp-ctp 中 THOST_FTDC_PD_Long='2', Short='3' 为 str
                 posi_dir = pInvestorPosition.PosiDirection
                 if isinstance(posi_dir, bytes):
                     posi_dir = posi_dir.decode().strip().strip('\x00')
@@ -1037,17 +1034,54 @@ class PositionSyncManagerBase(CTdSpiBase):
                 except (ValueError, TypeError):
                     posi_dir_val = 0
 
-                # 过滤净持仓记录(1)，只保留多头(2)/空头(3)明细
-                # 避免净持仓与明细重复计数，或方向不匹配导致误判空仓
                 if posi_dir_val in (2, 3):
+                    inst_id_raw = (pInvestorPosition.InstrumentID or "").strip()
+                    inst_std = self._standardize_contract(inst_id_raw) if hasattr(self, "_standardize_contract") else inst_id_raw
+                    import math as _math_settle
+                    def _sv(x):
+                        try:
+                            fv = float(x)
+                            return fv if (_math_settle.isfinite(fv) and 0 <= fv < 1e9) else 0.0
+                        except Exception:
+                            return 0.0
+                    _sp = _sv(getattr(pInvestorPosition, "SettlementPrice", 0))
+                    _psp = _sv(getattr(pInvestorPosition, "PreSettlementPrice", 0))
+                    _op = _sv(getattr(pInvestorPosition, "OpenPrice", 0))
                     self._actual_positions.append({
-                        "InstrumentID": (pInvestorPosition.InstrumentID or "").strip().upper(),
+                        "InstrumentID": inst_id_raw.upper(),
                         "PosiDirection": posi_dir_val,
                         "Position": pInvestorPosition.Position,
                         "TodayPosition": pInvestorPosition.TodayPosition,
                         "YdPosition": pInvestorPosition.YdPosition,
                         "ExchangeID": (pInvestorPosition.ExchangeID or "").strip(),
+                        "SettlementPrice": _sp,
+                        "PreSettlementPrice": _psp,
+                        "OpenPrice": _op,
                     })
+                    # P3 预暖：从持仓明细 SettlementPrice / PreSettlementPrice / OpenPrice 写永久已知价缓存
+                    # 冷启动 + Md/TD 全部断流时，至少能拿结算价/开仓均价兜底平仓定价
+                    if hasattr(self, "_update_last_known_prices") and inst_std:
+                        try:
+                            import math as _math_p3
+                            def _p3v(x):
+                                try:
+                                    fv = float(x)
+                                    return fv if (_math_p3.isfinite(fv) and 0 < fv < 1e9) else 0.0
+                                except Exception:
+                                    return 0.0
+                            sp = _p3v(getattr(pInvestorPosition, "SettlementPrice", 0))
+                            psp = _p3v(getattr(pInvestorPosition, "PreSettlementPrice", 0))
+                            op = _p3v(getattr(pInvestorPosition, "OpenPrice", 0))
+                            base = sp or psp or op
+                            if base > 0:
+                                self._update_last_known_prices(
+                                    inst_std,
+                                    last_price=base,
+                                    bid_price1=base,
+                                    ask_price1=base,
+                                )
+                        except Exception:
+                            pass
         if bIsLast:
             self._pos_query_event.set()
 
@@ -1462,6 +1496,157 @@ class PositionSyncManagerBase(CTdSpiBase):
             return False
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # 终极兜底：涨跌停超价平仓定价
+    #   场景：Md 路由断流 + TD 查询也挂了 + 永久已知价也空，4 层全空时启用。
+    #   逻辑：从任意路径（Md缓存/永久已知价/持仓SettlementPrice/合约静态涨跌停板估算）
+    #         拿到 UpperLimitPrice / LowerLimitPrice，然后：
+    #           - 平空（买入平仓）→ 限价=涨停价（确保排在买一最前，对手方排队优先）
+    #           - 平多（卖出平仓）→ 限价=跌停价（确保排在卖一最前）
+    #         为了避免「一字板打穿」反效果，再 -2 ticks（平空）或 +2 ticks（平多）保护。
+    # ------------------------------------------------------------------
+
+    def _get_limit_price_fallback(self, contract: str, pos_dir: int,
+                                   info: dict = None, md: dict = None) -> Tuple[Optional[float], Optional[str]]:
+        """获取「涨跌停超价平仓兜底限价」。
+
+        Args:
+            contract: 合约代码
+            pos_dir: 2=多(需卖平)  3=空(需买平)
+            info: _get_contract_info 返回的合约信息（含 PriceTick）
+            md: 已有行情 dict（若含 UpperLimitPrice/LowerLimitPrice 直接用）
+
+        Returns:
+            (limit_price, note_str)；(None, None) 表示所有路径都拿不到
+        """
+        try:
+            import math as _mfl
+            def _fp(x):
+                try:
+                    v = float(x); return v if (_mfl.isfinite(v) and 0 < v < 1e9) else 0.0
+                except Exception:
+                    return 0.0
+
+            price_tick = 0.0
+            if info and isinstance(info, dict):
+                price_tick = _fp(info.get("PriceTick")) or 0.0
+            if price_tick <= 0:
+                price_tick = 1.0
+
+            # -------- 第 1 路：md dict 里直接带涨跌停价 --------
+            upper = _fp(md.get("UpperLimitPrice")) if md and isinstance(md, dict) else 0.0
+            lower = _fp(md.get("LowerLimitPrice")) if md and isinstance(md, dict) else 0.0
+
+            # -------- 第 2 路：md_provider._quotes 原始缓存 --------
+            if upper <= 0 or lower <= 0:
+                _mdp = getattr(self, "_md_provider", None)
+                if _mdp is not None:
+                    try:
+                        _ck = str(contract).strip().upper()
+                        with _mdp._quotes_lock:
+                            _raw = _mdp._quotes.get(_ck) or {}
+                        if isinstance(_raw, dict):
+                            if upper <= 0:
+                                upper = _fp(_raw.get("UpperLimitPrice"))
+                            if lower <= 0:
+                                lower = _fp(_raw.get("LowerLimitPrice"))
+                    except Exception:
+                        pass
+
+            # -------- 第 3 路：query_market_data force_td_fallback=True 走 TD --------
+            if upper <= 0 or lower <= 0:
+                try:
+                    if hasattr(self, "query_market_data"):
+                        _md2 = self.query_market_data(
+                            contract, timeout=6, max_retries=1,
+                            prefer_cached=False, force_td_fallback=True
+                        )
+                        if isinstance(_md2, dict) and _md2:
+                            if upper <= 0:
+                                upper = _fp(_md2.get("UpperLimitPrice"))
+                            if lower <= 0:
+                                lower = _fp(_md2.get("LowerLimitPrice"))
+                            # 如果同时拿到了 LastPrice，也顺便回填永久已知价
+                            try:
+                                _lp = _fp(_md2.get("LastPrice"))
+                                _bp = _fp(_md2.get("BidPrice1"))
+                                _ap = _fp(_md2.get("AskPrice1"))
+                                if _lp > 0 and hasattr(self, "_update_last_known_prices"):
+                                    self._update_last_known_prices(
+                                        contract, last_price=_lp, bid_price1=_bp, ask_price1=_ap
+                                    )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            note = (
+                f"已拿到涨跌停价 UL={upper or 'N/A'} LL={lower or 'N/A'}"
+                if upper > 0 and lower > 0 else f"涨跌停价不完整 UL={upper} LL={lower}"
+            )
+
+            # -------- 第 4 路：估算——从永久已知价/持仓结算价 × 估算停板比例 --------
+            if upper <= 0 or lower <= 0:
+                base_price = 0.0
+                try:
+                    _ck2 = str(contract).strip().upper()
+                    _lkt = getattr(self, "_last_known_prices", None) or {}
+                    _lk2 = _lkt.get(_ck2) or {}
+                    if isinstance(_lk2, dict):
+                        base_price = _fp(_lk2.get("LastPrice"))
+                except Exception:
+                    base_price = 0.0
+                if base_price <= 0:
+                    # 从持仓 detail 里拿 SettlementPrice / PreSettlementPrice / OpenPrice
+                    try:
+                        _det = self._get_position_detail(contract, pos_dir)
+                        if isinstance(_det, dict):
+                            base_price = _fp(_det.get("SettlementPrice")) or _fp(_det.get("PreSettlementPrice")) or _fp(_det.get("OpenPrice"))
+                    except Exception:
+                        base_price = 0.0
+                if base_price > 0:
+                    # 商品期权/期货常见停板比例：上期所金/银/铜铝等 10%~12%，保守取 8%
+                    product_id = str(contract).strip().upper().rstrip("0123456789")
+                    wide_products = {"AG", "AU", "CU", "AL", "ZN", "PB", "SN", "SS", "NI", "RB", "HC", "BU", "RU", "NR", "SP", "FU", "LU"}
+                    ratio = 0.12 if product_id in wide_products else 0.10
+                    upper = base_price * (1.0 + ratio)
+                    lower = base_price * (1.0 - ratio)
+                    note = (
+                        f"⚠️ 未从接口拿到涨跌停价，基于基价{base_price:.4f}×±{int(ratio*100)}%估算: "
+                        f"UL≈{upper:.4f} LL≈{lower:.4f}（误差不超几个tick即可成交）"
+                    )
+
+            if upper <= 0 or lower <= 0:
+                return None, "所有涨跌停价路径均失败（Md/TD/结算价都空）"
+
+            # ------- 方向映射： -------
+            # 平多(pos_dir=2) → sell to close → 限价挂跌停价(LOWER)，确保排队最前，再 +2 tick 让一步
+            # 平空(pos_dir=3) → buy to close  → 限价挂涨停价(UPPER)，确保排队最前，再 -2 tick 让一步
+            if pos_dir == 2:
+                raw = lower
+                ticks = 2
+                limit = raw + price_tick * ticks
+                direction_note = "平多"
+            else:
+                raw = upper
+                ticks = 2
+                limit = raw - price_tick * ticks
+                direction_note = "平空"
+
+            # 钳位：别算到停板外
+            limit = max(lower, min(upper, limit))
+            # PriceTick 对齐
+            if price_tick > 0:
+                limit = round(round(limit / price_tick) * price_tick, 8)
+
+            note_final = f"[涨跌停超价兜底] {direction_note}限价={limit:.4f} ({note})"
+            return float(limit), note_final
+        except Exception as e:
+            try:
+                return None, f"涨跌停超价兜底异常: {e}"
+            except Exception:
+                return None, None
 
     # ------------------------------------------------------------------
     # 持仓实际聚合历史快照（环形缓存）：F 总闸脏空兜底 + 真清仓放行

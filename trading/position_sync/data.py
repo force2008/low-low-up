@@ -670,12 +670,18 @@ class PositionSyncManagerData:
         return result
 
     def _get_position_detail(self, contract: str, direction: int) -> dict:
-        """获取指定合约+方向的持仓详情（总持仓、今仓、昨仓、交易所）"""
+        """获取指定合约+方向的持仓详情（总持仓、今仓、昨仓、交易所、结算价、开仓均价等）"""
         pos_total = 0
         today_total = 0
         yd_total = 0
         exchange_id = ""
         contract_upper = contract.upper()
+        _sp_sum = 0.0
+        _psp_sum = 0.0
+        _op_sum = 0.0
+        _sp_cnt = 0
+        _psp_cnt = 0
+        _op_cnt = 0
         for pos in self._actual_positions:
             if pos["InstrumentID"].upper() == contract_upper and pos["PosiDirection"] == direction:
                 pos_total += pos["Position"]
@@ -683,11 +689,33 @@ class PositionSyncManagerData:
                 yd_total += pos["YdPosition"]
                 if not exchange_id:
                     exchange_id = pos.get("ExchangeID", "")
+                import math as _m_detail
+                def _pcheck(v):
+                    try:
+                        fv = float(v)
+                        return fv if (_m_detail.isfinite(fv) and 0 < fv < 1e9) else 0.0
+                    except Exception:
+                        return 0.0
+                _sp_i = _pcheck(pos.get("SettlementPrice", 0))
+                _psp_i = _pcheck(pos.get("PreSettlementPrice", 0))
+                _op_i = _pcheck(pos.get("OpenPrice", 0))
+                if _sp_i > 0:
+                    _sp_sum += _sp_i
+                    _sp_cnt += 1
+                if _psp_i > 0:
+                    _psp_sum += _psp_i
+                    _psp_cnt += 1
+                if _op_i > 0:
+                    _op_sum += _op_i
+                    _op_cnt += 1
         return {
             "Position": pos_total,
             "TodayPosition": today_total,
             "YdPosition": yd_total,
             "ExchangeID": exchange_id,
+            "SettlementPrice": _sp_sum / _sp_cnt if _sp_cnt > 0 else 0.0,
+            "PreSettlementPrice": _psp_sum / _psp_cnt if _psp_cnt > 0 else 0.0,
+            "OpenPrice": _op_sum / _op_cnt if _op_cnt > 0 else 0.0,
         }
 
     def _get_actual_position_volume(self, contract: str, direction: int) -> int:

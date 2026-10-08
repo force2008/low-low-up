@@ -156,59 +156,106 @@ class PositionSyncManagerMarket:
             # 跑过就清一下「正在跑」标记，但保留「15 分钟内不重跑」逻辑（用 now - ts < 900 自然过期，避免 pop 导致马上又重起）
             pass
 
-    def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2, prefer_cached: bool = True) -> Optional[dict]:
+    def query_market_data(self, instrument_id: str, timeout: int = 5, max_retries: int = 2, prefer_cached: bool = True, force_td_fallback: bool = False) -> Optional[dict]:
         """获取合约行情快照，统一通过行情 API（MdApi）订阅获取。
 
-        如果 MdApi 提供者未启动，才回退到交易 API 查询（保持兼容性）。
+        获取优先级：
+        1) MdApi 缓存（prefer_cached=True）→ 实时 tick
+        2) 若 force_td_fallback=True 或 md_provider 失败 → TD ReqQryDepthMarketData 查询
+           （走独立柜台路由，MdApi 断流时经常还活着，尤其适合拿涨跌停价兜底平仓定价）
 
         Args:
             instrument_id: 合约代码
             timeout: 等待 tick 秒数（仅在缓存空时生效）
             max_retries: 交易 API 回退时的重试次数
-            prefer_cached: True=如果已有历史缓存直接返回，不等最新 tick（次主力稀疏场景默认 True）
+            prefer_cached: True=如果已有历史缓存直接返回，不等最新 tick
+            force_td_fallback: True=即使 MdApi 存在也强制走 TD 查询（平仓拿涨跌停兜底用）
         """
         exact_id = self._standardize_contract(instrument_id)
 
-        # 优先使用行情 API 订阅提供者（统一 simu/online 机制）
         md_provider = getattr(self, "_md_provider", None)
-        if md_provider:
+        md = None
+        if md_provider and not force_td_fallback:
             md = md_provider.get_quote(exact_id, timeout=timeout, prefer_cached=prefer_cached)
             if md:
                 return md
-            # 融航/多数柜台只开放 MdApi 订阅，不开放 TD ReqQryDepthMarketData，
-            # 次主力合约（如 SM701）tick 稀疏 3s 内没首 tick 是常态。
-            # 这里不直接用 TD API 回退（无回调入口会永久超时挂住 _md_pending），
-            # 而是返回 None 让调用方（sync.py 平仓分支）再用 prefer_cached=True 做二次兜底或使用缓存历史值。
-            self.print(f"[警告] {exact_id} 行情API订阅获取失败（次主力tick稀疏，prefer_cached={prefer_cached}仍无缓存）")
+
+        # 即使 md_provider 存在，MdApi 路由也可能断流（本次 ag2612 事件）。
+        # 走 TD 接口 ReqQryDepthMarketData — 独立柜台路由，经常在 Md 断时还活着，
+        # 返回值里包含 UpperLimitPrice/LowerLimitPrice 涨跌停价，可兜底平仓定价。
+        try:
+            td_timeout = int(timeout) if isinstance(timeout, int) else 5
+            last_error = None
+            for attempt in range(max(max_retries + 1, 1)):
+                with self._md_lock:
+                    self._md_request_id += 1
+                    req_id = self._md_request_id
+                    pending = {"event": threading.Event(), "data": None}
+                    self._md_pending[req_id] = pending
+
+                req = tdapi.CThostFtdcQryDepthMarketDataField()
+                req.InstrumentID = exact_id
+                self._api.ReqQryDepthMarketData(req, req_id)
+                ok = pending["event"].wait(timeout=td_timeout)
+
+                with self._md_lock:
+                    data = pending.get("data")
+                    self._md_pending.pop(req_id, None)
+
+                if ok and data:
+                    # 拿到 TD 查询行情后立刻回填 md_provider 缓存和永久已知价，
+                    # 后续调用 prefer_cached=True 直接命中，不再每轮都走 TD 查询
+                    _upper = str(data.get("UpperLimitPrice") or 0) or ""
+                    _lower = str(data.get("LowerLimitPrice") or 0) or ""
+                    _tag_mark = "涨跌停价可用" if (_upper and _lower and float(_upper) > 0 and float(_lower) > 0) else ""
+                    self.print(
+                        f"[行情] {exact_id} TD 接口查询成功（MdApi 路由不可用或 force_td_fallback=True）{_tag_mark}"
+                    )
+                    try:
+                        if md_provider is not None:
+                            _k = str(data.get("InstrumentID") or exact_id).strip().upper()
+                            with md_provider._quotes_lock:
+                                md_provider._quotes[_k] = dict(data)
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self, "_update_last_known_prices"):
+                            def _fv(x):
+                                try:
+                                    v = float(x)
+                                    return v if 0 < v < 1e9 and __import__("math").isfinite(v) else 0.0
+                                except Exception:
+                                    return 0.0
+                            self._update_last_known_prices(
+                                exact_id,
+                                last_price=_fv(data.get("LastPrice")),
+                                bid_price1=_fv(data.get("BidPrice1")),
+                                ask_price1=_fv(data.get("AskPrice1")),
+                            )
+                    except Exception:
+                        pass
+                    return data
+
+                last_error = f"TD 查询超时 (attempt {attempt + 1}/{max_retries + 1})"
+                if attempt < max_retries:
+                    time.sleep(0.5)
+            self.print(f"[警告] {exact_id} TD 行情查询连续失败: {last_error}")
+        except Exception as e:
+            self.print(f"[警告] {exact_id} TD 行情查询异常: {e}")
             return None
 
-        # 兼容无行情前置的环境：回退到交易 API 查询（仅在 md_provider 不存在时走此路径）
-        self.print(f"[警告] 无行情API提供者，回退到交易API查询 {exact_id}")
-        last_error = None
-        for attempt in range(max_retries + 1):
-            with self._md_lock:
-                self._md_request_id += 1
-                req_id = self._md_request_id
-                pending = {"event": threading.Event(), "data": None}
-                self._md_pending[req_id] = pending
-
-            req = tdapi.CThostFtdcQryDepthMarketDataField()
-            req.InstrumentID = exact_id
-            self._api.ReqQryDepthMarketData(req, req_id)
-            ok = pending["event"].wait(timeout=timeout)
-
-            with self._md_lock:
-                data = pending.get("data")
-                self._md_pending.pop(req_id, None)
-
-            if ok and data:
-                return data
-
-            last_error = f"行情查询超时 (attempt {attempt + 1}/{max_retries + 1})"
-            if attempt < max_retries:
-                time.sleep(0.5)
-
-        self.print(f"[警告] {exact_id} 交易API行情查询连续失败: {last_error}")
+        if md_provider and not force_td_fallback:
+            # 判断是否主力：写日志时带上身份标签，避免把「主力断流」误判成「次主力稀疏」
+            _is_main = False
+            try:
+                _upper = exact_id.strip().upper()
+                _info = getattr(self, "_contract_info", None) or {}
+                if isinstance(_info, dict) and _upper in _info:
+                    _is_main = True
+            except Exception:
+                _is_main = False
+            _tag = "主力合约MdApi断流" if _is_main else "次主力tick稀疏"
+            self.print(f"[警告] {exact_id} {_tag}，MdApi+TD查询均未返回（prefer_cached={prefer_cached}）")
         return None
 
     def query_market_data_batch(self, instrument_ids: List[str], timeout: int = 5) -> Dict[str, dict]:
