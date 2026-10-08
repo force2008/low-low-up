@@ -33,11 +33,11 @@ LOGIN_WINDOW_TITLE_KEYWORD = "风控"          # 例：综合交易平台风控�
 # 四个点击位置坐标（直接从 record_coordinates.py / export/coordinates.txt 复制）
 PASSWORD_INPUT_COORDS = (739, 470)        # 密码输入框中心
 CONFIRM_BUTTON_COORDS   = (807, 586)      # 确定按钮中心
-CLOSE_BUTTON_COORDS     = (0, 0)            # 登录窗口右上角「×」关闭按钮（自行录入坐标；0,0 表示未配置，会走 .close()/taskkill 降级）
+CLOSE_BUTTON_COORDS     = (870, 381)            # 登录窗口右上角「×」关闭按钮（自行录入坐标；0,0 表示未配置，会走 .close()/taskkill 降级）
 DESKTOP_ICON_COORDS     = (13, 351)       # 备用：桌面图标坐标（路径启动失败时用）
 
 # 密码
-PASSWORD = "yqj123456"
+PASSWORD = "yqj1234567"
 
 # ============================================================
 # 时间配置（云主机较慢，等待时间给得稍长，稳定第一）
