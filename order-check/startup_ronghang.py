@@ -25,15 +25,15 @@ pyautogui.PAUSE = 0.05       # 每个 pyautogui 动作之间的默认等待
 # ============================================================
 # 配置区域（坐标直接填 record_coordinates.py 录出来的值即可，云主机无需 DPI 换算）
 # ============================================================
-PROGRAM_EXE_PATH = r"E:\Program Files\融航资管交易平台风控端\RohonServerRiskControl.exe"
+PROGRAM_EXE_PATH = r"C:\Program Files\融航资管交易平台风控端\RohonServerRiskControl.exe"
 
 # 登录窗口标题关键字（pygetwindow 会用 contains 匹配）
 LOGIN_WINDOW_TITLE_KEYWORD = "风控"          # 例：综合交易平台风控终端 / 融航资管...
 
 # 三个点击位置坐标（直接从 record_coordinates.py / export/coordinates.txt 复制）
-PASSWORD_INPUT_COORDS = (1832, 1948)        # 密码输入框中心
-CONFIRM_BUTTON_COORDS   = (1256, 1602)      # 确定按钮中心
-DESKTOP_ICON_COORDS     = (2653, 688)       # 备用：桌面图标坐标（路径启动失败时用）
+PASSWORD_INPUT_COORDS = (673, 457)        # 密码输入框中心
+CONFIRM_BUTTON_COORDS   = (745, 581)      # 确定按钮中心
+DESKTOP_ICON_COORDS     = (1169, 19)       # 备用：桌面图标坐标（路径启动失败时用）
 
 # 密码
 PASSWORD = "283200"
