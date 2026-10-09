@@ -4,13 +4,19 @@
 一键流水线：自动导出 -> 多账户持仓同步
 
 使用方式:
-    python run_pipeline.py [online|simu|7x24] [--skip-time-check] [--force] [--ratio RATIO]
+    python run_pipeline.py [online|simu|7x24]
+        [--skip-time-check] [--force] [--ratio RATIO]
+        [--first-sync-delay SEC] [--max-login-wait SEC]
 
 说明:
     - 默认只在配置的交易时段内执行导出与同步
     - --skip-time-check: 开发/测试时显式跳过交易时段检查，允许非交易时段运行
     - --force: 非交易日也强制运行
     - --ratio: 持仓同步比例，默认 1.0
+    - --first-sync-delay: 启动后多少秒再做首轮同步（默认 5s），
+        9:00 准点启动推荐 2；8:55 提前启动推荐 60
+    - --max-login-wait: first_sync_delay 到了后，CTP md/td 登录回调还没回来，
+        最多再补等多少秒（默认 20s，超时直接进后续 query_positions retry）
     - 多账户同步：在 order-check/account_targets.py 中配置源账户到目标CTP账户的映射
 """
 
@@ -117,6 +123,46 @@ if "--ratio" in sys.argv:
             print("[警告] --ratio 参数值无效，使用默认值 1.0")
     else:
         print("[警告] --ratio 参数缺少值，使用默认值 1.0")
+
+# 解析首轮同步延迟参数（用户："9:00启动但首次对比要1分30秒后才进行，想往前推"）
+#   用法：python run_pipeline.py online --first-sync-delay 2 --max-login-wait 10
+#   推荐：
+#     · 9:00 准点启动：--first-sync-delay 2  --max-login-wait 8
+#     · 8:55 提前启动：--first-sync-delay 60 --max-login-wait 20
+_FIRST_SYNC_DELAY_SEC = 5   # 默认 5 秒（保守值，保证 CTP 登录完成）
+if "--first-sync-delay" in sys.argv:
+    _idx = sys.argv.index("--first-sync-delay")
+    if _idx + 1 < len(sys.argv):
+        try:
+            _v = int(sys.argv[_idx + 1])
+            if 0 <= _v <= 600:
+                _FIRST_SYNC_DELAY_SEC = _v
+            else:
+                print(f"[警告] --first-sync-delay={_v} 超出范围 0~600，使用默认值 5")
+            sys.argv.pop(_idx)
+            sys.argv.pop(_idx)
+        except (ValueError, TypeError):
+            print("[警告] --first-sync-delay 参数值不是整数，使用默认值 5")
+    else:
+        print("[警告] --first-sync-delay 参数缺少值，使用默认值 5")
+
+# CTP 登录就绪最多补等秒数（first_sync_delay 到了但 md._login_ok=False 时再多等 N 秒）
+_MAX_LOGIN_WAIT_SEC = 20
+if "--max-login-wait" in sys.argv:
+    _idx = sys.argv.index("--max-login-wait")
+    if _idx + 1 < len(sys.argv):
+        try:
+            _v = int(sys.argv[_idx + 1])
+            if 0 <= _v <= 120:
+                _MAX_LOGIN_WAIT_SEC = _v
+            else:
+                print(f"[警告] --max-login-wait={_v} 超出范围 0~120，使用默认值 20")
+            sys.argv.pop(_idx)
+            sys.argv.pop(_idx)
+        except (ValueError, TypeError):
+            print("[警告] --max-login-wait 参数值不是整数，使用默认值 20")
+    else:
+        print("[警告] --max-login-wait 参数缺少值，使用默认值 20")
 
 
 def _is_trading_day() -> bool:
@@ -1587,6 +1633,8 @@ def main():
     logger.info("  - 关键时间: %s 强制对齐", KEY_ALIGN_TIMES)
     logger.info("  - 当前CTP环境: %s", _CTP_ENV_NAME)
     logger.info("  - 持仓同步比例: %s", POSITION_RATIO)
+    logger.info("  - 首轮同步前延迟: %ds（--first-sync-delay 可调整）", _FIRST_SYNC_DELAY_SEC)
+    logger.info("  - 登录未完成最多补等: %ds（--max-login-wait 可调整）", _MAX_LOGIN_WAIT_SEC)
     if SKIP_TRADING_TIME_CHECK:
         logger.info("  - 跳过交易时段检查")
     logger.info("交易时间段: %s", TRADING_SESSIONS)
@@ -1725,6 +1773,9 @@ def main():
                 # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude, ...)
                 runtime_config_resolver=_resolve_latest_target_config,
                 skip_trading_time_check=_skip_time_loop,
+                # ---- 首轮同步延迟（用户："9:00启动但首次对比要1分30秒后才进行，想往前推"）----
+                first_sync_delay_seconds=_FIRST_SYNC_DELAY_SEC,
+                max_login_wait_seconds=_MAX_LOGIN_WAIT_SEC,
             )
         except Exception as e:
             logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)
@@ -1909,7 +1960,88 @@ def main():
                                             pass
                             except Exception as _ge:
                                 logger.warning("[动态线程] 新源账号预生成 hold-std 跳过: %s", _ge)
-                            _start_new_thread_if_absent(_src, _tgt)
+                            # 新线程启动时，仍复用全局 first_sync_delay / max_login_wait（不需要再单独算），
+                            # 保证"热新增的账号"和"启动快照的账号"首轮同步节奏一致。
+                            try:
+                                from trading.position_sync.position_sync_manager import run_position_sync_loop
+                                _run_old_ref = _run_single_target_sync
+
+                                def _run_single_new_sync(_src_arg, _tgt_arg):
+                                    _uid_new = (_tgt_arg or {}).get("user_id") or "default"
+                                    try:
+                                        if _uid_new and (_uid_new != "default"):
+                                            _env_label_new = f"{(_tgt_arg or {}).get('env_name', _CTP_ENV_NAME)}_{_uid_new}"
+                                            _conf_new = build_target_conf(_tgt_arg)
+                                            _ratio_new = _get_target_ratio(_tgt_arg)
+                                            _exclude_new = _get_target_exclude(_tgt_arg)
+                                            _allow_new = _get_target_allow_contract_level(_tgt_arg)
+                                            _deny_new = _get_target_deny_products(_tgt_arg)
+                                            _min_q_new = _get_target_min_qty_hand(_tgt_arg)
+                                            _min_n_new = _get_target_min_notional(_tgt_arg)
+                                            _r_en_new, _r_ms_new = _get_random_delay_config(_tgt_arg)
+                                            _p_en_new, _p_s_new = _get_target_passive_config(_tgt_arg)
+                                            _h_new = os.path.join(_CURR_DIR, f"hold-std-{_src_arg or ''}.json")
+                                            _skip_new = (
+                                                bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN)
+                                                or (str(_env_label_new).lower() in ("simu", "7x24"))
+                                            )
+                                            run_position_sync_loop(
+                                                hold_std_path=_h_new,
+                                                main_contracts_path=MAIN_CONTRACTS_PATH,
+                                                trade_volume=1,
+                                                conf=_conf_new,
+                                                env_name=_env_label_new,
+                                                logger=logger,
+                                                stop_event=shutdown_event,
+                                                position_ratio=_ratio_new,
+                                                exclude_products=_exclude_new,
+                                                allow_contract_level=_allow_new,
+                                                deny_products=_deny_new,
+                                                big_notional_exemption=BIG_NOTIONAL_EXEMPTION,
+                                                min_qty_hand=_min_q_new,
+                                                min_notional=_min_n_new,
+                                                random_delay_enabled=_r_en_new,
+                                                random_delay_max_ms=_r_ms_new,
+                                                passive_mode=_p_en_new,
+                                                passive_wait_seconds=_p_s_new,
+                                                main_by_product_path=os.path.join(
+                                                    PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
+                                                ),
+                                                source_account=_src_arg,
+                                                target_user_id=_uid_new,
+                                                runtime_config_resolver=_resolve_latest_target_config,
+                                                skip_trading_time_check=_skip_new,
+                                                first_sync_delay_seconds=_FIRST_SYNC_DELAY_SEC,
+                                                max_login_wait_seconds=_MAX_LOGIN_WAIT_SEC,
+                                            )
+                                        else:
+                                            # fallback 旧单账户模式（一般不走，除非配置空）
+                                            _run_old_ref(_src_arg, _tgt_arg)
+                                    except Exception as _e_new:
+                                        logger.error("[同步][%s -> %s] 异常: %s", _src_arg, _uid_new, _e_new)
+                                        import traceback
+                                        logger.error(traceback.format_exc())
+
+                                _uid_arg = (_tgt or {}).get("user_id") or "default"
+                                _t_name = f"SyncThread-{_k[0] or 'src'}-{_k[1] or 'uid'}"
+                                _thr = threading.Thread(
+                                    target=_run_single_new_sync,
+                                    args=(_src, _tgt),
+                                    daemon=True,
+                                    name=_t_name,
+                                )
+                                _sync_task_registry[_k] = (_thr, shutdown_event, _src, _tgt)
+                                _thr.start()
+                                logger.info(
+                                    "[动态线程] 新增同步任务: %s -> %s (已启动，first_sync_delay=%ds, thread_name=%s)",
+                                    _src, _uid_arg, _FIRST_SYNC_DELAY_SEC, _t_name,
+                                )
+                                continue
+                            except Exception as _e_new:
+                                logger.error("[动态线程] 启动新同步线程失败: %s -> %s err=%s", _src, _uid_arg, _e_new)
+                                # 失败了回退到 _start_new_thread_if_absent（不会带 first_sync_delay 参数，但至少能启起来）
+                                _start_new_thread_if_absent(_src, _tgt)
+                                continue
 
                     # 2) 注册表中存在但新 cfg 已经没有的 key -> 移除 + 打日志
                     _to_remove_keys = [k for k in _sync_task_registry.keys() if k not in _new_keys]

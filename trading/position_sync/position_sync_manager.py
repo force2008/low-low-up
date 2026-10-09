@@ -170,6 +170,13 @@ def run_position_sync_loop(
     passive_wait_seconds: int = 300,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
+    # 【启动时首轮同步延迟】进程起来后，等多少秒再做首次 sync_and_trade（防止CTP登录还没完成就查仓超时）
+    #   - 推荐 9:00 启动 + 2~5s；8:55 启动 + 30~60s；
+    #   - 默认 5 秒（保守兜底，登录一般 3s 内完成）
+    first_sync_delay_seconds: int = 5,
+    # 【CTP 登录就绪等待最长时间】first_sync_delay 到了之后，如果 md/td 登录回调还没回来，
+    #   最多再等 max_login_wait_seconds 秒，超时就不卡了直接进入首轮同步（查仓失败会走正常 retry 链路）
+    max_login_wait_seconds: int = 20,
 ) -> bool:
     """持续运行持仓同步循环（保持 CTP 连接，持续接收成交回报）
 
@@ -243,6 +250,24 @@ def run_position_sync_loop(
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
         _log(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式=True，非开盘时间仍允许对齐和提交委托）")
+        try:
+            _first_d_s = int(first_sync_delay_seconds or 0)
+        except Exception:
+            _first_d_s = 5
+        if _first_d_s < 0:
+            _first_d_s = 0
+        if _first_d_s > 600:
+            _first_d_s = 600  # 最多等 10 分钟，防止填错参数卡死
+        try:
+            _max_login_s = int(max_login_wait_seconds or 0)
+        except Exception:
+            _max_login_s = 20
+        if _max_login_s < 0:
+            _max_login_s = 0
+        if _max_login_s > 120:
+            _max_login_s = 120
+        _log(f"  first_sync_delay={_first_d_s}s（首轮同步前的延迟，保证CTP登录完成）")
+        _log(f"  max_login_wait={_max_login_s}s（登录就绪最多再补等多少秒，超时直接进）")
 
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -267,6 +292,46 @@ def run_position_sync_loop(
             mgr.set_logger(logger)
 
         _log(f"[同步] PositionSyncManager 创建成功，开始监控...")
+
+        # ============== 【首轮同步前延迟 + CTP 登录就绪等待】==============
+        # 说明：PositionSyncManager.__init__ 会做 InitConnect → OnFrontConnected → ReqUserLogin，
+        # 这些回调最快 1~2s、慢的融航柜台可能 5~10s 才回来。
+        # 先按 first_sync_delay_seconds 等一等（用户可传 --first-sync-delay=2/5/30）；
+        # 时间到了之后再看 md 登录是否完成（_md_provider._login_ok），没完成就最多再补等 max_login_wait_seconds。
+        # 最后超时还没登录完，也不阻塞，直接进首轮同步（查仓超时会走正常 query_positions 的 retry 链路，最多 attempt=2/3 成功）。
+        if _first_d_s > 0:
+            _log(f"[同步] 首轮同步等待 {_first_d_s}s（CTP Init + 登录回调中）...")
+            for _ in range(max(1, _first_d_s)):
+                if stop_event is not None and stop_event.is_set():
+                    _log("[同步] 首轮等待期间收到停止信号，退出")
+                    return True
+                time.sleep(1)
+        _md_login_ok = False
+        try:
+            _md_prov = getattr(mgr, "_md_provider", None)
+            if _md_prov is not None:
+                _md_login_ok = bool(getattr(_md_prov, "_login_ok", False))
+        except Exception:
+            _md_login_ok = False
+        if (not _md_login_ok) and _max_login_s > 0:
+            _log(f"[同步] first_sync_delay 到了，但 md 登录回调还未返回（_login_ok={_md_login_ok}），最多补等 {_max_login_s}s...")
+            _total_waited = 0
+            while _total_waited < _max_login_s:
+                if stop_event is not None and stop_event.is_set():
+                    _log("[同步] 登录等待期间收到停止信号，退出")
+                    return True
+                time.sleep(1)
+                _total_waited += 1
+                try:
+                    _md_prov = getattr(mgr, "_md_provider", None)
+                    if _md_prov is not None and bool(getattr(_md_prov, "_login_ok", False)):
+                        break
+                except Exception:
+                    pass
+            if _total_waited >= _max_login_s:
+                _log(f"[同步] 登录等待已达 max_login_wait={_max_login_s}s 上限，不再等，直接进首轮同步（后续 query_positions 会自动 retry）")
+            else:
+                _log(f"[同步] CTP md/td 登录回调完成（补等 {_total_waited}s），进入首轮同步")
 
         # 获取初始文件的修改时间
         last_hold_std_mtime = 0

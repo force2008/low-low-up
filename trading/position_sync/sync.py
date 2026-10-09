@@ -895,20 +895,48 @@ class PositionSyncManagerSync:
         self.print("=" * 60)
 
         # 冷却门：
-        #   · hold 文件有变更 → 立即放行（哪怕上次同步才几秒钟前；
-        #   · 否则用同一份 hold 配置在 15 秒内被重复调用 → 保留 15 秒冷却（防CTP昨/今仓刷新延迟导致的重复下单）。
+        #   · hold 文件有变更 → 立即放行（哪怕上次同步才几秒钟前）；
+        #   · 如果上一轮同步对应的 target 是空/0 条（典型场景：进程刚启动 hold 还没生成，
+        #     首轮 sync_and_trade 记了 last_sync 但没干活），本轮 target 非空 → 立即放行；
+        #   · 否则用同一份 hold 配置在 15 秒内被重复调用 → 保留 15 秒冷却（防 CTP 昨/今仓刷新延迟导致的重复下单）。
         current_time = time.time()
         last_sync = getattr(self, '_last_sync_time', 0)
-        SYNC_COOLDOWN = 15  # 同一份配置连续触发时的冷却（秒数；hold有变则完全绕过。
+        SYNC_COOLDOWN = 15  # 同一份配置连续触发时的冷却（秒数；hold有变则完全绕过）
         bypass_reason = ""
         if _hold_changed and _hold_mtime > 0:
-            # 明确 hold 文件有新变更 → 跳过 cooldown，让同步立刻执行。
             cooldown_skip = True
             bypass_reason = f"hold-std changed (hold_mtime=%.3f vs last=%.3f)" % (_hold_mtime, getattr(self, "_last_sync_hold_mtime", 0.0))
         elif last_sync <= 0:
             cooldown_skip = True
         else:
-            cooldown_skip = False
+            # 额外兜底：上一轮 sync 对应的 target 是空（0 合约 / 0 手），本轮 target 非空 → 立刻放行。
+            # 这解决"进程刚启动还没生成 hold-std 时，首轮 sync 已经把 last_sync 记上了，
+            # 导致真正 hold 生成后被 SYNC_COOLDOWN 拦 15 秒"的问题（也是"1分30秒后才真正同步"的主因）。
+            _last_target_n = int(getattr(self, "_last_sync_target_n_contracts", 0) or 0)
+            _last_target_h = int(getattr(self, "_last_sync_target_total_hands", 0) or 0)
+            _last_target_empty = ((_last_target_n <= 0 and _last_target_h <= 0) or
+                                  bool(getattr(self, "_last_sync_target_was_empty", False)))
+            # 快速估计本轮 target 是否非空（后面 _parse_hold_std 会再精确算一次，这里先快估）
+            _cur_target_nonempty_est = False
+            try:
+                if self._load_hold_std():
+                    _t_tmp = self._parse_hold_std()
+                    if _t_tmp:
+                        _n_tmp = int(len(_t_tmp))
+                        _h_tmp = 0
+                        for _vv in _t_tmp.values():
+                            try: _h_tmp += int(_vv or 0)
+                            except Exception: continue
+                        if _n_tmp > 0 and _h_tmp > 0:
+                            _cur_target_nonempty_est = True
+            except Exception:
+                _cur_target_nonempty_est = False
+            if _last_target_empty and _cur_target_nonempty_est:
+                cooldown_skip = True
+                bypass_reason = (f"last_sync target 为空({_last_target_n}合约/{_last_target_h}手)，"
+                                 f"本轮 target 非空(快估) → 跳过 {SYNC_COOLDOWN}s 冷却")
+            else:
+                cooldown_skip = False
         if not cooldown_skip and current_time - last_sync < SYNC_COOLDOWN:
             self.print(f"[跳过] 距离上次同步仅 {current_time - last_sync:.0f} 秒，冷却中（{SYNC_COOLDOWN}秒）")
             return False
@@ -1156,6 +1184,21 @@ class PositionSyncManagerSync:
                         except Exception:
                             continue
                 _is_empty_target = (_cur_n_t <= 0 or _cur_t_total <= 0)
+                # ============== 【本次同步 target 特征落字段（cooldown 短路径用）】==============
+                # 上一轮同步如果是"进程刚启动 hold 还没生成，target=0/0 空"，会把这三个字段写成 0/0/True，
+                # 下一轮 cooldown 判定里就拿这三个判「上一次是空、这一次非空 → 立刻跳过 cooldown」，
+                # 解决"首轮空同步把 last_sync 记上，真正 hold 生成后被 SYNC_COOLDOWN 卡 15s"的 90s 延迟问题。
+                try:
+                    object.__setattr__(self, "_last_sync_target_n_contracts", int(_cur_n_t))
+                    object.__setattr__(self, "_last_sync_target_total_hands", int(_cur_t_total))
+                    object.__setattr__(self, "_last_sync_target_was_empty", bool(_is_empty_target))
+                except Exception:
+                    try:
+                        self._last_sync_target_n_contracts = int(_cur_n_t)
+                        self._last_sync_target_total_hands = int(_cur_t_total)
+                        self._last_sync_target_was_empty = bool(_is_empty_target)
+                    except Exception:
+                        pass
                 _tbuf = getattr(self, '_target_ring_signatures', None) or []
                 try:
                     _hmt = float(_hold_mtime or 0)
