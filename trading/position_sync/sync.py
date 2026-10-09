@@ -1057,6 +1057,84 @@ class PositionSyncManagerSync:
             target = self._parse_hold_std()
             _raw_ratio = float(getattr(self, '_position_ratio', 1.0))
             self._is_liquidate_mode = abs(_raw_ratio) < 1e-9  # 浮点数 0 兼容 0.0/-0.0/非标准极小值
+
+            # ============== 🛡️ Passive 在途开仓完全匹配 target → 短路径跳过 B1/B2 脏空拦截 ==============
+            # 用户场景：首仓 passive_mode=True 挂限价单（300s 排队等待），CTP actual 还没成交 → actual_agg=0；
+            # 但 kept_orders（步骤2保留的 passive 开仓挂单）已经把需要的合约/手数全挂在在途，
+            # 有效持仓 effective_actual = actual + 在途开仓 = target 完全匹配。
+            # 这种情况如果走 B1/B2 硬闸，会把"正常排队中的 passive 挂单"误判成脏空反复拦截，
+            # 还会不断发飞书"超仓拦截"噪音。
+            # 判定条件（全部满足才短路径 return True）：
+            #   1) kept_orders 非空（都是步骤2保留的 passive 开仓挂单）；
+            #   2) 所有 kept_orders 聚合出来的 pending_map 至少有 1 条开仓在途；
+            #   3) effective_actual（actual + 在途开仓）和 target 逐合约逐手数完全相等；
+            #   4) target 非空（避免空仓误跳）。
+            _passive_shortcut_ok = False
+            try:
+                if kept_orders and target:
+                    _pending_pre = self._build_pending_map(kept_orders) or {}
+                    _n_open_pending = 0
+                    for _pk, _pv in _pending_pre.items():
+                        if isinstance(_pk, tuple) and len(_pk) >= 3 and bool(_pk[2]) and int(_pv or 0) > 0:
+                            _n_open_pending += 1
+                    if _pending_pre and _n_open_pending > 0:
+                        _eff_pre = {}
+                        for _k in set(actual_agg.keys()) | set(target.keys()):
+                            _c, _d = _k
+                            _a = actual_agg.get(_k, 0)
+                            _po = _pending_pre.get(((_c or "").upper(), _d, True), 0)
+                            _eff_pre[_k] = int(_a or 0) + int(_po or 0)
+                        _match_all = True
+                        for _tk, _tv in target.items():
+                            _ev = _eff_pre.get(_tk, 0)
+                            try:
+                                if int(_ev or 0) != int(_tv or 0):
+                                    _match_all = False
+                                    break
+                            except Exception:
+                                _match_all = False
+                                break
+                        if _match_all and len(_eff_pre) == len(target):
+                            _all_in_target = True
+                            for _ek in _eff_pre.keys():
+                                if _ek not in target:
+                                    _all_in_target = False
+                                    break
+                            if _all_in_target:
+                                _passive_shortcut_ok = True
+                                try:
+                                    _t_n = int(len(target))
+                                    _t_h = 0
+                                    for _v in target.values():
+                                        try:
+                                            _t_h += int(_v or 0)
+                                        except Exception:
+                                            continue
+                                    _p_cnt = len(kept_orders)
+                                    _env_sc = str(getattr(self, '_env_name', '') or '').strip() or None
+                                    _uid_sc = str(getattr(self, '_user_id', '') or '').strip() or None
+                                    _bid_sc = str(getattr(self, '_broker_id', '') or '').strip() or None
+                                    _pre_sc = ""
+                                    if _env_sc:
+                                        _pre_sc += f"[{_env_sc}]"
+                                    if _uid_sc:
+                                        _pre_sc += f"[{_uid_sc}]"
+                                    _suf_sc = f" (BrokerID={_bid_sc}, InvestorID={_uid_sc})" if (_bid_sc or _uid_sc) else ""
+                                    _l_sc = (f"[跳过][passive 在途匹配] effective_actual（actual+在途开仓）已完全匹配 target="
+                                             f"{_t_n}合约/{_t_h}手，当前 pending 保留 {_p_cnt} 条 passive 开仓挂单排队等待成交，"
+                                             f"跳过本轮 B1/B2 脏空判定与后续重开/重挂{_suf_sc}")
+                                    if _pre_sc:
+                                        _l_sc = f"{_pre_sc.strip()} {_l_sc}"
+                                    self.print(_l_sc.rstrip())
+                                except Exception:
+                                    pass
+            except Exception:
+                _passive_shortcut_ok = False
+            if _passive_shortcut_ok:
+                # passive 在途匹配，不需要再走脏空闸口/提交，但 actual 还没真实成交，
+                # 因此不写环形缓存、不清首仓标记，等真实成交后下一轮再来清理。
+                return True
+            # ============== Passive 在途匹配短路径结束 ==============
             _sync_mode_tag = (
                 "ratio=0清仓模式" if self._is_liquidate_mode
                 else f"ratio={_raw_ratio:g}对冲模式(方向反转)" if _raw_ratio < 0
