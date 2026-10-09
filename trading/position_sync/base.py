@@ -223,6 +223,14 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 条目结构：(ts, actual_agg_dict, n_contracts, total_hands)，actual_agg 是快照 copy 避免外部突变
         self._actual_positions_history: list = []
 
+        # ---------- target 签名环形缓存（首仓豁免「运行中从 0 开首仓」路径 B 需要）----------
+        # 结构：(ts, hold_mtime, is_empty_target, n_contracts, total_hands)，默认 64 条陈腐 60min。
+        # 初始化时强制塞 1 条「空 target 哨兵条目」（hold_mtime=0，empty=True），
+        # 避免冷启动第一轮 target=非空 时，找不到"之前是空 target"的证据，导致路径 B 永远不命中。
+        self._target_ring_signatures: list = [
+            (time.time(), 0.0, True, 0, 0),
+        ]
+
         # ---------- 次主力稀疏 tick 行情兜底：永久已知价缓存（磁盘持久化，跨时段/跨日/跨重启保留）----------
         # 次主力合约（SM701、xx701 等）可能 30 分钟以上才有一笔行情，
         # md_provider 3s 超时永远拿不到 tick，导致超仓平仓永久被跳过。
@@ -1654,9 +1662,17 @@ class PositionSyncManagerBase(CTdSpiBase):
     _POSITIONS_HISTORY_STALE_SECONDS = 60 * 60  # 1 小时以上陈腐条目自动丢弃（防止几天前的旧数据误兜）
 
     def _push_actual_positions_history(self, actual_agg_dict: dict) -> bool:
-        """每次 actual_agg 聚合完成后调用，把快照写进环形缓存（CPU 优化：空聚合不遍历）。
+        """每次 actual_agg 聚合完成 && 经过 B1~B3 公共闸口通过之后 再调用。
 
-        写盘策略：纯内存 RLock 保护，不触发任何 I/O；
+        关键约束（2026-10-09 修复：首仓豁免被提前置位导致永远不命中）：
+          - 被 B1/B2/B3 拦截的脏空/空聚合，绝对不允许写进环形缓存，
+            也绝对不允许清掉 _is_first_run=True；
+          - 只有当 B1~B3 全过、actual_agg 可信（哪怕为空=真实空仓）时，
+            才把快照写入环形缓存 + 清首仓标记。
+        否则：冷启动首轮 attempt1 返回 0 条脏空 → 写完 0 条缓存 → 下一轮
+              _is_first_run=False 且 环形缓存 latest=0（非空）→ 路径 A/B 全不命中，
+              导致正常首仓永远被 B1 硬拦（用户 7x24_20424 11:15 场景）。
+
         条目结构 (ts, snapshot_copy, n_contracts, total_hands)；
         容量超出时丢弃最旧条目；1 小时以上陈腐条目 append 时顺便清理。
         """

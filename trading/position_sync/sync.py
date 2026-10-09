@@ -301,17 +301,54 @@ class PositionSyncManagerSync:
         _exempt_reason = ""
         _cold_start_tag = ""
         _debug_parts = []
+        _diag_latest_ring_total = -1
+        _diag_prev_empty = None
         try:
             _attempt = int(getattr(self, '_last_query_positions_attempt', 1) or 1)
             _is_first_run_here = bool(getattr(self, '_is_first_run', True))
             _hold_mtime_here = float(hold_mtime or 0)
             _buf_raw = getattr(self, '_actual_positions_history', None) or []
             _hold_sigs_raw = getattr(self, '_target_ring_signatures', None) or []
+            # ========== Debug 用：把路径 B 的关键判断也提前算好，直接塞进 tag 里，下次不用再猜 ==========
+            _now_ts_dbg = time.time()
+            _cutoff_dbg = _now_ts_dbg - float(getattr(self, '_POSITIONS_HISTORY_STALE_SECONDS', 3600) or 3600)
+            _l_ring = None
+            if _buf_raw:
+                for i in range(len(_buf_raw) - 1, -1, -1):
+                    r = _buf_raw[i]
+                    if isinstance(r, (list, tuple)) and len(r) >= 4:
+                        try:
+                            if float(r[0] or 0) > _cutoff_dbg:
+                                _l_ring = r
+                                break
+                        except Exception:
+                            continue
+            if _l_ring is not None:
+                _diag_latest_ring_total = int(_l_ring[3]) if len(_l_ring) >= 4 else -1
+            else:
+                _diag_latest_ring_total = -2  # -2 = 没有任何有效缓存（= ring_empty）
+            _p_sig = None
+            if _hold_sigs_raw:
+                for i in range(len(_hold_sigs_raw) - 1, -1, -1):
+                    r = _hold_sigs_raw[i]
+                    if isinstance(r, (list, tuple)) and len(r) >= 3:
+                        try:
+                            if float(r[0] or 0) > _cutoff_dbg:
+                                _p_sig = r
+                                break
+                        except Exception:
+                            continue
+            if _p_sig is not None:
+                _diag_prev_empty = bool(_p_sig[2]) if len(_p_sig) >= 3 else None
+            else:
+                _diag_prev_empty = None  # 没有任何签名缓存（= 初始化空哨兵还没写）
             _debug_parts = [
                 f"is_first_run={str(_is_first_run_here):5s}",
                 f"hold_mtime={'N/A' if _hold_mtime_here<=0 else time.strftime('%H:%M:%S', time.localtime(_hold_mtime_here))}",
                 f"ring_buf_len={len(_buf_raw):d}",
+                f"latest_ring_total={_diag_latest_ring_total}",
                 f"sig_buf_len={len(_hold_sigs_raw):d}",
+                f"prev_target_empty={_diag_prev_empty}",
                 f"attempt={_attempt:d}",
                 f"target={n_target_contracts}c/{total_target_hands}h",
                 f"actual_pos_rows={n_pos_rows}",
@@ -323,6 +360,8 @@ class PositionSyncManagerSync:
             _hold_mtime_here = 0.0
             _buf_raw = []
             _hold_sigs_raw = []
+            _diag_latest_ring_total = -3
+            _diag_prev_empty = None
         if not is_liquidate_mode and not b3_hit and (b1_hit or b2_hit) and n_target_contracts > 0 and total_target_hands > 0:
             try:
                 _now_ts = time.time()
@@ -1023,7 +1062,11 @@ class PositionSyncManagerSync:
                 else f"ratio={_raw_ratio:g}对冲模式(方向反转)" if _raw_ratio < 0
                 else f"ratio={_raw_ratio:g}正跟单模式"
             )
-            # ============== 📖 每轮 target 签名落环形缓存（首仓豁免需要「target从空变非空」判定）==============
+            # ============== 📖 target 签名落环形缓存（首仓豁免需要「target从空变非空」判定）==============
+            # 注意：target 签名在 B1~B3 公共闸口 **之前** 就落盘，因为「target 本身是 hold 文件解析出来的，
+            # 跟查仓结果是否脏空没关系」；而 actual 环形缓存（_push_actual_positions_history）
+            # 必须在 B1~B3 公共闸口 **通过之后** 再落盘，避免把 attempt=1 的脏空 0 条提前写进缓存、
+            # 清掉 _is_first_run=True，导致下一轮首仓豁免两条路径都失败（用户 11:15 场景）。
             try:
                 _target_empty_here = target or {}
                 _cur_n_t = int(len(_target_empty_here))
@@ -1049,12 +1092,6 @@ class PositionSyncManagerSync:
                     self._target_ring_signatures = _tbuf
             except Exception:
                 pass
-            # ============== 📖 actual 聚合快照写入环形缓存（F 总闸脏空兜底 + 真清仓放行）==============
-            # 每轮同步都写一次（哪怕 F 总闸不命中也留档），默认保留最近 8 次，1 小时以上陈腐自动丢弃。
-            try:
-                self._push_actual_positions_history(actual_agg)
-            except Exception:
-                pass
             t_5_done = time.time()
             self.print(f"[同步耗时] 步骤5(聚合+解析): {(t_5_done - t_phase)*1000:.0f}ms [{_sync_mode_tag}]"); t_phase = t_5_done
 
@@ -1070,6 +1107,15 @@ class PositionSyncManagerSync:
             ):
                 return False
             # ========== 硬闸结束 ==========
+
+            # ============== 📖 actual 聚合快照写入环形缓存（F 总闸脏空兜底 + 真清仓放行）==============
+            # 关键：必须在 B1~B3 公共闸口通过之后再写，被拦截的脏空 0 条不要写进缓存，
+            # 否则清掉 _is_first_run=True、又填了一条 latest=0 的环形缓存条目 → 首仓豁免路径 A/B 全不命中。
+            # 只有当 actual_agg 可信（要么真实全空、要么真实有仓位）时，才写入缓存并清首仓标记。
+            try:
+                self._push_actual_positions_history(actual_agg)
+            except Exception:
+                pass
 
             # 6. 再次查询在途委托（撤销后的状态）
             ctp_orders = self.query_orders(timeout=qry_order2_timeout, only_pending=True, today_only=True) or []
