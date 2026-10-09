@@ -8,7 +8,7 @@ REM ================================================================
 setlocal
 
 REM 1) 强制切盘 + 切工作目录（计划任务默认在 system32 下，必须 cd /d）
-cd /d D:\projects\low-low-up
+cd /d C:\projects\low-low-up
 
 REM 2) 激活 conda 环境 python310（call 等它完成，不新开子shell）
 call conda activate python310
@@ -27,7 +27,7 @@ REM    online            = 实盘/仿真在线环境（优先接交易时段真�
 REM    --refresh-instruments = 强制重新 ReqQryInstrument，更新新上市/下市合约
 REM    --md-wait 120     = 订阅行情后等120秒收推送（7x24/非活跃时段也能收得比较全）
 REM    --top-n 3         = 输出 main/main2/main3 三级主力
-python utils\GetMainContractWithVolume.py online --refresh-instruments --md-wait 120 --top-n 3
+python utils\GetMainContractWithVolume.py 7x24 --refresh-instruments --md-wait 120 --top-n 3
 set EXITCODE=%errorlevel%
 
 echo.

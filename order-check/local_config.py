@@ -12,23 +12,23 @@ ACCOUNT = "wangk0402"
 APP_TITLE = "用户: yqj1021"
 
 # 菜单坐标
-MENU_POSITION = (22, 36)  # 主菜单按钮
-EXPORT_MENU_POSITION = (64, 60) # "导出全部数据"菜单项
+MENU_POSITION = (39, 40)  # 主菜单按钮
+EXPORT_MENU_POSITION = (49, 58) # "导出全部数据"菜单项
 
 # 浏览文件夹对话框中的文件夹点击序列
 # 按顺序依次点击，换电脑时修改这里即可
 FOLDER_CLICK_SEQUENCE = [
-    ("我的电脑", (573, 599)),
-    ("C盘", (598, 616)),
-    ("ronghang",(604, 618)),
-    ("data",  (625, 638)),
+    ("我的电脑", (484, 432)),
+    ("C盘", (539, 586)),
+    ("ronghang",(540, 606)),
+    ("data",  (559, 625)),
 ]
 
 # 按钮坐标
-SAVE_BUTTON_POSITION = (740, 678) # 保存对话框"确定"
-OK_BUTTON_POSITION =(722, 558)   # 导出完成确认弹框"确定"
+SAVE_BUTTON_POSITION = (686, 683) # 保存对话框"确定"
+OK_BUTTON_POSITION =(647, 546)   # 导出完成确认弹框"确定"
 
 # 其他常量
 EXPORT_DIALOG_TITLE = "导出数据"
 SAVE_DIALOG_TITLE = "浏览文件夹"
-DEFAULT_SAVE_PATH = r"D:\ronghang\data"
+DEFAULT_SAVE_PATH = r"C:\ronghang\data"

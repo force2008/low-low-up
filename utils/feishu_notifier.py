@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 
 # 飞书 webhook 地址
-FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/6afaaa96-9685-4de8-8136-4de3b7eb4b42"
+FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/21560a12-0e6a-428a-944a-3e3aae96b8a3"
 
 
 class FeishuNotifier:
