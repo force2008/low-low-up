@@ -118,6 +118,40 @@ if "--ratio" in sys.argv:
     else:
         print("[警告] --ratio 参数缺少值，使用默认值 1.0")
 
+_FIRST_SYNC_DELAY_SEC = 5
+if "--first-sync-delay" in sys.argv:
+    _idx = sys.argv.index("--first-sync-delay")
+    if _idx + 1 < len(sys.argv):
+        try:
+            _v = int(sys.argv[_idx + 1])
+            if 0 <= _v <= 600:
+                _FIRST_SYNC_DELAY_SEC = _v
+            else:
+                print(f"[警告] --first-sync-delay={_v} 超出范围 0~600，使用默认值 5")
+            sys.argv.pop(_idx)
+            sys.argv.pop(_idx)
+        except (ValueError, TypeError):
+            print("[警告] --first-sync-delay 参数值不是整数，使用默认值 5")
+    else:
+        print("[警告] --first-sync-delay 参数缺少值，使用默认值 5")
+
+_MAX_LOGIN_WAIT_SEC = 20
+if "--max-login-wait" in sys.argv:
+    _idx = sys.argv.index("--max-login-wait")
+    if _idx + 1 < len(sys.argv):
+        try:
+            _v = int(sys.argv[_idx + 1])
+            if 0 <= _v <= 120:
+                _MAX_LOGIN_WAIT_SEC = _v
+            else:
+                print(f"[警告] --max-login-wait={_v} 超出范围 0~120，使用默认值 20")
+            sys.argv.pop(_idx)
+            sys.argv.pop(_idx)
+        except (ValueError, TypeError):
+            print("[警告] --max-login-wait 参数值不是整数，使用默认值 20")
+    else:
+        print("[警告] --max-login-wait 参数缺少值，使用默认值 20")
+
 
 def _is_trading_day() -> bool:
     """检查今天是否为交易日
@@ -1499,6 +1533,8 @@ def main():
     logger.info("  - 关键时间: %s 强制对齐", KEY_ALIGN_TIMES)
     logger.info("  - 当前CTP环境: %s", _CTP_ENV_NAME)
     logger.info("  - 持仓同步比例: %s", POSITION_RATIO)
+    logger.info("  - 首轮同步前延迟: %ds（--first-sync-delay 可调整）", _FIRST_SYNC_DELAY_SEC)
+    logger.info("  - 登录未完成最多补等: %ds（--max-login-wait 可调整）", _MAX_LOGIN_WAIT_SEC)
     if SKIP_TRADING_TIME_CHECK:
         logger.info("  - 跳过交易时段检查")
     logger.info("交易时间段: %s", TRADING_SESSIONS)
@@ -1635,6 +1671,8 @@ def main():
                 # 热加载解析器：每 10 秒 reload account_targets.py，并返回 (ratio, exclude, ...)
                 runtime_config_resolver=_resolve_latest_target_config,
                 skip_trading_time_check=_skip_time_loop,
+                first_sync_delay_seconds=_FIRST_SYNC_DELAY_SEC,
+                max_login_wait_seconds=_MAX_LOGIN_WAIT_SEC,
             )
         except Exception as e:
             logger.error("[同步][%s -> %s] 异常: %s", source_account, user_id, e)
