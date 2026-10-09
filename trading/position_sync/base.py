@@ -2052,18 +2052,32 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.print("[监控] 自动撤单重挂监控线程已停止")
 
     def _replace_monitor_loop(self):
-        """监控循环：每 CHECK_INTERVAL 秒做一次仓位对比，发现差异则同步"""
-        self.print("[监控] 监控线程启动，等待首次检查...")
+        """监控循环：每 CHECK_INTERVAL 秒做一次仓位对比，发现差异则同步。
+
+        【启动时首轮回调优化】用户 9:00 启动后，不希望等 15 秒才开始第一轮巡检，
+        所以改成：先立即跑一轮巡检，等它完成后再进入「wait 15s → 下一轮」的固定节奏。
+        这样 9:00 启动 + 登录 3s 就绪，首轮巡检可以在 9:00:04 就完成差异检测。
+        """
+        self.print("[监控] 监控线程启动，立即执行首轮巡检（不等冷却）")
         CHECK_INTERVAL = 15  # 巡检心跳间隔（秒）；与 SYNC_COOLDOWN=15 配套，减少消息误导
-        # 巡检期间的文案统一使用这个标题前缀，避免再出现"间隔15秒还写30秒"的硬编码误报
         monitor_tag = f"{CHECK_INTERVAL}秒持仓巡检"
+        _first_round_done = False
         while not self._replace_stop_event.is_set():
-            self._replace_stop_event.wait(CHECK_INTERVAL)
+            # ---------- 首轮：不等，立即执行；后续轮次：按 CHECK_INTERVAL 等 ----------
+            if not _first_round_done:
+                _first_round_done = True
+                # 首轮给个很短的等待（0.5s）：保证 mgr 的 __init__ InitConnect/ReqUserLogin 已经发出，
+                # 避免极端情况下 CTP 回调还没回来就立刻查仓 -> 超时
+                if not self._replace_stop_event.is_set():
+                    self._replace_stop_event.wait(timeout=0.5)
+            else:
+                self._replace_stop_event.wait(CHECK_INTERVAL)
+
             if self._replace_stop_event.is_set():
                 self.print("[监控] 收到停止信号，退出循环")
                 break
             try:
-                self.print(f"[监控] 开始下一轮巡检 (间隔 {CHECK_INTERVAL} 秒)")
+                self.print(f"[监控] 开始{'首轮' if not _first_round_done else '下一轮'}巡检 (间隔 {CHECK_INTERVAL} 秒)")
                 # 1. 先检查未成交委托是否需要撤单重挂
                 self._check_and_replace_pending_orders()
 
