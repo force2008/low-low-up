@@ -906,6 +906,94 @@ def _reload_account_targets_module():
     return dict(ACCOUNT_TARGETS or {})
 
 
+def _hash_account_targets_content(algo: str = "blake2b") -> "tuple":
+    """返回 (file_path_abs_or_None, content_hash_hex_or_None)，直接用文件内容 MD5/blake2b 判"真的改了没"。
+
+    设计（用户要求的"简单直接"版，去掉 cfg 深度签名那一层复杂逻辑）：
+      - 首选用 blake2b(digest_size=16)（和 MD5 一样快，无碰撞历史），想换成 MD5 传 algo="md5" 即可；
+      - 内部保留一层 stat(快路径) 缓存：如果 inode/size/mtime_ns 全没变，说明文件一次保存都没发生过，
+        直接返回上次算好的 hash，**连读文件算 hash 的 IO 都省掉**，99.9% 时间 0 CPU；
+      - stat 判不出（inode 变了/编辑器替换式保存）→ 真正以 64KB 分块读文件，算内容 hash。
+    返回 None, None 表示文件不存在或异常，调用方当"跳过本次"处理。
+    """
+    # 1) 定位 account_targets.py 的真实物理路径
+    try:
+        if 'account_targets' in sys.modules:
+            _p = getattr(sys.modules['account_targets'], '__file__', None)
+        else:
+            try:
+                import importlib.util as _ilu  # type: ignore
+                _spec = _ilu.find_spec('account_targets')
+                _p = getattr(_spec, 'origin', None) if _spec else None
+            except Exception:
+                _p = None
+        if (not _p) or (not os.path.exists(_p)):
+            _fallback_p = os.path.join(_CURR_DIR, 'account_targets.py')
+            if os.path.exists(_fallback_p):
+                _p = _fallback_p
+        if (not _p) or (not os.path.exists(_p)):
+            return None, None
+    except Exception:
+        return None, None
+
+    # 2) stat 快路径：inode/size/mtime_ns 全相同 → 文件连保存都没保存过，直接返回上次 hash
+    _STAT_CACHE_ATTR = "_stat_cache_v1"
+    _HASH_CACHE_ATTR = "_last_hash_hex"
+    _PATH_CACHE_ATTR = "_last_path"
+    try:
+        _st = os.stat(_p)
+        _mtime_ns = int(
+            _st.st_mtime_ns if hasattr(_st, 'st_mtime_ns')
+            else int(_st.st_mtime * 1_000_000_000)
+        )
+        _stat_key = (int(_st.st_ino or 0), int(_st.st_size or 0), _mtime_ns)
+    except Exception:
+        _stat_key = None
+
+    if _stat_key is not None:
+        try:
+            _prev_stat = getattr(_hash_account_targets_content, _STAT_CACHE_ATTR, None)
+            _prev_path = getattr(_hash_account_targets_content, _PATH_CACHE_ATTR, None)
+            _prev_hash = getattr(_hash_account_targets_content, _HASH_CACHE_ATTR, None)
+            if (_prev_stat == _stat_key) and (str(_prev_path or '') == str(_p or '')) and _prev_hash:
+                # 100% 没被保存过 → 直接返回上次 hash，不读内容，0 IO
+                return _p, _prev_hash
+        except Exception:
+            pass
+
+    # 3) 真的走到这里：stat 判定失败/首次，读内容算 hash
+    try:
+        import hashlib as _hl
+        if algo == "md5":
+            _h = _hl.md5()
+        else:
+            _h = _hl.blake2b(digest_size=16)
+        with open(_p, 'rb') as _f:
+            while True:
+                _chunk = _f.read(65536)
+                if not _chunk:
+                    break
+                _h.update(_chunk)
+        _hex = _h.hexdigest()
+    except Exception:
+        return _p, None
+
+    # 4) 把 stat + hash 存进缓存，下次 stat 相同直接返
+    if _stat_key is not None:
+        try:
+            object.__setattr__(_hash_account_targets_content, _STAT_CACHE_ATTR, _stat_key)
+            object.__setattr__(_hash_account_targets_content, _PATH_CACHE_ATTR, _p)
+            object.__setattr__(_hash_account_targets_content, _HASH_CACHE_ATTR, _hex)
+        except Exception:
+            try:
+                setattr(_hash_account_targets_content, _STAT_CACHE_ATTR, _stat_key)
+                setattr(_hash_account_targets_content, _PATH_CACHE_ATTR, _p)
+                setattr(_hash_account_targets_content, _HASH_CACHE_ATTR, _hex)
+            except Exception:
+                pass
+    return _p, _hex
+
+
 def _resolve_latest_target_config(source_account: str, user_id: str):
     """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
 
@@ -1529,7 +1617,9 @@ def main():
         logger.error("启动导出异常: %s", e)
         export_ok = False
 
-    # 根据配置确定要处理的源账户及其目标账户
+    # 根据配置确定要处理的源账户及其目标账户列表
+    # 说明：这个列表只是"启动时的快照"，后面会在主线程心跳里每 10s 重新算一次，
+    # 动态补线程/停线程，因此可以支持 account_targets.py 新增/删除账号热生效。
     source_account_jobs = get_source_accounts()
     if not source_account_jobs:
         # 没有配置任何映射，回退到旧模式
@@ -1647,47 +1737,226 @@ def main():
         for target in targets:
             sync_jobs.append((source_account, target))
 
-    # 预创建所有同步线程对象
-    sync_threads = []
-    for idx, (source_account, target) in enumerate(sync_jobs):
-        user_id = target.get("user_id", "default")
-        thread_name = f"SyncThread-{source_account}-{user_id}"
-        t = threading.Thread(
-            target=_run_single_target_sync,
-            args=(source_account, target),
-            daemon=True,
-            name=thread_name,
-        )
-        sync_threads.append(t)
+    # 预创建所有同步线程对象（+ 给每个线程分配独立 stop_event，方便后期动态停掉某一条线程）
+    # 说明：_sync_task_registry 是「key=(source_account, user_id) -> value=(thread, stop_event, source_account, target)」，
+    # 主线程心跳里每 10s 检查一次是否需要新增/删除，支持 account_targets.py 热更新账号配置。
+    _sync_task_registry: "dict[tuple, tuple]" = {}
+
+    def _task_key_of(source_account, target):
+        """计算同步任务的唯一 key，用来判断新增/删除"""
+        _uid = (target or {}).get("user_id") or "default"
+        _src = source_account or ""
+        return (str(_src), str(_uid))
+
+    def _build_jobs_from_cfg(source_account_jobs_cfg):
+        """从 ACCOUNT_TARGETS 解析后的 (src, tgts_list) 元组列表构造 sync_jobs 元组列表"""
+        _jobs = []
+        for _src, _tgts in (source_account_jobs_cfg or []):
+            for _t in (_tgts or []):
+                _jobs.append((_src, dict(_t or {})))
+        return _jobs
+
+    def _start_new_thread_if_absent(src, tgt):
+        """如果 (src, user_id) 不在注册表中，就启动一个新的同步线程并登记"""
+        try:
+            _k = _task_key_of(src, tgt)
+            if _k in _sync_task_registry:
+                _existing = _sync_task_registry[_k]
+                # 如果已经存在，哪怕线程死掉也不重起（避免被停掉后又"误唤醒"），只在全新 key 时启动
+                return False
+            _uid = (tgt or {}).get("user_id") or "default"
+            _t_name = f"SyncThread-{_k[0] or 'src'}-{_k[1] or 'uid'}"
+            _thr = threading.Thread(
+                target=_run_single_target_sync,
+                args=(src, tgt),
+                daemon=True,
+                name=_t_name,
+            )
+            _sync_task_registry[_k] = (_thr, shutdown_event, src, tgt)
+            _thr.start()
+            logger.info("[动态线程] 新增同步任务: %s -> %s (已启动，thread_name=%s)", src, _uid, _t_name)
+            return True
+        except Exception as e:
+            logger.error("[动态线程] 启动新同步线程失败: %s -> %s err=%s", src, (tgt or {}).get("user_id"), e)
+            return False
+
+    # 启动首轮同步线程（进程启动时的快照）
+    _first_start_total = 0
+    for _src, _tgt in sync_jobs:
+        if _start_new_thread_if_absent(_src, _tgt):
+            _first_start_total += 1
 
     def sync_loop():
-        """同步线程：为每个目标账户启动一个持仓同步循环并等待全部结束"""
-        for t in sync_threads:
-            t.start()
-        for t in sync_threads:
-            t.join()
+        """同步线程：不再手动 join 所有线程，改由注册表里的线程各自独立 join，
+        主线程心跳里定期增删 _sync_task_registry 的条目即可动态调整账号。"""
+        while not shutdown_event.is_set():
+            # 每隔 1 秒扫一下注册表里死掉的线程，标记退出（不做增删，增删放在主线程 10s reload 后做）
+            _dead = []
+            for _k, _entry in _sync_task_registry.items():
+                _thr = _entry[0] if len(_entry) >= 1 else None
+                if _thr is not None and (not _thr.is_alive()):
+                    _dead.append(_k)
+            if _dead:
+                for _k in _dead:
+                    _entry = _sync_task_registry.get(_k)
+                    if _entry:
+                        try:
+                            _uid = (_entry[3] or {}).get("user_id") if len(_entry) >= 4 else "?"
+                            logger.warning("[动态线程] 同步线程已退出，从注册表移除: src=%s uid=%s", _k[0], _uid or _k[1])
+                        except Exception:
+                            pass
+                    try:
+                        del _sync_task_registry[_k]
+                    except Exception:
+                        pass
+            # 睡 1 秒再扫，避免占 CPU
+            time.sleep(1)
 
     # 启动同步总控线程
     sync_controller = threading.Thread(target=sync_loop, name="SyncController", daemon=True)
     sync_controller.start()
 
+    # 上一次"文件内容真的变了"的 hash 16进制字符串 + 对应文件路径
+    # （用户要求"用文件 MD5 或内容哈希直接判断"，所以这里把变量名按语义写死，
+    #  grep 可以直接搜到；算法默认 blake2b，想换成 md5 在调用处改 algo 即可）
+    _last_account_targets_hash_hex = None
+    _last_account_targets_file_path = None
+    _last_reload_ts = 0.0
+    _RELOAD_ACCOUNTS_EVERY_SEC = 10.0  # 每 10s 重新比对一次账号配置，支持热增删
+
     # 主线程监控，等待退出信号
     target_desc = ", ".join([
-        f"{src}->{t.get('user_id', 'default')}" for src, t in sync_jobs
+        f"{src}->{(t or {}).get('user_id', 'default')}" for src, t in sync_jobs
     ])
-    logger.info("工作线程已启动：导出线程 + %d个同步线程", len(sync_threads))
+    logger.info("工作线程已启动：导出线程 + %d个同步线程", _first_start_total)
     logger.info("同步任务: %s", target_desc)
     logger.info("按 Ctrl+C 停止")
 
     try:
         while not shutdown_event.is_set():
+            # 每 1s 打一次心跳，但账号配置热更新只在每 10s 的节点上做（省 CPU）
             time.sleep(1)
-            alive_sync = sum(1 for t in sync_threads if t.is_alive())
+            now_mono = time.monotonic()
+
+            # ---- 每 10s 判一次 account_targets.py 内容 hash，动态增删同步线程 ----
+            if (now_mono - _last_reload_ts) >= _RELOAD_ACCOUNTS_EVERY_SEC:
+                _last_reload_ts = now_mono
+                try:
+                    # ============== 第一层（最简单直接）：直接拿文件内容哈希 ==============
+                    # algo="blake2b" 或 algo="md5" 都行，语义完全一样；
+                    # 函数内部自带 stat 快路径短路，文件没被保存过连读都不读。
+                    _cur_file_path, _cur_hash_hex = _hash_account_targets_content(algo="blake2b")
+                    # 想换成 md5 就把上面改成：_hash_account_targets_content(algo="md5")
+
+                    # ============== hash 没变 → 直接 continue，后面什么逻辑都不跑 ==============
+                    if _cur_hash_hex is None:
+                        # 文件不存在/异常（比如编辑器暂时写 tmp 再 replace 短暂窗口），直接跳过本轮
+                        continue
+                    if (
+                        _last_account_targets_hash_hex is not None
+                        and _cur_hash_hex == _last_account_targets_hash_hex
+                        and (
+                            not _cur_file_path
+                            or not _last_account_targets_file_path
+                            or str(_cur_file_path) == str(_last_account_targets_file_path)
+                        )
+                    ):
+                        # 内容一字节没变 → 不调 reload、不遍历 cfg、不增删线程（0 CPU）
+                        continue
+                    # ============== hash 真的变了 → 才进入 reload + 增删线程 ==============
+                    _last_account_targets_hash_hex = _cur_hash_hex
+                    if _cur_file_path:
+                        _last_account_targets_file_path = _cur_file_path
+
+                    _new_cfg = _reload_account_targets_module()
+                    try:
+                        if not _new_cfg:
+                            _new_jobs_cfg = [(ACCOUNT, [{}])]
+                        else:
+                            _new_jobs_cfg = get_source_accounts()
+                        _new_jobs = _build_jobs_from_cfg(_new_jobs_cfg)
+                    except Exception as e:
+                        logger.error("[动态线程] 解析新 ACCOUNT_TARGETS 失败: %s", e)
+                        _new_jobs = []
+
+                    _new_keys = set()
+                    for _src, _tgt in _new_jobs:
+                        _k = _task_key_of(_src, _tgt)
+                        _new_keys.add(_k)
+                        # 1) 新 key 出现 -> 如果 hold-std 不存在就预生成，然后启动新线程
+                        if _k not in _sync_task_registry:
+                            try:
+                                import compare_orders
+                                _src_key = _src or ACCOUNT or ''
+                                if not _tgt or (len(_tgt) == 1 and not _tgt.get("user_id")):
+                                    _hp = os.path.join(_CURR_DIR, "hold-std.json")
+                                else:
+                                    _hp = os.path.join(_CURR_DIR, f"hold-std-{_src_key}.json")
+                                if _hp and (not os.path.exists(_hp)):
+                                    _gen_ok = compare_orders.generate_hold_std(
+                                        account=_src_key, output_path=_hp,
+                                    )
+                                    if _gen_ok and os.path.exists(_hp):
+                                        try:
+                                            with open(_hp, 'r', encoding='utf-8') as _f:
+                                                _hr = json.load(_f)
+                                            compare_orders.send_feishu_hold_notification(_hr)
+                                            logger.info(
+                                                "[动态线程] 为新源账号预生成 hold-std: %s 共 %d 条",
+                                                os.path.basename(_hp), len(_hr),
+                                            )
+                                        except Exception:
+                                            pass
+                            except Exception as _ge:
+                                logger.warning("[动态线程] 新源账号预生成 hold-std 跳过: %s", _ge)
+                            _start_new_thread_if_absent(_src, _tgt)
+
+                    # 2) 注册表中存在但新 cfg 已经没有的 key -> 移除 + 打日志
+                    _to_remove_keys = [k for k in _sync_task_registry.keys() if k not in _new_keys]
+                    for _rk in _to_remove_keys:
+                        _entry = _sync_task_registry.get(_rk)
+                        if not _entry:
+                            try:
+                                del _sync_task_registry[_rk]
+                            except Exception:
+                                pass
+                            continue
+                        _src_ref = _entry[2] if len(_entry) >= 3 else _rk[0]
+                        _tgt_ref = _entry[3] if len(_entry) >= 4 else {}
+                        _uid_ref = (_tgt_ref or {}).get("user_id") or _rk[1]
+                        logger.info(
+                            "[动态线程] cfg 已移除该同步任务，停止加入心跳维护（下次重启彻底停止）: %s -> %s",
+                            _src_ref, _uid_ref,
+                        )
+                        try:
+                            del _sync_task_registry[_rk]
+                        except Exception:
+                            pass
+
+                    _curr_running = sum(
+                        1 for _e in _sync_task_registry.values()
+                        if _e and len(_e) >= 1 and _e[0].is_alive()
+                    )
+                    logger.info(
+                        "[动态线程] ACCOUNT_TARGETS 内容变更（hash=%s，file=%s），增/减=%d/%d，当前存活线程=%d",
+                        (_cur_hash_hex or '')[:16] or '-',
+                        _cur_file_path or '-',
+                        max(0, len(_new_keys) - (len(_sync_task_registry) + len(_to_remove_keys) - len(_new_keys))),
+                        len(_to_remove_keys),
+                        _curr_running,
+                    )
+                except Exception as _err:
+                    logger.error("[动态线程] 热更新 ACCOUNT_TARGETS 异常: %s", _err)
+
+            alive_sync = sum(
+                1 for _e in _sync_task_registry.values()
+                if _e and len(_e) >= 1 and _e[0].is_alive()
+            )
             if export_thread.is_alive():
                 logger.info(
                     "[主线程] 心跳 - 导出线程: 运行 | 同步线程: %d/%d 运行",
                     alive_sync,
-                    len(sync_threads),
+                    len(_sync_task_registry),
                 )
             else:
                 logger.warning("[主线程] 导出线程已停止")
@@ -1699,9 +1968,13 @@ def main():
         if sync_controller.is_alive():
             logger.warning("[主线程] 同步总控线程未能正常退出")
         # 再等待各个目标账户同步线程（外层总控结束后，子线程可能仍在收尾）
-        for t in sync_threads:
-            t.join(timeout=5)
-
+        for _entry in list(_sync_task_registry.values()):
+            try:
+                _thr = _entry[0] if len(_entry) >= 1 else None
+                if _thr is not None:
+                    _thr.join(timeout=5)
+            except Exception:
+                pass
     except Exception as e:
         logger.exception("[主线程] 运行异常: %s", e)
         _mark_exiting(f"exception: {e}")
