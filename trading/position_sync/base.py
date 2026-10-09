@@ -2092,6 +2092,14 @@ class PositionSyncManagerBase(CTdSpiBase):
 
             # 查询 CTP 实际持仓
             positions = self.query_positions(timeout=15)
+            # 巡检入口拿 hold-std mtime（透传给 _do_sync → _guard_post_query_positions 首仓豁免判定用）
+            _monitor_hold_mtime = 0.0
+            try:
+                _hs_path = getattr(self, "hold_std_path", None)
+                if _hs_path and os.path.exists(str(_hs_path)):
+                    _monitor_hold_mtime = float(os.path.getmtime(str(_hs_path)))
+            except Exception:
+                _monitor_hold_mtime = 0.0
 
             if positions is None:
                 # 15 秒巡检：查超时就用历史 15 分钟内快照继续对比，避免「锁被占用 5 秒 + 查询超时 → 连续丢多轮巡检，差异隐瞒不报」
@@ -2116,6 +2124,28 @@ class PositionSyncManagerBase(CTdSpiBase):
             # 聚合持仓
             actual_agg = self._aggregate_actual_positions()
             target = self._parse_hold_std()
+            # 巡检入口同步落 target 签名环形缓存（首仓豁免路径B需要「历史上 previous target 是否为空」）
+            try:
+                _t_agg = target or {}
+                _cur_n_t = int(len(_t_agg))
+                _cur_t_total = 0
+                if _cur_n_t > 0:
+                    for _vv in _t_agg.values():
+                        try:
+                            _cur_t_total += int(_vv or 0)
+                        except Exception:
+                            continue
+                _t_is_empty = (_cur_n_t <= 0 or _cur_t_total <= 0)
+                _tsig_buf = getattr(self, '_target_ring_signatures', None) or []
+                _tsig_buf.append((time.time(), float(_monitor_hold_mtime or 0), bool(_t_is_empty), int(_cur_n_t), int(_cur_t_total)))
+                if len(_tsig_buf) > 64:
+                    _tsig_buf = _tsig_buf[len(_tsig_buf)-64:]
+                try:
+                    object.__setattr__(self, '_target_ring_signatures', _tsig_buf)
+                except Exception:
+                    self._target_ring_signatures = _tsig_buf
+            except Exception:
+                pass
 
             # 计算有效持仓 = 实际持仓 + 在途开仓委托
             effective_actual = {}
@@ -2193,8 +2223,13 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self._notify_async("\n".join(lines))
                 self.print((_fmt_m(f"[监控] {monitor_tag} 检测到仓位差异: 缺额 {len(missing)} 个，超额 {len(excess)} 个，跳过 {len(skipped_sorted)} 个") or "").strip())
 
-                # 执行同步（已持有锁，传入 lock_held=True）
-                self._do_sync(trade_volume=1, lock_held=True)
+                # 执行同步（已持有锁，传入 lock_held=True + 巡检侧真实 hold-std mtime）
+                self._do_sync(
+                    trade_volume=1,
+                    lock_held=True,
+                    _hold_mtime=float(_monitor_hold_mtime or 0),
+                    _hold_changed=False,
+                )
             else:
                 # 无差异也要发送定期通知，让用户知道系统一直在检查
                 # 只统计当前可交易合约的手数，避免非交易时段合约导致误报不一致

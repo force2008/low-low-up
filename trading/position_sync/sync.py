@@ -293,34 +293,58 @@ class PositionSyncManagerSync:
 
         # ============== 首仓豁免（解决用户问题：冷启动/源突然开仓 → B1误拦）==============
         # 两条独立豁免路径：
-        #   A) 冷启动首仓路径（_is_first_run + hold_mtime<=0）：环形缓存/签名都为空，直接走这条
-        #   B) 运行中首仓路径（之前首仓豁免的 4 条）：环形缓存 latest==0 + target从空变非空 + attempt=1
+        #   A) 冷启动首仓路径（_is_first_run 为 True 或 环形缓存为空）：新进程刚起没历史兜底，走这条
+        #   B) 运行中首仓路径：环形缓存 latest==0 + target从空变非空 + attempt=1
         # 两条都要求非清仓、非B3命中、target非空 & actual=0；放行后强制触发🔒首仓防御 sleep3s重查仓兜底。
         # 其他脏空场景（历史 latest>0 突然变0 / attempt=2+ / B3命中 / 清仓）继续100%拦截，不放松。
         _is_first_position_fill_exempt = False
         _exempt_reason = ""
         _cold_start_tag = ""
+        _debug_parts = []
+        try:
+            _attempt = int(getattr(self, '_last_query_positions_attempt', 1) or 1)
+            _is_first_run_here = bool(getattr(self, '_is_first_run', True))
+            _hold_mtime_here = float(hold_mtime or 0)
+            _buf_raw = getattr(self, '_actual_positions_history', None) or []
+            _hold_sigs_raw = getattr(self, '_target_ring_signatures', None) or []
+            _debug_parts = [
+                f"is_first_run={str(_is_first_run_here):5s}",
+                f"hold_mtime={'N/A' if _hold_mtime_here<=0 else time.strftime('%H:%M:%S', time.localtime(_hold_mtime_here))}",
+                f"ring_buf_len={len(_buf_raw):d}",
+                f"sig_buf_len={len(_hold_sigs_raw):d}",
+                f"attempt={_attempt:d}",
+                f"target={n_target_contracts}c/{total_target_hands}h",
+                f"actual_pos_rows={n_pos_rows}",
+            ]
+        except Exception:
+            _debug_parts = []
+            _attempt = 1
+            _is_first_run_here = True
+            _hold_mtime_here = 0.0
+            _buf_raw = []
+            _hold_sigs_raw = []
         if not is_liquidate_mode and not b3_hit and (b1_hit or b2_hit) and n_target_contracts > 0 and total_target_hands > 0:
             try:
-                _attempt = int(getattr(self, '_last_query_positions_attempt', 1) or 1)
-                _is_first_run_here = bool(getattr(self, '_is_first_run', True))
-                _hold_mtime_here = float(hold_mtime or 0)
                 _now_ts = time.time()
                 _stale = float(getattr(self, '_POSITIONS_HISTORY_STALE_SECONDS', 3600) or 3600)
                 _cutoff = _now_ts - _stale
-
-                # ========== 路径 A：冷启动首仓（新进程刚起，环形缓存/签名都为空，attempt 一般是 1~2）==========
-                # 额外多一条保守校验：跟单账号「当前内存里聚合的 positions 也是 0」& target 合约数<=30 & target 手数<=30（小批量首仓，不是全仓 38 合约那种脏空）
-                if _is_first_run_here and _hold_mtime_here <= 0 and n_pos_rows <= 0 and (n_target_contracts <= 30 and total_target_hands <= 30):
+                # ========== 路径 A：冷启动首仓（新进程刚起，环形缓存/签名都为空，attempt 一般是 1~3）==========
+                # 放宽：hold_mtime 不再硬要求 <=0（巡检入口拿到的 hold_st 正常就有真实 mtime，之前强约束导致巡检触发的同步全卡）
+                _ring_empty = (not _buf_raw) or (len([r for r in _buf_raw if isinstance(r, (list, tuple)) and len(r) >= 4 and float(r[0] or 0) > _cutoff]) <= 0)
+                _cap_n_ok = (n_target_contracts <= 50)
+                _cap_h_ok = (total_target_hands <= 100)
+                if (_is_first_run_here or _ring_empty) and _cap_n_ok and _cap_h_ok and n_pos_rows <= 0:
                     _is_first_position_fill_exempt = True
                     _cold_start_tag = "[冷启动]"
+                    _tag_hm = "N/A" if _hold_mtime_here <= 0 else time.strftime("%H:%M:%S", time.localtime(_hold_mtime_here))
                     _exempt_reason = (f"首仓豁免（冷启动，B1/B2放行）："
-                                      f"_is_first_run=True + hold_mtime=N/A"
+                                      f"{'_is_first_run=True' if _is_first_run_here else 'ring_buf_empty'}"
+                                      f" + hold_mtime={_tag_hm}"
                                       f" + target小批量首开({n_target_contracts}合约/{total_target_hands}手)"
-                                      f" + attempt={_attempt}")
+                                      f" + attempt={_attempt}"
+                                      f" + cap_check={'OK' if (_cap_n_ok and _cap_h_ok) else 'NO(n='+str(n_target_contracts)+'/h='+str(total_target_hands)+')'}")
                 # ========== 路径 B：运行中首仓（之前的 4 条，环形缓存 latest==0 + target从空变非空）==========
                 if not _is_first_position_fill_exempt and _attempt <= 1:
-                    _buf_raw = getattr(self, '_actual_positions_history', None) or []
                     _latest_ring = None
                     if _buf_raw:
                         for i in range(len(_buf_raw) - 1, -1, -1):
@@ -336,7 +360,6 @@ class PositionSyncManagerSync:
                         _l_n = int(_latest_ring[2]) if len(_latest_ring) >= 3 else -1
                         _l_total = int(_latest_ring[3]) if len(_latest_ring) >= 4 else -1
                         if _l_n <= 0 and _l_total <= 0:
-                            _hold_sigs_raw = getattr(self, '_target_ring_signatures', None) or []
                             _prev_target_was_empty = True
                             if _hold_sigs_raw:
                                 for i in range(len(_hold_sigs_raw) - 1, -1, -1):
@@ -359,6 +382,27 @@ class PositionSyncManagerSync:
                 _is_first_position_fill_exempt = False
                 _exempt_reason = ""
                 _cold_start_tag = ""
+        # ============== 【调试tag】每次命中 B1/B2/B3 都打一行判定明细（方便下次直接知道是哪个条件卡住）==============
+        try:
+            _debug_line = None
+            if (b1_hit or b2_hit or b3_hit):
+                _parts = list(_debug_parts)
+                if _parts:
+                    _parts_str = " | ".join(_parts)
+                    hit_flags = []
+                    if b1_hit: hit_flags.append("B1")
+                    if b2_hit: hit_flags.append("B2")
+                    if b3_hit: hit_flags.append("B3")
+                    exempt_str = "命中" if _is_first_position_fill_exempt else "未命中"
+                    _debug_line = (f"[首仓豁免判定][{','.join(hit_flags)}] 豁免={exempt_str} | "
+                                   f"{_parts_str}"
+                                   f"{' → '+_exempt_reason if _is_first_position_fill_exempt and _exempt_reason else ''}")
+                    if _acct_prefix:
+                        _debug_line = f"{_acct_prefix} {_debug_line}"
+                    self.print(_debug_line.rstrip())
+        except Exception:
+            pass
+        # ============== 调试tag结束 ==============
         if _is_first_position_fill_exempt:
             # 冷启动首仓路径必须强制触发🔒首仓防御：哪怕 missing_orders<10（比如 5手单合约）也 sleep3s 重查一次，
             # 因为冷启动没历史环形缓存兜底，没这个强制重查就真的会拿 actual=0 去开仓→翻倍（原🔒首仓防御只在 missing>=10 才触发）。
