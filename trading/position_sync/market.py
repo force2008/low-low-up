@@ -307,6 +307,10 @@ class PositionSyncManagerMarket:
 
         with self._pos_query_lock:
             for attempt in range(retries + 1):
+                try:
+                    object.__setattr__(self, '_last_query_positions_attempt', int(attempt + 1))
+                except Exception:
+                    self._last_query_positions_attempt = int(attempt + 1)
                 self._pos_query_event.clear()
                 self._actual_positions = []
                 req = tdapi.CThostFtdcQryInvestorPositionField()
