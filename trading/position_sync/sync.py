@@ -763,14 +763,16 @@ class PositionSyncManagerSync:
             #    当 _hold_changed=True（真的有新导出/新订单）时，缩短查询与等待时间。
             # 2026-09-21 超时优化：今日 100+ 超时与「qry_pos_timeout 8/15s 过短」有关，
             #   统一加 4s：hold 变 8→12s，不变 15→20s；默认 retries 仍 2 次 → 单轮最大等待 36s/60s
+            # 2026-10-12 延迟优化：日志统计显示成功查询均 <5s 返回，超时均卡满 timeout，
+            #   故 hold 不变分支 20s→12s（偶发慢响应时 12s 超时+重试仍能成功，省 8s）。
             if _hold_changed:
                 qry_order_timeout = 6
                 qry_pos_timeout = 12
-                qry_order2_timeout = 5
+                qry_order2_timeout = 3
             else:
                 qry_order_timeout = 10
-                qry_pos_timeout = 20
-                qry_order2_timeout = 10
+                qry_pos_timeout = 12
+                qry_order2_timeout = 3
             ctp_orders = self.query_orders(timeout=qry_order_timeout, only_pending=True, today_only=True) or []
             kept_orders = []
             cancelled_ctp = []
@@ -883,7 +885,13 @@ class PositionSyncManagerSync:
             # ========== 硬闸结束 ==========
 
             # 6. 再次查询在途委托（撤销后的状态）
-            ctp_orders = self.query_orders(timeout=qry_order2_timeout, only_pending=True, today_only=True) or []
+            #    超时兜底：用步骤2的 kept_orders 快照替代（比"空列表"更安全，避免漏判在途导致重复开仓）
+            ctp_orders = self.query_orders(timeout=qry_order2_timeout, only_pending=True, today_only=True)
+            if ctp_orders is None:
+                self.print(f"[委托] 步骤6查询超时({qry_order2_timeout}s)，用步骤2保留的 {len(kept_orders)} 条在途快照兜底")
+                ctp_orders = list(kept_orders)
+            else:
+                ctp_orders = ctp_orders or []
             if ctp_orders:
                 self.print(f"[委托] 撤销后剩余 CTP 在途 {len(ctp_orders)} 条")
                 self._sync_ctp_orders_to_memory(ctp_orders)

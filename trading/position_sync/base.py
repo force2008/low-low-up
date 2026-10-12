@@ -2110,7 +2110,15 @@ class PositionSyncManagerBase(CTdSpiBase):
                 return
 
             # 查询在途委托，用于计算有效持仓
-            ctp_orders = self.query_orders(timeout=10, only_pending=True, today_only=True) or []
+            # 超时从 10s 降到 5s：日志显示查单经常卡满 10s 超时。
+            # 超时则跳过本轮巡检：差异检测需要准确的在途数据，内存 _orders 可能有状态延迟
+            # （已成交但 OnRtnOrder 未推送），用不准确的数据兜底可能误判。跳过一轮最多延迟 15s，
+            # 同步阶段会重新查单，不影响最终对齐。
+            ctp_orders = self.query_orders(timeout=5, only_pending=True, today_only=True)
+            if ctp_orders is None:
+                self.print(_fmt_m("[监控] 在途委托查询超时(5s)，跳过本轮巡检，等下一轮") or "")
+                return
+            ctp_orders = ctp_orders or []
             pending_map = self._build_pending_map(ctp_orders)
 
             # 聚合持仓

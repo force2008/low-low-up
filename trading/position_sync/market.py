@@ -312,7 +312,7 @@ class PositionSyncManagerMarket:
                 req = tdapi.CThostFtdcQryInvestorPositionField()
                 req.BrokerID = self._broker_id
                 req.InvestorID = self._user_id
-                self.print(f"{_prefix} 发送请求，attempt={attempt + 1}/{retries + 1} {_acc_tag}".rstrip())
+                self.print(f"{_prefix} 发送请求，attempt={attempt + 1}/{retries + 1} timeout={timeout}s {_acc_tag}".rstrip())
                 self._api.ReqQryInvestorPosition(req, 0)
                 ok = self._pos_query_event.wait(timeout=timeout)
                 if ok:
@@ -320,7 +320,7 @@ class PositionSyncManagerMarket:
                     self._reset_query_health()
                     return list(self._actual_positions)
                 if attempt < retries:
-                    self.print(f"[警告] {_prefix} 持仓查询超时，第 {attempt + 1} 次重试... {_acc_tag}".rstrip())
+                    self.print(f"[警告] {_prefix} 持仓查询超时（{timeout}s），第 {attempt + 1} 次重试... {_acc_tag}".rstrip())
                     time.sleep(1)
             self.print(f"[错误] {_prefix} 连续 {retries + 1} 次超时，返回 None {_acc_tag}".rstrip())
             self._on_query_timeout(source="持仓查询")
