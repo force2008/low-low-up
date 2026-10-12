@@ -305,7 +305,7 @@ def run_position_sync_loop(
                 if stop_event is not None and stop_event.is_set():
                     _log("[同步] 首轮等待期间收到停止信号，退出")
                     return True
-                time.sleep(1)
+                _t.sleep(1)
         _md_login_ok = False
         try:
             _md_prov = getattr(mgr, "_md_provider", None)
@@ -320,7 +320,7 @@ def run_position_sync_loop(
                 if stop_event is not None and stop_event.is_set():
                     _log("[同步] 登录等待期间收到停止信号，退出")
                     return True
-                time.sleep(1)
+                _t.sleep(1)
                 _total_waited += 1
                 try:
                     _md_prov = getattr(mgr, "_md_provider", None)
