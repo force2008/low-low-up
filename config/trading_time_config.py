@@ -172,14 +172,22 @@ def get_annual_factor(product_id: str = None) -> float:
 def get_trading_minutes_for_product(product_id: str) -> int:
     """
     获取某品种的每日交易分钟数
-    
+
     Args:
         product_id: 产品代码
-        
+
     Returns:
         int: 每日交易分钟数
     """
-    return PRODUCT_TRADING_MINUTES.get(product_id, PRODUCT_TRADING_MINUTES["DEFAULT"])
+    if product_id in PRODUCT_TRADING_MINUTES:
+        return PRODUCT_TRADING_MINUTES[product_id]
+    lower = product_id.lower() if product_id else ""
+    if lower in PRODUCT_TRADING_MINUTES:
+        return PRODUCT_TRADING_MINUTES[lower]
+    upper = product_id.upper() if product_id else ""
+    if upper in PRODUCT_TRADING_MINUTES:
+        return PRODUCT_TRADING_MINUTES[upper]
+    return PRODUCT_TRADING_MINUTES["DEFAULT"]
 
 
 def get_trading_hours_info(product_id: str) -> dict:
@@ -319,10 +327,12 @@ def is_contract_trading_now(instrument_id: str, now: Optional[datetime] = None) 
         now = datetime.now()
     t = now.time()
 
+    product_upper = product.upper()
+
     # 日盘判断
-    if product in _CFFEX_STOCK_INDEX_PRODUCTS:
+    if product_upper in _CFFEX_STOCK_INDEX_PRODUCTS:
         day_sessions = _CFFEX_STOCK_INDEX_DAY_SESSIONS
-    elif product in _CFFEX_TREASURY_PRODUCTS:
+    elif product_upper in _CFFEX_TREASURY_PRODUCTS:
         day_sessions = _CFFEX_TREASURY_DAY_SESSIONS
     else:
         day_sessions = _COMMODITY_DAY_SESSIONS
