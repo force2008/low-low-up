@@ -25,7 +25,7 @@ PRODUCT_TRADING_MINUTES = {
     "IC": 240,
     "IM": 240,
     "IH": 240,
-    # 国债期货：09:15-11:30, 13:00-15:15 = 255 分钟
+    # 国债期货：09:30-11:30, 13:00-15:15 = 255 分钟
     "T": 255,
     "TF": 255,
     "TS": 255,
@@ -270,7 +270,7 @@ _CFFEX_STOCK_INDEX_DAY_SESSIONS = [
 
 # 中金所国债期货日盘时段
 _CFFEX_TREASURY_DAY_SESSIONS = [
-    (time(9, 15), time(11, 30)),
+    (time(9, 30), time(11, 30)),
     (time(13, 0), time(15, 15)),
 ]
 
