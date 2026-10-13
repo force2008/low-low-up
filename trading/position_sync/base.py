@@ -208,6 +208,11 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 首次运行标志：只在第一次执行同步时为 True
         self._is_first_run: bool = True
 
+        # B1/B2 脏空拦截连续计数：冷启动场景（actual=0, target>0）下，
+        # 前 3 轮拦截防脏空，第 4 轮放行使其能真正开始同步（避免永远被拦）。
+        # passive 模式下有在途开仓挂单时直接放行，不等 3 轮。
+        self._consecutive_b1b2_blocks: int = 0
+
         # ---------- 持仓实际聚合历史快照环形缓存（F 总闸脏空兜底 + 真清仓放行）----------
         # 用户场景：手动在柜台平掉大部分合约（真清仓）后，同步工具本轮查仓返回的 actual_agg
         # 合约数/手数突然很小（2 合约/6 手），F 总闸（缺额 95%合约/95%手）直接 ABORT，不让后续缺额开仓提交。

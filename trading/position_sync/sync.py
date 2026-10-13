@@ -238,12 +238,19 @@ class PositionSyncManagerSync:
         target: dict,
         hold_mtime: float,
         sync_mode_tag: str,
+        passive_mode: bool = False,
+        has_pending_open_orders: bool = False,
     ) -> bool:
         """B1+B2 硬闸 + 双端一致性校验。返回 True=安全可继续、False=命中拦截需 abort。
         B1：positions 查询返回 0 条 但 target 有合约 → 脏空拦截
         B2：actual 总手=0 但 target 总手>0（非清仓模式）→ 脏空/脏0拦截
         B3：positions 返回条数 与 self._actual_positions 当前缓存长度 差>1 且两边非 0 →
             说明查询返回对象和聚合用的不是同一份数据（重试乱序/竞态污染），同样判脏
+
+        放行规则（避免冷启动/passive 模式下永远被拦）：
+          1) passive_mode=True 且 has_pending_open_orders=True → 直接放行（在途挂单排队中）；
+          2) 连续命中 B1/B2 达 3 次后，第 4 次放行（冷启动场景：源有仓、跟单空仓，
+             前 3 轮防脏空兜底，第 4 轮必须让同步真正执行，否则永远追不上标准仓）。
         """
         _env = str(getattr(self, '_env_name', '') or '').strip() or None
         _uid = str(getattr(self, '_user_id', '') or '').strip() or None
@@ -271,6 +278,55 @@ class PositionSyncManagerSync:
         b3_hit = _big_gap and n_target_contracts > 0
 
         if not (b1_hit or b2_hit or b3_hit):
+            # 未命中拦截，重置连续拦截计数
+            try:
+                object.__setattr__(self, '_consecutive_b1b2_blocks', 0)
+            except Exception:
+                self._consecutive_b1b2_blocks = 0
+            return True
+
+        # ============== 放行规则：避免冷启动 / passive 模式下永远被拦 ==============
+        # 规则 1：passive 模式 + 有在途开仓挂单 → 直接放行（挂单排队等待成交，actual 还没回填是正常的）
+        if passive_mode and has_pending_open_orders:
+            _env_r = str(getattr(self, '_env_name', '') or '').strip() or None
+            _uid_r = str(getattr(self, '_user_id', '') or '').strip() or None
+            _bid_r = str(getattr(self, '_broker_id', '') or '').strip() or None
+            _pre_r = "".join([p for p in [f"[{_env_r}]" if _env_r else None, f"[{_uid_r}]" if _uid_r else None] if p])
+            _suf_r = f" (BrokerID={_bid_r}, InvestorID={_uid_r})" if (_bid_r or _uid_r) else ""
+            _l_r = (f"[放行][passive在途] B1/B2 命中但 passive 模式存在在途开仓挂单，"
+                    f"actual={total_actual_hands}手/target={total_target_hands}手，"
+                    f"挂单排队等待成交中，本轮放行不拦截{_suf_r}")
+            if _pre_r:
+                _l_r = f"{_pre_r} {_l_r}"
+            self.print(_l_r.rstrip())
+            try:
+                object.__setattr__(self, '_consecutive_b1b2_blocks', 0)
+            except Exception:
+                self._consecutive_b1b2_blocks = 0
+            return True
+
+        # 规则 2：连续命中 B1/B2 达 3 次后，第 4 次放行（冷启动场景）
+        _cur_blocks = int(getattr(self, '_consecutive_b1b2_blocks', 0) or 0)
+        _cur_blocks += 1
+        try:
+            object.__setattr__(self, '_consecutive_b1b2_blocks', _cur_blocks)
+        except Exception:
+            self._consecutive_b1b2_blocks = _cur_blocks
+        if _cur_blocks > 3:
+            _env_c = str(getattr(self, '_env_name', '') or '').strip() or None
+            _uid_c = str(getattr(self, '_user_id', '') or '').strip() or None
+            _bid_c = str(getattr(self, '_broker_id', '') or '').strip() or None
+            _pre_c = "".join([p for p in [f"[{_env_c}]" if _env_c else None, f"[{_uid_c}]" if _uid_c else None] if p])
+            _suf_c = f" (BrokerID={_bid_c}, InvestorID={_uid_c})" if (_bid_c or _uid_c) else ""
+            _l_c = (f"[放行][冷启动] 连续 {_cur_blocks} 轮 B1/B2 脏空拦截后放行（actual={total_actual_hands}手/"
+                    f"target={total_target_hands}手），冷启动场景下让同步真正执行，避免永远追不上标准仓{_suf_c}")
+            if _pre_c:
+                _l_c = f"{_pre_c} {_l_c}"
+            self.print(_l_c.rstrip())
+            try:
+                object.__setattr__(self, '_consecutive_b1b2_blocks', 0)
+            except Exception:
+                self._consecutive_b1b2_blocks = 0
             return True
 
         hold_tag = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(hold_mtime)) if hold_mtime > 0 else "N/A"
@@ -294,6 +350,7 @@ class PositionSyncManagerSync:
             f"  标准仓合约数={n_target_contracts}，标准总仓={total_target_hands}手",
             f"  实际聚合合约数={len(actual_agg or {})}，实际总仓={total_actual_hands}手",
             f"  hold-std写入时刻={hold_tag}",
+            f"  连续拦截计数={_cur_blocks}/3（第4轮将冷启动放行）",
             f"  -> 拒绝本轮任何开/平仓，避免用脏数据对齐导致翻倍超仓或平过头。",
         ]
         msg = "\n".join(msg_lines)
@@ -1023,6 +1080,8 @@ class PositionSyncManagerSync:
                 target=target,
                 hold_mtime=_hold_mtime,
                 sync_mode_tag=_sync_mode_tag,
+                passive_mode=bool(getattr(self, '_passive_mode', False)),
+                has_pending_open_orders=len(kept_orders) > 0,
             ):
                 return False
             # ========== 硬闸结束 ==========
