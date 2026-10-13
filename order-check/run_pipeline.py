@@ -407,13 +407,19 @@ def _dismiss_startup_popup():
         logger.warning("[启动弹框] 点击失败或无需点击: %s", e)
 
 
-def _cleanup_export_files():
+def _cleanup_export_files(keep_latest: int = 5):
     """清理 DEFAULT_SAVE_PATH 目录下的旧导出 CSV 文件，防止文件夹无限增长。
 
-    保留今天的文件（今天日期开头的），删除昨天及更早的文件。
-    文件名日期格式可能是 YYYY-M-D（一位数）或 YYYY-MM-DD（两位数），
-    提取后统一归一化为 YYYY-MM-DD 再比较。
+    按「账号 + 文件类型」（文件名前两段空格分隔内容）分组，每组只保留
+    修改时间最新的 ``keep_latest`` 个 CSV 文件，其余全部删除。非 CSV 文件保留不动。
+
+    文件名样例：
+      wangk0402 持仓明细 2026-10-14 09-35-59.csv   -> key="wangk0402 持仓明细"
+      wangk0402 所有委托 2026-10-14 09-35-59.csv   -> key="wangk0402 所有委托"
+      wangk0402 成交明细 2026-10-14 09-35-59.csv   -> key="wangk0402 成交明细"
+      资金账户申报费监控 2026-10-14 15-00-00.csv   -> key="资金账户申报费监控"
     """
+    import collections
     import re
     try:
         from local_config import DEFAULT_SAVE_PATH
@@ -421,35 +427,48 @@ def _cleanup_export_files():
             logger.warning("[清理] DEFAULT_SAVE_PATH 不存在或不是目录: %s", DEFAULT_SAVE_PATH)
             return
 
-        today = datetime.date.today().isoformat()  # e.g. "2026-09-02"
-
-        removed_count = 0
-        kept_count = 0
-        failed_paths = []
+        groups = collections.defaultdict(list)
+        non_csv_count = 0
+        date_re = re.compile(r'^\d{4}-\d{1,2}-\d{1,2}$')
 
         for entry in os.scandir(DEFAULT_SAVE_PATH):
             if not entry.is_file():
                 continue
             if not entry.name.lower().endswith('.csv'):
-                kept_count += 1
+                non_csv_count += 1
                 continue
-            # 文件名日期可能是 "2026-9-2"（一位数）或 "2026-09-02"（两位数）
-            match = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', entry.name)
-            if not match:
-                kept_count += 1
-                continue
-            year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
-            file_date = f"{year}-{month:02d}-{day:02d}"
-            if file_date < today:
+            parts = entry.name.split(' ')
+            if len(parts) >= 2 and date_re.match(parts[1]):
+                # 第二段就是日期（如"资金账户申报费监控 2026-10-14 ..."），
+                # 说明只有名称一段，用第一段作为分组 key
+                key = parts[0]
+            elif len(parts) >= 2:
+                # 账号 + 文件类型 两段（如"WQ1017 所有委托 2026-9-7 ..."）
+                key = ' '.join(parts[:2])
+            else:
+                key = parts[0]
+            groups[key].append(entry)
+
+        removed_count = 0
+        kept_count = non_csv_count
+        failed_paths = []
+
+        for key, entries in groups.items():
+            entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+            for idx, entry in enumerate(entries):
+                if idx < keep_latest:
+                    kept_count += 1
+                    continue
                 try:
                     os.remove(entry.path)
                     removed_count += 1
                 except Exception as e:
                     failed_paths.append((entry.path, str(e)))
-            else:
-                kept_count += 1
 
-        logger.info("[清理] 已删除 %d 个旧导出文件，保留 %d 个: %s", removed_count, kept_count, DEFAULT_SAVE_PATH)
+        logger.info(
+            "[清理] 已删除 %d 个旧导出文件，保留 %d 个（每组最新 %d 个，共 %d 组，非CSV %d 个）: %s",
+            removed_count, kept_count, keep_latest, len(groups), non_csv_count, DEFAULT_SAVE_PATH,
+        )
         if failed_paths:
             for path, err in failed_paths[:5]:
                 logger.warning("[清理] 删除失败: %s - %s", path, err)
