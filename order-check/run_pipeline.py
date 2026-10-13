@@ -408,10 +408,11 @@ def _dismiss_startup_popup():
 
 
 def _cleanup_export_files():
-    """清理 DEFAULT_SAVE_PATH 目录下的旧导出文件，防止文件夹无限增长。
+    """清理 DEFAULT_SAVE_PATH 目录下的旧导出 CSV 文件，防止文件夹无限增长。
 
     保留今天的文件（今天日期开头的），删除昨天及更早的文件。
-    仅在夜盘结束（02:30）退出时调用一次。
+    文件名日期格式可能是 YYYY-M-D（一位数）或 YYYY-MM-DD（两位数），
+    提取后统一归一化为 YYYY-MM-DD 再比较。
     """
     import re
     try:
@@ -420,33 +421,33 @@ def _cleanup_export_files():
             logger.warning("[清理] DEFAULT_SAVE_PATH 不存在或不是目录: %s", DEFAULT_SAVE_PATH)
             return
 
-        # 获取今天和昨天的日期字符串（格式：YYYY-MM-DD）
         today = datetime.date.today().isoformat()  # e.g. "2026-09-02"
-        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()  # e.g. "2026-09-01"
 
         removed_count = 0
         kept_count = 0
         failed_paths = []
 
         for entry in os.scandir(DEFAULT_SAVE_PATH):
-            if entry.is_file():
-                # 文件名格式："资金账户申报费监控 2026-09-02 09-35-59"
-                # 提取文件名中的日期部分
-                match = re.search(r'(\d{4}-\d{2}-\d{2})', entry.name)
-                if not match:
-                    # 没有日期格式，保留
-                    kept_count += 1
-                    continue
-                file_date = match.group(1)
-                # 只删除昨天及更早的文件，保留今天的
-                if file_date < today:
-                    try:
-                        os.remove(entry.path)
-                        removed_count += 1
-                    except Exception as e:
-                        failed_paths.append((entry.path, str(e)))
-                else:
-                    kept_count += 1
+            if not entry.is_file():
+                continue
+            if not entry.name.lower().endswith('.csv'):
+                kept_count += 1
+                continue
+            # 文件名日期可能是 "2026-9-2"（一位数）或 "2026-09-02"（两位数）
+            match = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', entry.name)
+            if not match:
+                kept_count += 1
+                continue
+            year, month, day = match.group(1), int(match.group(2)), int(match.group(3))
+            file_date = f"{year}-{month:02d}-{day:02d}"
+            if file_date < today:
+                try:
+                    os.remove(entry.path)
+                    removed_count += 1
+                except Exception as e:
+                    failed_paths.append((entry.path, str(e)))
+            else:
+                kept_count += 1
 
         logger.info("[清理] 已删除 %d 个旧导出文件，保留 %d 个: %s", removed_count, kept_count, DEFAULT_SAVE_PATH)
         if failed_paths:
@@ -454,6 +455,9 @@ def _cleanup_export_files():
                 logger.warning("[清理] 删除失败: %s - %s", path, err)
     except Exception as e:
         logger.warning("[清理] 清理导出文件失败: %s", e)
+
+
+atexit.register(_cleanup_export_files)
 
 
 def is_in_trading_time():
@@ -1451,10 +1455,10 @@ def export_loop():
                     elif _RESPONSIBLE_SESSION_END == datetime.time(2, 30, 0):
                         logger.info("[导出线程] 夜盘已结束，准备退出")
                         send_feishu_text("夜盘结束，流水线退出")
-                        _cleanup_export_files()
                     else:
                         logger.info("[导出线程] 上午盘已结束，准备退出")
                         send_feishu_text("上午盘结束，流水线退出")
+                    _cleanup_export_files()
                     shutdown_event.set()
                     break
 
