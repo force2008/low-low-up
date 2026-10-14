@@ -34,7 +34,6 @@ CFFEX_BOND_DAY = [_sess(9, 30, 11, 30), _sess(13, 0, 15, 15)]
 # 夜盘（跨午夜的在判断逻辑中自动处理）
 NIGHT_2300 = _sess(21, 0, 23, 0)
 NIGHT_0100 = _sess(21, 0, 1, 0)
-NIGHT_0130 = _sess(21, 0, 1, 30)
 NIGHT_0230 = _sess(21, 0, 2, 30)
 
 # 按 ProductID 聚合的完整时段映射
@@ -53,31 +52,36 @@ PRODUCT_TRADING_SESSIONS: Dict[str, List] = {
     # === 上期所 - 夜盘到 23:00 ===
     "bu": DAY_3SEG + [NIGHT_2300],
     "ru": DAY_3SEG + [NIGHT_2300],
-    "zn": DAY_3SEG + [NIGHT_2300],
-    "pb": DAY_3SEG + [NIGHT_2300],
-    "al": DAY_3SEG + [NIGHT_2300],
-    "cu": DAY_3SEG + [NIGHT_2300],
     "rb": DAY_3SEG + [NIGHT_2300],
     "hc": DAY_3SEG + [NIGHT_2300],
     "fu": DAY_3SEG + [NIGHT_2300],
     "sp": DAY_3SEG + [NIGHT_2300],
     "br": DAY_3SEG + [NIGHT_2300],
-    "ao": DAY_3SEG + [NIGHT_2300],
     # === 上期所 - 夜盘到 01:00 ===
+    "ao": DAY_3SEG + [NIGHT_0100],
+    "cu": DAY_3SEG + [NIGHT_0100],
+    "al": DAY_3SEG + [NIGHT_0100],
+    "zn": DAY_3SEG + [NIGHT_0100],
+    "pb": DAY_3SEG + [NIGHT_0100],
     "ni": DAY_3SEG + [NIGHT_0100],
     "sn": DAY_3SEG + [NIGHT_0100],
+    "ss": DAY_3SEG + [NIGHT_0100],
+    "ad": DAY_3SEG + [NIGHT_0100],
     # === 上期所 - 夜盘到 02:30 ===
     "au": DAY_3SEG + [NIGHT_0230],
     "ag": DAY_3SEG + [NIGHT_0230],
-    "ss": DAY_3SEG + [NIGHT_0230],
+    # === 上期所 - 无夜盘 ===
+    "wr": DAY_3SEG,
 
     # === 能源中心 - 夜盘到 23:00 ===
     "lu": DAY_3SEG + [NIGHT_2300],
-    "bc": DAY_3SEG + [NIGHT_2300],
     "nr": DAY_3SEG + [NIGHT_2300],
-    "ec": DAY_3SEG + [NIGHT_2300],
+    # === 能源中心 - 夜盘到 01:00 ===
+    "bc": DAY_3SEG + [NIGHT_0100],
     # === 能源中心 - 夜盘到 02:30 ===
     "sc": DAY_3SEG + [NIGHT_0230],
+    # === 能源中心 - 无夜盘（指数类） ===
+    "ec": DAY_3SEG,
 
     # === 大商所 - 夜盘到 23:00 ===
     "m": DAY_3SEG + [NIGHT_2300],
@@ -92,18 +96,18 @@ PRODUCT_TRADING_SESSIONS: Dict[str, List] = {
     "eb": DAY_3SEG + [NIGHT_2300],
     "pg": DAY_3SEG + [NIGHT_2300],
     "rr": DAY_3SEG + [NIGHT_2300],
-    "fb": DAY_3SEG + [NIGHT_2300],
-    "bb": DAY_3SEG + [NIGHT_2300],
-    "lg": DAY_3SEG + [NIGHT_2300],
-    # === 大商所 - 夜盘到 01:30 ===
-    "i": DAY_3SEG + [NIGHT_0130],
-    "j": DAY_3SEG + [NIGHT_0130],
-    "jm": DAY_3SEG + [NIGHT_0130],
-    "lh": DAY_3SEG + [NIGHT_0130],
+    "i": DAY_3SEG + [NIGHT_2300],
+    "j": DAY_3SEG + [NIGHT_2300],
+    "jm": DAY_3SEG + [NIGHT_2300],
+    "bz": DAY_3SEG + [NIGHT_2300],
+    "c": DAY_3SEG + [NIGHT_2300],
+    "cs": DAY_3SEG + [NIGHT_2300],
     # === 大商所 - 无夜盘 ===
-    "c": DAY_3SEG,
-    "cs": DAY_3SEG,
     "jd": DAY_3SEG,
+    "fb": DAY_3SEG,
+    "bb": DAY_3SEG,
+    "lg": DAY_3SEG,
+    "lh": DAY_3SEG,
 
     # === 郑商所 - 夜盘到 23:00 ===
     "CF": DAY_3SEG + [NIGHT_2300],
@@ -114,30 +118,29 @@ PRODUCT_TRADING_SESSIONS: Dict[str, List] = {
     "OI": DAY_3SEG + [NIGHT_2300],
     "FG": DAY_3SEG + [NIGHT_2300],
     "SA": DAY_3SEG + [NIGHT_2300],
-    "AP": DAY_3SEG + [NIGHT_2300],
-    # === 郑商所 - 夜盘到 01:30 ===
-    "SM": DAY_3SEG + [NIGHT_0130],
-    "SF": DAY_3SEG + [NIGHT_0130],
-    "PX": DAY_3SEG + [NIGHT_0130],
-    "PR": DAY_3SEG + [NIGHT_0130],
-    "PF": DAY_3SEG + [NIGHT_0130],
-    "PK": DAY_3SEG + [NIGHT_0130],
-    "PL": DAY_3SEG + [NIGHT_0130],
-    "SH": DAY_3SEG + [NIGHT_0130],
-    "UR": DAY_3SEG + [NIGHT_0130],
+    "PX": DAY_3SEG + [NIGHT_2300],
+    "PR": DAY_3SEG + [NIGHT_2300],
+    "PF": DAY_3SEG + [NIGHT_2300],
+    "PL": DAY_3SEG + [NIGHT_2300],
+    "SH": DAY_3SEG + [NIGHT_2300],
+    "CY": DAY_3SEG + [NIGHT_2300],
     # === 郑商所 - 无夜盘 ===
+    "UR": DAY_3SEG,
+    "SM": DAY_3SEG,
+    "SF": DAY_3SEG,
+    "PK": DAY_3SEG,
+    "AP": DAY_3SEG,
     "CJ": DAY_3SEG,
-    "CY": DAY_3SEG,
     "JR": DAY_3SEG,
     "PM": DAY_3SEG,
     "RS": DAY_3SEG,
     "WH": DAY_3SEG,
     "ZC": DAY_3SEG,
 
-    # === 广期所 - 夜盘到 23:00 ===
-    "lc": DAY_3SEG + [NIGHT_2300],
-    "si": DAY_3SEG + [NIGHT_2300],
-    "ps": DAY_3SEG + [NIGHT_2300],
-    "pt": DAY_3SEG + [NIGHT_2300],
-    "pd": DAY_3SEG + [NIGHT_2300],
+    # === 广期所 - 无夜盘 ===
+    "lc": DAY_3SEG,
+    "si": DAY_3SEG,
+    "ps": DAY_3SEG,
+    "pt": DAY_3SEG,
+    "pd": DAY_3SEG,
 }
