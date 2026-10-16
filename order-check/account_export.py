@@ -26,6 +26,10 @@ except ImportError:
     sys.exit(1)
 
 
+# 导出完成确认弹框的窗口标题关键字（融航风控端“导出完成”的模态信息框）
+EXPORT_DONE_DIALOG_KEYWORD = "融航风控"
+
+
 def wait_for_window(title, timeout=10):
     """等待指定标题的窗口出现"""
     start_time = time.time()
@@ -150,7 +154,7 @@ def save_exported_data():
     # 处理导出完成确认弹框（最多等待 10 秒，账号多需要更长时间）
     print("等待导出完成确认弹框...")
     try:
-        wait_for_window("融航风控", timeout=30)
+        wait_for_window(EXPORT_DONE_DIALOG_KEYWORD, timeout=30)
         print("检测到导出完成弹框，点击确认按钮...")
         pyautogui.moveTo(OK_BUTTON_POSITION)
         pyautogui.click()
@@ -160,9 +164,59 @@ def save_exported_data():
         print("10 秒内未检测到导出完成弹框，跳过确认，继续后续同步...")
 
 
+def dismiss_leftover_dialogs():
+    """清理上一次遗留的模态确认框（如“导出完成”的 OK 信息框）。
+
+    问题场景：上一次导出时，程序在点掉“导出完成”OK 框之前就退出了
+    （进程被重启/关闭、或超时没等到弹框），融航风控端的模态 OK 框
+    残留下来。它是模态窗口，会抢走所有鼠标点击，导致后续导出菜单点不开、
+    导出全部失效。这里在每次导出前先把它点掉，实现自愈。
+
+    Returns:
+        bool: 是否点掉了至少一个遗留弹框
+    """
+    try:
+        candidates = pyautogui.getWindowsWithTitle(EXPORT_DONE_DIALOG_KEYWORD)
+    except Exception as e:
+        print(f"检测遗留弹框失败: {e}")
+        return False
+
+    dismissed = False
+    for win in candidates:
+        title = getattr(win, "title", "") or ""
+        if not title or getattr(win, "isMinimized", False):
+            continue
+        # 排除主窗口（主窗口标题里带账号信息 APP_TITLE）
+        if APP_TITLE and APP_TITLE in title:
+            continue
+        # 弹框是小窗口，主窗口远大于此；尺寸保护，避免误点到主界面上
+        if getattr(win, "width", 0) > 1000 or getattr(win, "height", 0) > 800:
+            continue
+
+        print(f"检测到遗留弹框: '{title}'，点击确认按钮 {OK_BUTTON_POSITION} ...")
+        try:
+            try:
+                win.activate()
+                time.sleep(0.3)
+            except Exception:
+                pass
+            pyautogui.moveTo(OK_BUTTON_POSITION)
+            pyautogui.click()
+            time.sleep(0.5)
+            dismissed = True
+            print("已点掉遗留弹框")
+        except Exception as e:
+            print(f"点掉遗留弹框失败: {e}")
+    return dismissed
+
+
 def main():
     try:
         print("开始数据导出自动化...")
+
+        # 先清理上一次遗留的模态确认框（如导出完成的 OK 框），
+        # 否则它会抢走点击，导致菜单打不开、导出全部失效。
+        dismiss_leftover_dialogs()
 
         # 等待并激活应用程序窗口
         print(f"等待应用程序窗口: {APP_TITLE}...")
