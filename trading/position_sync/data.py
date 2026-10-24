@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import time
 from datetime import datetime, time as dt_time
 from typing import Dict, List, Optional, Tuple
 
@@ -202,21 +203,33 @@ class PositionSyncManagerData:
         if not os.path.exists(self.hold_std_path):
             self.print(f"[错误] 找不到 hold-std.json: {self.hold_std_path}")
             return False
-        try:
-            with open(self.hold_std_path, "r", encoding="utf-8") as f:
-                self._hold_std = json.load(f)
-            total_vol = 0
-            for item in self._hold_std:
-                vol = item.get("持仓量") or item.get("手数") or item.get("数量") or "0"
-                try:
-                    total_vol += int(float(str(vol).strip()))
-                except (ValueError, TypeError):
-                    pass
-            self.print(f"[信息] 已加载标准持仓 {len(self._hold_std)} 个合约，共 {total_vol} 手")
-            return True
-        except Exception as e:
-            self.print(f"[错误] 加载 hold-std.json 失败: {e}")
-            return False
+        # 并发写入容错：导出线程刷新 hold-std 时是「截断 + 覆盖写」，读方可能恰好读到
+        # 已截断但还没写完的空文件。这里做 3 次短重试（每次 100ms），避免把瞬时空文件
+        # 误判为「加载失败」而触发后续危险回退。
+        last_err: object = None
+        for _attempt in range(3):
+            try:
+                with open(self.hold_std_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if not content.strip():
+                    last_err = "文件为空（可能正在被覆盖写入）"
+                    time.sleep(0.1)
+                    continue
+                self._hold_std = json.loads(content)
+                total_vol = 0
+                for item in self._hold_std:
+                    vol = item.get("持仓量") or item.get("手数") or item.get("数量") or "0"
+                    try:
+                        total_vol += int(float(str(vol).strip()))
+                    except (ValueError, TypeError):
+                        pass
+                self.print(f"[信息] 已加载标准持仓 {len(self._hold_std)} 个合约，共 {total_vol} 手")
+                return True
+            except Exception as e:
+                last_err = e
+                time.sleep(0.1)
+        self.print(f"[错误] 加载 hold-std.json 失败: {last_err}")
+        return False
 
     def _positions_to_hold_std(self, positions: List[dict]) -> List[dict]:
         """将 CTP 原始持仓聚合转换为 hold-std.json 格式"""
@@ -240,14 +253,27 @@ class PositionSyncManagerData:
         return result
 
     def _save_hold_std(self) -> bool:
-        """将 self._hold_std 保存到 hold-std.json"""
+        """将 self._hold_std 保存到 hold-std.json（原子写入：临时文件 + os.replace）
+
+        原子写入可保证读方（同步/巡检线程）永远看不到「已截断但还没写完」的空文件，
+        从根因上消除「读空文件 → 误走回退 → 用跟单账户持仓覆盖标准仓」的二次放大风险。
+        """
+        tmp_path = f"{self.hold_std_path}.tmp.{os.getpid()}"
         try:
-            with open(self.hold_std_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._hold_std, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.hold_std_path)
             self.print(f"[信息] 已保存标准持仓到 {self.hold_std_path}")
             return True
         except Exception as e:
             self.print(f"[错误] 保存 hold-std.json 失败: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
             return False
 
     # ------------------------------------------------------------------

@@ -918,6 +918,17 @@ class PositionSyncManagerSync:
 
             # 4. 加载标准持仓
             if not self._load_hold_std():
+                # 文件存在但解析失败（多为导出线程并发覆盖写的瞬时状态）：
+                # 绝不能拿「跟单账户自己的 CTP 持仓」当标准仓，否则会把自身持仓
+                # 再乘一次 ratio（如 44 手 ×4 = 176 手），导致二次放大重复开仓。
+                # 此时直接跳过本轮，等下一轮 hold-std 刷新后重试。
+                if os.path.exists(self.hold_std_path):
+                    self.print(
+                        "[错误] hold-std 文件存在但解析失败（疑似并发写入中），"
+                        "跳过本轮同步，避免用跟单账户自身持仓覆盖标准仓"
+                    )
+                    return False
+                # 文件确实不存在 → 真正的首次建仓 bootstrap（账户 0 持仓时按标准仓跟单建仓）
                 initial_path = os.path.join(PROJECT_ROOT, "data", "initial_positions.json")
                 if os.path.exists(initial_path):
                     try:

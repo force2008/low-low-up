@@ -285,8 +285,22 @@ def generate_hold_std(account=None, output_path=None):
 
     if output_path is None:
         output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hold-std.json')
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(rows, f, ensure_ascii=False, indent=2)
+    # 原子写入（临时文件 + os.replace）：避免同步线程在覆盖写过程中读到空/半写文件，
+    # 从而误判「加载失败」并走危险回退（用跟单账户自身持仓覆盖标准仓 → 二次放大开仓）。
+    tmp_path = f"{output_path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
     print(f"标准持仓文件已写入: {output_path}（共 {len(rows)} 条）")
 
     return True
