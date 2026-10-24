@@ -135,7 +135,8 @@ def _should_keep_pending_order(
     """判断一条 CTP 在途委托在 sync 入口阶段是否跳过撤销。
 
     返回 (keep=True 不撤, 原因字符串)。
-    仅在"passive_mode 开仓挂单 且 挂单时长 < passive_wait 且 非 exclude/清仓/非被动"情况下保留；其他一律可撤。
+    passive 模式下，开仓/平仓挂单统一按「挂单时长 < passive_wait」保留（与监控线程
+    _check_and_replace_pending_orders 的被动分支保持一致）；超过 wait 或非 passive 模式一律可撤。
     """
     use_passive = bool(getattr(self, '_passive_mode', False))
     wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
@@ -145,14 +146,16 @@ def _should_keep_pending_order(
         chr(tdapi.THOST_FTDC_OF_Open) if isinstance(tdapi.THOST_FTDC_OF_Open, int) else "",
         "0",
     )
-    # 只有 passive 模式的开仓挂单才享受"挂单保留"；平仓/清仓/exclude 场景按旧逻辑优先撤
-    if not (use_passive and is_open):
-        return False, "not-passive-open"
+    offset_label = "开仓" if is_open else "平仓"
+    # passive 模式下开仓/平仓挂单都要保留：若只保留开仓而撤平仓，同步入口每轮都会把
+    # 排队中的平仓限价单撤掉重挂，单子永远排在队尾、等不到成交（复现：20424 平仓挂单 16s 即被撤）
+    if not use_passive:
+        return False, "not-passive-mode"
 
     elapsed = _ctp_order_elapsed_seconds(o, time.time())
     if elapsed < wait_s:
-        return True, f"passive-open keep ({elapsed:.0f}s < {wait_s}s, cooldown={SYNC_COOLDOWN}s)"
-    return False, f"passive-open expired ({elapsed:.0f}s >= {wait_s}s)"
+        return True, f"passive-{offset_label} keep ({elapsed:.0f}s < {wait_s}s, cooldown={SYNC_COOLDOWN}s)"
+    return False, f"passive-{offset_label} expired ({elapsed:.0f}s >= {wait_s}s)"
 
 
 def _calc_limit_price(
@@ -884,7 +887,7 @@ class PositionSyncManagerSync:
                         if self.cancel_order(order_ref):
                             cancel_success += 1
                     time.sleep(0.15)
-                self.print(f"[撤销] 已撤销 {cancel_success}/{len(cancelled_ctp)} 条委托（保留 {len(kept_orders)} 条 passive 开仓挂单）")
+                self.print(f"[撤销] 已撤销 {cancel_success}/{len(cancelled_ctp)} 条委托（保留 {len(kept_orders)} 条 passive 挂单）")
                 if cancelled_ctp:
                     raw_wait = min(max(0.3, 0.3 * len(cancelled_ctp)), 1.6)
                     wait_s = raw_wait * (0.7 if _hold_changed else 1.0)
@@ -2081,6 +2084,41 @@ class PositionSyncManagerSync:
                 # 如果有多头超额（需要平多），先撤销所有空头委托
                 # 如果有空头超额（需要平空），先撤销所有多头委托
                 opposite_dir = "sell" if pos_dir == 2 else "buy"
+
+                # ========== 🛡️ passive 平仓挂单未到期：本轮不撤不重挂，等待成交或超时重挂 ==========
+                # 与监控线程 _check_and_replace_pending_orders 的被动分支保持一致：
+                # passive 模式下未到 passive_wait_seconds 的委托（含平仓）一律保留。
+                # 否则 15 秒巡检每轮触发同步都会撤掉排队中的平仓限价单再重挂，永远排在队尾、无法成交。
+                _wk_pk = int(getattr(self, '_passive_wait_seconds', 300) or 300)
+                if _wk_pk < 10:
+                    _wk_pk = 300
+                _now_pk = time.time()
+                _kept_passive_close = []
+                with self._order_lock:
+                    for _r, _oi in self._orders.items():
+                        try:
+                            if not self._is_order_pending(_oi):
+                                continue
+                            if not bool(_oi.get("is_passive_mode", False)):
+                                continue
+                            if str(_oi.get("instr", "")).upper() != contract.upper():
+                                continue
+                            if str(_oi.get("direction", "")) != opposite_dir:
+                                continue
+                            _st = float(_oi.get("submit_time", 0) or 0)
+                            _el = (_now_pk - _st) if _st > 0 else 0.0
+                            if _el < _wk_pk:
+                                _kept_passive_close.append(f"{_r}({int(_el)}s<{_wk_pk}s)")
+                        except Exception:
+                            continue
+                if _kept_passive_close:
+                    _sk_reason = (f"存在 passive 平仓挂单未到期，等待成交或超时重挂（"
+                                  f"{', '.join(_kept_passive_close)}）")
+                    self.print(f"[平-passive-等待] {contract} {'多' if pos_dir==2 else '空'} {eo_volume}手: {_sk_reason}")
+                    skip_close[0] += 1
+                    time.sleep(0.2)
+                    continue
+                # ========== passive 平仓等待结束 ==========
 
                 # 检查该合约是否之前被 1009 拒绝过（冷却机制）
                 current_time = time.time()
