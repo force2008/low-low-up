@@ -209,8 +209,8 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._is_first_run: bool = True
 
         # B1/B2 脏空拦截连续计数：冷启动场景（actual=0, target>0）下，
-        # 前 3 轮拦截防脏空，第 4 轮放行使其能真正开始同步（避免永远被拦）。
-        # passive 模式下有在途开仓挂单时直接放行，不等 3 轮。
+        # 前 2 轮拦截防脏空，第 3 轮放行使其能真正开始同步（避免冷启动建仓比源账户慢 30s+）。
+        # passive 模式下有在途开仓挂单时直接放行，不等 2 轮。
         self._consecutive_b1b2_blocks: int = 0
 
         # ---------- 持仓实际聚合历史快照环形缓存（F 总闸脏空兜底 + 真清仓放行）----------

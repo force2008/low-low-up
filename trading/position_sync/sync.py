@@ -252,8 +252,8 @@ class PositionSyncManagerSync:
 
         放行规则（避免冷启动/passive 模式下永远被拦）：
           1) passive_mode=True 且 has_pending_open_orders=True → 直接放行（在途挂单排队中）；
-          2) 连续命中 B1/B2 达 3 次后，第 4 次放行（冷启动场景：源有仓、跟单空仓，
-             前 3 轮防脏空兜底，第 4 轮必须让同步真正执行，否则永远追不上标准仓）。
+          2) 连续命中 B1/B2 达 2 次后，第 3 次放行（冷启动场景：源有仓、跟单空仓，
+             前 2 轮防脏空兜底，第 3 轮必须让同步真正执行，否则冷启动建仓比源账户慢 30s+）。
         """
         _env = str(getattr(self, '_env_name', '') or '').strip() or None
         _uid = str(getattr(self, '_user_id', '') or '').strip() or None
@@ -308,14 +308,14 @@ class PositionSyncManagerSync:
                 self._consecutive_b1b2_blocks = 0
             return True
 
-        # 规则 2：连续命中 B1/B2 达 3 次后，第 4 次放行（冷启动场景）
+        # 规则 2：连续命中 B1/B2 达 2 次后，第 3 次放行（冷启动场景）
         _cur_blocks = int(getattr(self, '_consecutive_b1b2_blocks', 0) or 0)
         _cur_blocks += 1
         try:
             object.__setattr__(self, '_consecutive_b1b2_blocks', _cur_blocks)
         except Exception:
             self._consecutive_b1b2_blocks = _cur_blocks
-        if _cur_blocks > 3:
+        if _cur_blocks > 2:
             _env_c = str(getattr(self, '_env_name', '') or '').strip() or None
             _uid_c = str(getattr(self, '_user_id', '') or '').strip() or None
             _bid_c = str(getattr(self, '_broker_id', '') or '').strip() or None
@@ -353,7 +353,7 @@ class PositionSyncManagerSync:
             f"  标准仓合约数={n_target_contracts}，标准总仓={total_target_hands}手",
             f"  实际聚合合约数={len(actual_agg or {})}，实际总仓={total_actual_hands}手",
             f"  hold-std写入时刻={hold_tag}",
-            f"  连续拦截计数={_cur_blocks}/3（第4轮将冷启动放行）",
+            f"  连续拦截计数={_cur_blocks}/2（第3轮将冷启动放行）",
             f"  -> 拒绝本轮任何开/平仓，避免用脏数据对齐导致翻倍超仓或平过头。",
         ]
         msg = "\n".join(msg_lines)
