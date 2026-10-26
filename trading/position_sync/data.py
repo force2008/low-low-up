@@ -64,6 +64,27 @@ class PositionSyncManagerData:
             return False
         return product in {str(p).strip().upper() for p in excludes}
 
+    # ------------------------------------------------------------------
+    # 期权合约识别（默认不跟单，目标账户配置 allowOption=1 才跟）
+    # ------------------------------------------------------------------
+    # 识别规则按合约代码形态（大小写不敏感）：
+    #   · DCE/GFEX/CFFEX 带短横：m2601-C-3000 / jd2702-C-3500 / lh2705-P-10400 / IO2603-C-4000
+    #   · CZCE/SHFE/INE 无短横：SR401C6000 / TA601C5000 / cu2601C68000 / rb2601P3800
+    # 说明：instruments.json / main_contracts.json 只收录期货（ProductClass=="1"），
+    #       期权在里面查不到 ProductClass，因此这里只能用合约代码形态兜底识别。
+    _OPTION_CONTRACT_RE = re.compile(r"^[A-Z]{1,6}\d{3,4}(?:-[CP]-\d+|[CP]\d+)$")
+
+    def _is_option_contract(self, instrument_id: str) -> bool:
+        """判断是否期权合约（按合约代码形态，大小写不敏感）。"""
+        s = str(instrument_id or "").strip().upper()
+        if not s:
+            return False
+        return bool(self._OPTION_CONTRACT_RE.match(s))
+
+    def _option_allowed(self) -> bool:
+        """目标账户是否允许跟单期权（配置 allowOption=1 时为 True，默认 False=屏蔽期权）。"""
+        return bool(getattr(self, '_allow_option', False))
+
     def _load_contract_info(self) -> bool:
         """从 main_contracts.json / instruments.json 加载合约信息（交易所、PriceTick、ProductID）"""
         self._contract_info: Dict[str, dict] = {}
@@ -498,6 +519,7 @@ class PositionSyncManagerData:
         raw_result: Dict[Tuple[str, int], int] = {}
         total_original = 0
         excluded_original = 0
+        excluded_option = 0
         hedged_total = 0
         abs_ratio = abs(ratio)
 
@@ -515,6 +537,14 @@ class PositionSyncManagerData:
             if self._is_contract_excluded(contract):
                 excluded_original += volume
                 self.print(f"[exclude] 目标持仓跳过（{contract} 命中排除品种）: {direction_str} {volume}手")
+                continue
+            # 期权默认不跟单（屏蔽源账户期权持仓）；目标账户配置 allowOption=1 才跟
+            if self._is_option_contract(contract) and not self._option_allowed():
+                excluded_option += volume
+                self.print(
+                    f"[option] 目标持仓跳过（{contract} 为期权合约，默认不跟单；"
+                    f"如需跟单请在该目标账户配置 allowOption=1）: {direction_str} {volume}手"
+                )
                 continue
             if direction_str in ("买", "多头", "多", "Buy", "BUY", "buy", "B"):
                 src_direction = 2
@@ -612,12 +642,14 @@ class PositionSyncManagerData:
         total_final = sum(final_result.values())
         if ratio < 0:
             base_mode_msg = (
-                f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
+                f"[模式-对冲(×{abs_ratio})] 原始source持仓: {total_original} 手（已排除品种占 {excluded_original} 手, "
+                f"已屏蔽期权占 {excluded_option} 手）, "
                 f"对冲后未过滤={total_scaled_raw} 手"
             )
         else:
             base_mode_msg = (
-                f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手）, "
+                f"[比例] 原始目标持仓: {total_original} 手（已排除品种占 {excluded_original} 手, "
+                f"已屏蔽期权占 {excluded_option} 手）, "
                 f"缩放后未过滤={total_scaled_raw} 手 (ratio={ratio})"
             )
         self.print(base_mode_msg)
@@ -650,13 +682,21 @@ class PositionSyncManagerData:
             这 5 手会保留在 actual dict 中参与对比；而 _parse_hold_std 对 exclude 品种
             的目标持仓强制为 0（不跟开）→ 对比结果为 "超额 5 手" → 走平仓分支平掉。
           - 平掉之后：目标=0、实际=0，后续永不复开；源侧再怎么开 exclude 品种也不会跟开。
+
+        期权（默认屏蔽）：与 exclude 不同，这里对期权做「双端跳过」——实际持仓里的期权也
+        不参与对比，既不跟开、也不会被当成「超额」触发平仓，完全交给用户手工管理。
         """
         result: Dict[Tuple[str, int], int] = {}
         excluded_actual = 0  # 仅用于日志统计：命中 exclude 的实际持仓合计（这些仓位仍参与对齐，用于触发退出平仓）
+        option_actual = 0    # 仅用于日志统计：被屏蔽的期权实际持仓合计（不参与对齐）
+        option_allowed = self._option_allowed()
         for pos in self._actual_positions:
             contract = self._standardize_contract(pos["InstrumentID"])
             volume = int(pos.get("Position", 0) or 0)
             if volume <= 0:
+                continue
+            if (not option_allowed) and self._is_option_contract(contract):
+                option_actual += volume
                 continue
             key = (contract, pos["PosiDirection"])
             result[key] = result.get(key, 0) + volume
@@ -666,6 +706,11 @@ class PositionSyncManagerData:
             self.print(
                 f"[exclude] 检测到排除品种仍有实际持仓共 {excluded_actual} 手，"
                 f"将作为「超额」参与对齐（优先平仓退出，后续永不复开）"
+            )
+        if option_actual > 0:
+            self.print(
+                f"[option] 检测到期权实际持仓共 {option_actual} 手，已屏蔽（不跟开也不平仓，"
+                f"如需跟单请配置 allowOption=1）"
             )
         return result
 

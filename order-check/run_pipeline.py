@@ -888,6 +888,35 @@ def _get_target_passive_config(target: dict) -> Tuple[bool, int]:
     return passive_mode, wait_seconds
 
 
+def _get_target_allow_option(target: dict) -> bool:
+    """获取目标账户的「期权跟单开关」。
+
+    支持字段：allowOption / allow_option（布尔、0/1、或 "1"/"true"/"on"/"yes" 字符串）。
+    未配置时回退默认 False —— 源账户的期权持仓不跟单（也不参与实际持仓对齐）。
+    """
+    raw = None
+    for key in ("allowOption", "allow_option"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on", "开启", "启用"):
+        return True
+    if s in ("0", "false", "no", "off", "关闭", "禁用"):
+        return False
+    logger.warning(
+        "[option] 目标账户 %s 的 allowOption=%r 无法识别，按默认 False（屏蔽期权）处理",
+        target.get("user_id", "unknown"), raw,
+    )
+    return False
+
+
 # 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
 _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
@@ -966,17 +995,18 @@ def _reload_account_targets_module():
 def _resolve_latest_target_config(source_account: str, user_id: str):
     """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
 
-    返回 11-tuple:
+    返回 12-tuple:
       (ratio, exclude, allow_level, deny_products, min_qty_hand, min_notional,
-       random_enabled, random_max_ms, passive_mode, passive_wait_seconds, matched_target)
+       random_enabled, random_max_ms, passive_mode, passive_wait_seconds, allow_option,
+       matched_target)
     找不到匹配条目时 -> 返回全 None，调用方沿用旧值。
     """
     targets_cfg = _reload_account_targets_module()
     if not targets_cfg or not source_account or not user_id:
-        return None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None
     target_list = targets_cfg.get(source_account) or []
     if not isinstance(target_list, (list, tuple)):
-        return None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None
     matched = None
     for t in target_list:
         if not isinstance(t, dict):
@@ -985,7 +1015,7 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
             matched = t
             break
     if matched is None:
-        return None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None
     ratio = _get_target_ratio(matched)
     exclude = _get_target_exclude(matched)
     allow_level = _get_target_allow_contract_level(matched)
@@ -994,8 +1024,10 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
     min_not = _get_target_min_notional(matched)
     rnd_enabled, rnd_max_ms = _get_random_delay_config(matched)
     passive_mode, passive_wait_sec = _get_target_passive_config(matched)
+    allow_option = _get_target_allow_option(matched)
     return (ratio, exclude, allow_level, deny, min_qty, min_not,
-            rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, matched)
+            rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
+            matched)
 
 
 # ==================== 线程间通信 ====================
@@ -1192,7 +1224,7 @@ def force_sync():
         import compare_orders
         from trading.position_sync.position_sync_manager import run_position_sync
 
-        # 构造任务列表：[(source_account, hold_std_path, ratio, env_label, conf, user_id)]
+        # 构造任务列表：[(source_account, hold_std_path, ratio, env_label, conf, user_id, allow_option)]
         sync_tasks = []
 
         if ACCOUNT_TARGETS:
@@ -1214,8 +1246,9 @@ def force_sync():
                     env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
                     conf = build_target_conf(target)
                     ratio = _get_target_ratio(target)
+                    allow_option = _get_target_allow_option(target)
                     sync_tasks.append((
-                        source_account, hold_std_path, ratio, env_label, conf, user_id,
+                        source_account, hold_std_path, ratio, env_label, conf, user_id, allow_option,
                     ))
         else:
             # ========= 回退：旧单账户模式 =========
@@ -1223,7 +1256,7 @@ def force_sync():
             gen_ok = compare_orders.generate_hold_std(account=ACCOUNT)
             if gen_ok and os.path.exists(hold_std_path):
                 sync_tasks.append((
-                    "default", hold_std_path, POSITION_RATIO, _CTP_ENV_NAME, None, "default",
+                    "default", hold_std_path, POSITION_RATIO, _CTP_ENV_NAME, None, "default", False,
                 ))
             else:
                 logger.warning("[强制同步] 生成 hold-std.json 失败")
@@ -1235,7 +1268,7 @@ def force_sync():
 
         all_ok = True
         total = len(sync_tasks)
-        for idx, (src_account, hold_std_path, ratio, env_label, conf, user_id) in enumerate(sync_tasks):
+        for idx, (src_account, hold_std_path, ratio, env_label, conf, user_id, allow_option) in enumerate(sync_tasks):
             logger.info("[强制同步] (%d/%d) 开始: %s -> %s", idx + 1, total, src_account, user_id)
             _skip_time_f = bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN) or (str(env_label).lower() in ("simu", "7x24"))
             sync_ok = run_position_sync(
@@ -1247,6 +1280,7 @@ def force_sync():
                 env_name=env_label,
                 logger=logger,
                 position_ratio=ratio,
+                allow_option=allow_option,
                 skip_trading_time_check=_skip_time_f,
             )
             if not sync_ok:
@@ -1638,14 +1672,15 @@ def main():
                 min_notional = _get_target_min_notional(target)
                 rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
                 passive_mode, passive_wait_sec = _get_target_passive_config(target)
+                allow_option = _get_target_allow_option(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
                 logger.info(
                     "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
                     "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
-                    "random_delay=%s@%sms, passive=%s@%ss)",
+                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s)",
                     source_account, user_id, ratio, exclude or '[]',
                     sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
-                    rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec,
+                    rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
                 )
             else:
                 # 回退到默认单账户模式
@@ -1660,6 +1695,7 @@ def main():
                 min_notional = None
                 rnd_enabled, rnd_max_ms = RANDOM_ORDER_DELAY_ENABLED, RANDOM_ORDER_DELAY_MAX_MS
                 passive_mode, passive_wait_sec = PASSIVE_MODE_DEFAULT, PASSIVE_WAIT_SECONDS_DEFAULT
+                allow_option = False
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
@@ -1686,6 +1722,7 @@ def main():
                 random_delay_max_ms=rnd_max_ms,
                 passive_mode=passive_mode,
                 passive_wait_seconds=passive_wait_sec,
+                allow_option=allow_option,
                 main_by_product_path=os.path.join(
                     PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
                 ),

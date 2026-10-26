@@ -85,6 +85,8 @@ def run_position_sync(
     main_by_product_path: str = None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）
+    allow_option: bool = False,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
 ) -> bool:
@@ -120,6 +122,7 @@ def run_position_sync(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
         )
         if logger:
@@ -169,6 +172,9 @@ def run_position_sync_loop(
     runtime_config_resolver=None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）；
+    # 目标账户配置 allowOption=1 时为 True，期权按普通合约跟单。
+    allow_option: bool = False,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
     # 【启动时首轮同步延迟】进程起来后，等多少秒再做首次 sync_and_trade（防止CTP登录还没完成就查仓超时）
@@ -212,9 +218,10 @@ def run_position_sync_loop(
         passive_wait_seconds: 被动模式下的排队等待窗口秒数（默认300=5分钟）
         source_account: 源账号，用于热加载定位
         target_user_id: 目标账号，用于热加载定位
-        runtime_config_resolver: callable(source, user) -> 11-tuple
+        runtime_config_resolver: callable(source, user) -> 12-tuple
                                  (ratio, exclude, allow_level, deny, min_qty, min_notional,
-                                  rnd_enabled, rnd_max_ms, passive_mode, passive_wait_seconds, matched_target)
+                                  rnd_enabled, rnd_max_ms, passive_mode, passive_wait_seconds,
+                                  allow_option, matched_target)
                                  返回 None 表示保持当前值不变。
     Returns:
         bool: 是否正常结束
@@ -250,6 +257,7 @@ def run_position_sync_loop(
             _log(f"  min_notional={min_notional}")
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
+        _log(f"  allow_option={allow_option}（{'跟单期权' if allow_option else '默认屏蔽源账户期权持仓'}）")
         _log(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式=True，非开盘时间仍允许对齐和提交委托）")
         try:
             _first_d_s = int(first_sync_delay_seconds or 0)
@@ -287,6 +295,7 @@ def run_position_sync_loop(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
         )
         if logger:
@@ -365,14 +374,15 @@ def run_position_sync_loop(
                     _last_reload_ts = _now
                     try:
                         _rr = runtime_config_resolver(source_account, target_user_id)
-                        # 解析函数返回 11-tuple (ratio, exclude, allow_level, deny,
+                        # 解析函数返回 12-tuple (ratio, exclude, allow_level, deny,
                         #                      min_qty, min_notional, rnd_enabled, rnd_max_ms,
-                        #                      passive_mode, passive_wait_seconds, matched)
+                        #                      passive_mode, passive_wait_seconds, allow_option, matched)
                         # 任一值为 None 表示保持当前值不变
-                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 11:
+                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 12:
                             (new_ratio, new_exclude, new_allow_level, new_deny,
                              new_min_qty, new_min_not, new_rnd_en, new_rnd_ms,
-                             new_passive_mode, new_passive_wait_sec, _matched) = _rr
+                             new_passive_mode, new_passive_wait_sec,
+                             new_allow_option, _matched) = _rr
                             try:
                                 mgr.apply_runtime_target_config(
                                     position_ratio=new_ratio,
@@ -385,6 +395,7 @@ def run_position_sync_loop(
                                     random_delay_max_ms=new_rnd_ms,
                                     passive_mode=new_passive_mode,
                                     passive_wait_seconds=new_passive_wait_sec,
+                                    allow_option=new_allow_option,
                                 )
                             except Exception as _ae:
                                 _log(f"[热更新] 应用配置异常: {_ae}")

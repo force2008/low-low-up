@@ -66,6 +66,10 @@ class PositionSyncManagerBase(CTdSpiBase):
         #                            exclude 退出平仓 / ratio==0 的全仓清仓 不受 passive 影响，仍按各自策略走。
         passive_mode: bool = False,
         passive_wait_seconds: int = 300,
+        # ---- 期权跟单开关（默认 False=屏蔽源账户的期权持仓，不跟单）----
+        # False：源账户的期权持仓既不跟开、也不参与实际持仓对齐（完全交给用户手工管理）；
+        # True ：目标账户配置 allowOption=1 时打开，按普通合约一样跟单期权。
+        allow_option: bool = False,
         # ---- 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式下为 True）----
         # 为 True 时：_do_sync 和 _check_position_diff 不再调用 get_contracts_trading_status 过滤，
         # 非开盘时间（周末/节假日/夜间非连续交易段）也能正常对齐和提交委托，专供测试/仿真环境使用。
@@ -164,6 +168,11 @@ class PositionSyncManagerBase(CTdSpiBase):
             self._passive_wait_seconds = 300
         if self._passive_wait_seconds < 10:
             self._passive_wait_seconds = 300
+
+        # ------------------------------------------------------------------
+        # 8.1) 期权跟单开关（默认 False=屏蔽源账户期权持仓）
+        # ------------------------------------------------------------------
+        self._allow_option: bool = bool(allow_option)
 
         # ------------------------------------------------------------------
         # 9) 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式）
@@ -319,6 +328,10 @@ class PositionSyncManagerBase(CTdSpiBase):
         if self._min_notional:
             self.print(f"[配置] 单合约最低成交额: {self._min_notional:,.0f} 元（低于则跳过）")
         self.print(f"[配置] 下单随机延迟: {self._random_delay_enabled}（最大 {self._random_delay_max_ms} ms）")
+        if self._allow_option:
+            self.print("[配置] 期权跟单: 开启（allowOption=1，期权持仓按普通合约跟单）")
+        else:
+            self.print("[配置] 期权跟单: 关闭（源账户期权持仓不跟单，实际持仓里的期权也不参与对齐）")
 
         # 自动撤单重挂监控（未成交开仓委托超时后自动撤单并用最新对手价重挂）
         # 注意：必须在 super().__init__ 之后调用，因为后者会阻塞直到登录成功
@@ -368,6 +381,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         random_delay_max_ms=None,
         passive_mode=None,
         passive_wait_seconds=None,
+        allow_option=None,
     ) -> dict:
         """运行时动态刷新 target 配置。
 
@@ -391,6 +405,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         old_rnd_ms = int(self._random_delay_max_ms)
         old_passive_mode = bool(getattr(self, '_passive_mode', False))
         old_passive_wait = int(getattr(self, '_passive_wait_seconds', 300))
+        old_allow_option = bool(getattr(self, '_allow_option', False))
 
         ratio_status = 'kept'
         exclude_status = 'kept'
@@ -402,6 +417,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         rnd_ms_status = 'kept'
         passive_mode_status = 'kept'
         passive_wait_status = 'kept'
+        allow_option_status = 'kept'
 
         # -------- 1. ratio --------
         if position_ratio is not None:
@@ -575,10 +591,32 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self._passive_wait_seconds = v2
                 passive_wait_status = 'changed'
 
+        # -------- 11. allow_option（期权跟单开关）--------
+        if allow_option is not None:
+            if isinstance(allow_option, bool):
+                v = allow_option
+            elif isinstance(allow_option, (int, float)):
+                v = bool(allow_option)
+            elif isinstance(allow_option, str):
+                s = allow_option.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    v = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    v = False
+                else:
+                    v = old_allow_option
+            else:
+                v = old_allow_option
+            if v == old_allow_option:
+                allow_option_status = 'unchanged'
+            else:
+                self._allow_option = v
+                allow_option_status = 'changed'
+
         changed_lst = [s for s in (
             ratio_status, exclude_status, allow_status, deny_status,
             min_qty_status, min_not_status, rnd_en_status, rnd_ms_status,
-            passive_mode_status, passive_wait_status,
+            passive_mode_status, passive_wait_status, allow_option_status,
         ) if s == 'changed']
         changed = len(changed_lst) > 0
         if changed:
@@ -593,6 +631,7 @@ class PositionSyncManagerBase(CTdSpiBase):
                 f"rnd_ms {old_rnd_ms}->{self._random_delay_max_ms} ({rnd_ms_status})",
                 f"passive_mode {old_passive_mode}->{getattr(self, '_passive_mode', False)} ({passive_mode_status})",
                 f"passive_wait {old_passive_wait}->{getattr(self, '_passive_wait_seconds', 300)} ({passive_wait_status})",
+                f"allow_option {old_allow_option}->{getattr(self, '_allow_option', False)} ({allow_option_status})",
             ]
             changed_lines = [ln for ln in lines if '(changed)' in ln]
             self.print(
@@ -611,6 +650,7 @@ class PositionSyncManagerBase(CTdSpiBase):
             'rnd_ms': (self._random_delay_max_ms, old_rnd_ms, rnd_ms_status),
             'passive_mode': (getattr(self, '_passive_mode', False), old_passive_mode, passive_mode_status),
             'passive_wait': (getattr(self, '_passive_wait_seconds', 300), old_passive_wait, passive_wait_status),
+            'allow_option': (getattr(self, '_allow_option', False), old_allow_option, allow_option_status),
         }
 
     def _notify_async(self, text: str):
