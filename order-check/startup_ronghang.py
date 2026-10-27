@@ -11,6 +11,39 @@
 import os
 import sys
 import time
+import logging
+from logging.handlers import RotatingFileHandler
+
+# ============================================================
+# 日志配置：控制台 + 日志文件双输出（风格对齐 account_monitor.py）
+# 无人值守启动失败时，可事后到 logs/startup_ronghang/ 下查看完整日志
+# ============================================================
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "startup_ronghang")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "startup_ronghang.log")
+
+logger = logging.getLogger("startup_ronghang")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+    _ch = logging.StreamHandler(sys.stdout)
+    _ch.setFormatter(_fmt)
+    _ch.setLevel(logging.INFO)
+    logger.addHandler(_ch)
+
+
+def print(*args, **kwargs):  # noqa: A001  覆盖内置 print：让脚本里原有的 print 全部落盘
+    """统一转发到 logger：控制台 + 日志文件都能看到，且带时间戳。"""
+    sep = kwargs.get("sep", " ")
+    try:
+        msg = sep.join(str(a) for a in args)
+    except Exception:
+        msg = sep.join(repr(a) for a in args)
+    logger.info(msg)
+
 
 try:
     import pyautogui
@@ -189,12 +222,98 @@ def _close_login_window(login_win):
     return closed
 
 
+def _show_desktop(settle=1.2):
+    """
+    清理桌面：最小化所有已打开的窗口，露出桌面（等价于手动按 Win+D）。
+
+    为什么需要：Windows 重启后常有应用（浏览器等）自启动，其窗口会盖住桌面/登录窗口。
+    此时不论「按坐标双击桌面图标」还是「按坐标点登录窗口的密码框/确定」，都可能点到
+    被遮盖的那个窗口上，导致融航风控端看起来没被启动/登录成功。
+
+    实现优先级（任一成功即视为已清理）：
+      1) ctypes 枚举所有可见顶层窗口，逐个 SW_MINIMIZE —— 非 toggle、确定性最强，
+         不依赖热键投递，云主机/远程桌面下比 Win+D 稳；
+      2) 仅当 ctypes 不可用时，退回 pyautogui Win+D 热键（注意它是 toggle，故尽量不用）。
+    返回是否至少执行了一种清理方式。
+    """
+    print("  [清理桌面] 最小化所有窗口，露出桌面 ...")
+    minimized = 0
+    ctypes_ok = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        SW_MINIMIZE = 6
+        # 桌面/任务栏等 shell 窗口不能最小化，否则会出怪相
+        skip_classes = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [enum_proc_type, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClassNameW.restype = ctypes.c_int
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+
+        hwnds = []
+
+        def _collect(hwnd, lparam):
+            hwnds.append(hwnd)
+            return True
+
+        _cb = enum_proc_type(_collect)
+        user32.EnumWindows(_cb, 0)
+        for hwnd in hwnds:
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    continue
+                cls_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls_buf, 256)
+                if cls_buf.value in skip_classes:
+                    continue
+                # 无标题的多是不可见的辅助/隐藏窗口，跳过更安全
+                if user32.GetWindowTextLengthW(hwnd) == 0:
+                    continue
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
+                minimized += 1
+            except Exception:
+                continue
+        ctypes_ok = True
+    except Exception as e:
+        print(f"  [清理桌面] ctypes 最小化失败(非致命): {e}")
+
+    if ctypes_ok:
+        print(f"  [清理桌面] 已最小化 {minimized} 个窗口")
+        ok = True
+    else:
+        # 兜底：Win+D 热键（只有在 ctypes 完全不可用时才用，避免 toggle 把刚最小化的又还原）
+        try:
+            pyautogui.hotkey("win", "d")
+            print("  [清理桌面] 已发送 Win+D 热键")
+            ok = True
+        except Exception as e:
+            print(f"  [清理桌面] Win+D 失败: {e}")
+            ok = False
+
+    time.sleep(settle)
+    return ok
+
+
 def _launch_program():
     """
     启动融航风控端。
     关键：必须把「工作目录」切换到 exe 所在目录后再启动，否则软件会读取脚本运行目录下的配置，
     导致用户名/参数等一切都不对（例如出现用户名是 123）。
     """
+    # 先清理桌面：重启后若有浏览器等应用自启动盖住桌面，会导致登录窗口开到其后面、
+    # 或按坐标点到被遮盖的窗口上 → 风控端看起来「没启动成功」。启动前先露出桌面。
+    _show_desktop()
+
     if PROGRAM_EXE_PATH and os.path.exists(PROGRAM_EXE_PATH):
         exe_dir = os.path.dirname(os.path.abspath(PROGRAM_EXE_PATH))
         print(f"[启动] 切换工作目录到: {exe_dir}")
@@ -221,8 +340,9 @@ def _launch_program():
     if DESKTOP_ICON_COORDS and DESKTOP_ICON_COORDS != (0, 0):
         print(f"[启动] 尝试双击桌面图标 {DESKTOP_ICON_COORDS}")
         try:
-            pyautogui.hotkey("win", "d")
-            time.sleep(1.2)
+            # 双击前先清理桌面：桌面图标坐标一旦被浏览器等窗口盖住，双击就会点到那个窗口上，
+            # 风控端根本没被启动。这里用 _show_desktop() 露出桌面后再双击图标。
+            _show_desktop()
             pyautogui.doubleClick(*DESKTOP_ICON_COORDS)
             return True
         except Exception as e:
@@ -346,6 +466,7 @@ def main():
     print("=" * 50)
     print(f"  程序路径  : {PROGRAM_EXE_PATH}")
     print(f"  窗口关键字: {LOGIN_WINDOW_TITLE_KEYWORD}")
+    print(f"  日志文件  : {LOG_FILE}")
     print(f"  密码框坐标: {PASSWORD_INPUT_COORDS}")
     print(f"  确定按钮  : {CONFIRM_BUTTON_COORDS}")
     print(f"  关闭按钮× : {CLOSE_BUTTON_COORDS}"
@@ -489,3 +610,7 @@ if __name__ == "__main__":
     except pyautogui.FailSafeException:
         print("\n检测到 pyautogui FAILSAFE（鼠标撞到屏幕左上角），已紧急中止")
         sys.exit(130)
+    except Exception as e:
+        # 未捕获异常也写进日志（含堆栈），方便事后排查无人值守时的启动失败
+        logger.exception("未捕获异常，程序异常退出: %s", e)
+        sys.exit(1)
