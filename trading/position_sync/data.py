@@ -699,8 +699,12 @@ class PositionSyncManagerData:
             )
         return final_result
 
-    def _aggregate_actual_positions(self) -> Dict[Tuple[str, int], int]:
+    def _aggregate_actual_positions(self, positions: Optional[List[dict]] = None) -> Dict[Tuple[str, int], int]:
         """聚合 CTP 实际持仓。
+
+        positions：传入「本次查仓返回的局部快照」时，直接聚合该快照，保证聚合源与
+        本次查询结果严格一致（不受并发查仓发布的新快照影响）；传 None 时回退读
+        self._actual_positions（最近一次成功查仓发布的整份快照）。
 
         语义变更（2026-09-14 起）：
           - exclude 品种 **不再从实际持仓侧剔除**。
@@ -716,7 +720,8 @@ class PositionSyncManagerData:
         excluded_actual = 0  # 仅用于日志统计：命中 exclude 的实际持仓合计（这些仓位仍参与对齐，用于触发退出平仓）
         option_actual = 0    # 仅用于日志统计：被屏蔽的期权实际持仓合计（不参与对齐）
         option_allowed = self._option_allowed()
-        for pos in self._actual_positions:
+        _src = positions if positions is not None else getattr(self, '_actual_positions', [])
+        for pos in _src:
             contract = self._standardize_contract(pos["InstrumentID"])
             volume = int(pos.get("Position", 0) or 0)
             if volume <= 0:

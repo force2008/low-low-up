@@ -705,7 +705,7 @@ class PositionSyncManagerOrderOps:
             return
 
         self._actual_positions = positions
-        actual_agg = self._aggregate_actual_positions()
+        actual_agg = self._aggregate_actual_positions(positions)
         target = self._parse_hold_std()
 
         # 计算缺额合约

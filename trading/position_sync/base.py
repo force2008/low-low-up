@@ -189,7 +189,11 @@ class PositionSyncManagerBase(CTdSpiBase):
         self.env_name = env_name
 
         self._hold_std: List[dict] = []
+        # 已发布的「最近一次成功查仓」快照（只读读者用它，永不出现「查询中途被清空」的窗口）
         self._actual_positions: List[dict] = []
+        # 当前在途查询的局部收集缓冲：回调只写这里，查询成功后原子发布到 _actual_positions。
+        # 这样并发查询（15s 巡检 + 异步 5s hold 更新）不会互相清空对方正在读取的数据源。
+        self._pos_query_buf: List[dict] = []
         self._pos_query_event = threading.Event()
 
         # 订单追踪
@@ -1092,7 +1096,11 @@ class PositionSyncManagerBase(CTdSpiBase):
                     _sp = _sv(getattr(pInvestorPosition, "SettlementPrice", 0))
                     _psp = _sv(getattr(pInvestorPosition, "PreSettlementPrice", 0))
                     _op = _sv(getattr(pInvestorPosition, "OpenPrice", 0))
-                    self._actual_positions.append({
+                    _buf = getattr(self, '_pos_query_buf', None)
+                    if _buf is None:
+                        _buf = []
+                        self._pos_query_buf = _buf
+                    _buf.append({
                         "InstrumentID": inst_id_raw.upper(),
                         "PosiDirection": posi_dir_val,
                         "Position": pInvestorPosition.Position,
@@ -2180,8 +2188,9 @@ class PositionSyncManagerBase(CTdSpiBase):
             ctp_orders = ctp_orders or []
             pending_map = self._build_pending_map(ctp_orders)
 
-            # 聚合持仓
-            actual_agg = self._aggregate_actual_positions()
+            # 聚合持仓（传入本次查仓返回的快照，保证聚合源与本次查询严格一致；
+            #  positions 为 None 的超时兜底分支会自动读 _fallback 还原后的 self._actual_positions）
+            actual_agg = self._aggregate_actual_positions(positions)
             target = self._parse_hold_std()
 
             # 计算有效持仓 = 实际持仓 + 在途开仓委托
