@@ -937,8 +937,9 @@ class PositionSyncManagerSync:
             t_4_done = time.time()
             self.print(f"[同步耗时] 步骤4(加载标准持仓): {(t_4_done - t_phase)*1000:.0f}ms"); t_phase = t_4_done
 
-            # 5. 聚合持仓
-            actual_agg = self._aggregate_actual_positions()
+            # 5. 聚合持仓（传入本次查仓返回的快照，保证聚合源与本次查询严格一致；
+            #    传 None 的兜底分支会自动读 _fallback 还原后的 self._actual_positions）
+            actual_agg = self._aggregate_actual_positions(positions)
             target = self._parse_hold_std()
             _raw_ratio = float(getattr(self, '_position_ratio', 1.0))
             self._is_liquidate_mode = abs(_raw_ratio) < 1e-9  # 浮点数 0 兼容 0.0/-0.0/非标准极小值
@@ -1393,16 +1394,12 @@ class PositionSyncManagerSync:
                 return False
             actual_agg2 = {}
             try:
-                _saved = getattr(self, '_actual_positions', [])
-                # 临时替换缓存以聚合最新查仓结果
-                object.__setattr__(self, '_actual_positions', re_positions)
-                actual_agg2 = self._aggregate_actual_positions() or {}
-                object.__setattr__(self, '_actual_positions', _saved)
-            except Exception:
-                try:
-                    object.__setattr__(self, '_actual_positions', _saved)
-                except Exception:
-                    pass
+                # 直接聚合重查返回的局部快照，不再临时篡改共享的 self._actual_positions
+                # （篡改窗口会与巡检/查仓并发读取同一份数据，属于同类竞态隐患）
+                actual_agg2 = self._aggregate_actual_positions(re_positions) or {}
+            except Exception as _agg_e:
+                self.print(f"[🔒首仓防御] 重查聚合异常：{_agg_e}，本轮保守弃单")
+                return False
             _total2 = sum(actual_agg2.values())
             _total_orig = sum((actual_agg or {}).values())
             _n2 = len(actual_agg2)

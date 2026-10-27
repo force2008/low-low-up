@@ -308,7 +308,10 @@ class PositionSyncManagerMarket:
         with self._pos_query_lock:
             for attempt in range(retries + 1):
                 self._pos_query_event.clear()
-                self._actual_positions = []
+                # 只清空「本次查询的局部收集缓冲」，绝不在查询中途清空已发布的 self._actual_positions。
+                # 否则并发查仓（如 15s 巡检正在聚合读取时，异步 5s hold 查仓抢锁）会把共享缓冲清空，
+                # 导致巡检读到空快照 → 误报「缺额开仓」。
+                self._pos_query_buf = []
                 req = tdapi.CThostFtdcQryInvestorPositionField()
                 req.BrokerID = self._broker_id
                 req.InvestorID = self._user_id
@@ -316,9 +319,12 @@ class PositionSyncManagerMarket:
                 self._api.ReqQryInvestorPosition(req, 0)
                 ok = self._pos_query_event.wait(timeout=timeout)
                 if ok:
-                    self.print(f"{_prefix} 成功，返回 {len(self._actual_positions)} 条记录 {_acc_tag}".rstrip())
+                    # 原子发布本次查询得到的「完整快照」：读 self._actual_positions 的读者永远拿到一致的整份数据
+                    snapshot = list(self._pos_query_buf)
+                    self._actual_positions = snapshot
+                    self.print(f"{_prefix} 成功，返回 {len(snapshot)} 条记录 {_acc_tag}".rstrip())
                     self._reset_query_health()
-                    return list(self._actual_positions)
+                    return list(snapshot)
                 if attempt < retries:
                     self.print(f"[警告] {_prefix} 持仓查询超时（{timeout}s），第 {attempt + 1} 次重试... {_acc_tag}".rstrip())
                     time.sleep(1)
