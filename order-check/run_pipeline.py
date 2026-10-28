@@ -1224,7 +1224,7 @@ def force_sync():
         import compare_orders
         from trading.position_sync.position_sync_manager import run_position_sync
 
-        # 构造任务列表：[(source_account, hold_std_path, ratio, env_label, conf, user_id, allow_option)]
+        # 构造任务列表（每个任务一个 dict；过滤字段必须与正常同步链路 _run_single_target_sync 完全一致）
         sync_tasks = []
 
         if ACCOUNT_TARGETS:
@@ -1244,20 +1244,52 @@ def force_sync():
                     if not user_id:
                         continue
                     env_label = f"{target.get('env_name', _CTP_ENV_NAME)}_{user_id}"
-                    conf = build_target_conf(target)
-                    ratio = _get_target_ratio(target)
-                    allow_option = _get_target_allow_option(target)
-                    sync_tasks.append((
-                        source_account, hold_std_path, ratio, env_label, conf, user_id, allow_option,
-                    ))
+                    rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
+                    passive_mode, passive_wait_sec = _get_target_passive_config(target)
+                    sync_tasks.append({
+                        "source_account": source_account,
+                        "hold_std_path": hold_std_path,
+                        "ratio": _get_target_ratio(target),
+                        "env_label": env_label,
+                        "conf": build_target_conf(target),
+                        "user_id": user_id,
+                        # 关键：强制对齐必须沿用与正常同步完全相同的过滤条件，
+                        # 否则 exclude / deny / 合约级别 / 最小手数 等过滤会被绕过，
+                        # 导致 exclude 品种在收市前被强行对齐（历史 bug）。
+                        "exclude_products": _get_target_exclude(target),
+                        "allow_contract_level": _get_target_allow_contract_level(target),
+                        "deny_products": _get_target_deny_products(target),
+                        "min_qty_hand": _get_target_min_qty_hand(target),
+                        "min_notional": _get_target_min_notional(target),
+                        "random_delay_enabled": rnd_enabled,
+                        "random_delay_max_ms": rnd_max_ms,
+                        "passive_mode": passive_mode,
+                        "passive_wait_seconds": passive_wait_sec,
+                        "allow_option": _get_target_allow_option(target),
+                    })
         else:
             # ========= 回退：旧单账户模式 =========
             hold_std_path = os.path.join(_CURR_DIR_SYNC, 'hold-std.json')
             gen_ok = compare_orders.generate_hold_std(account=ACCOUNT)
             if gen_ok and os.path.exists(hold_std_path):
-                sync_tasks.append((
-                    "default", hold_std_path, POSITION_RATIO, _CTP_ENV_NAME, None, "default", False,
-                ))
+                sync_tasks.append({
+                    "source_account": "default",
+                    "hold_std_path": hold_std_path,
+                    "ratio": POSITION_RATIO,
+                    "env_label": _CTP_ENV_NAME,
+                    "conf": None,
+                    "user_id": "default",
+                    "exclude_products": [],
+                    "allow_contract_level": set(GLOBAL_ALLOW_CONTRACT_LEVEL),
+                    "deny_products": set(GLOBAL_DENY_PRODUCTS),
+                    "min_qty_hand": None,
+                    "min_notional": None,
+                    "random_delay_enabled": RANDOM_ORDER_DELAY_ENABLED,
+                    "random_delay_max_ms": RANDOM_ORDER_DELAY_MAX_MS,
+                    "passive_mode": PASSIVE_MODE_DEFAULT,
+                    "passive_wait_seconds": PASSIVE_WAIT_SECONDS_DEFAULT,
+                    "allow_option": False,
+                })
             else:
                 logger.warning("[强制同步] 生成 hold-std.json 失败")
 
@@ -1268,19 +1300,40 @@ def force_sync():
 
         all_ok = True
         total = len(sync_tasks)
-        for idx, (src_account, hold_std_path, ratio, env_label, conf, user_id, allow_option) in enumerate(sync_tasks):
-            logger.info("[强制同步] (%d/%d) 开始: %s -> %s", idx + 1, total, src_account, user_id)
+        for idx, task in enumerate(sync_tasks):
+            src_account = task["source_account"]
+            user_id = task["user_id"]
+            env_label = task["env_label"]
+            logger.info("[强制同步] (%d/%d) 开始: %s -> %s (exclude=%s, deny=%s, allow_level=%s)",
+                        idx + 1, total, src_account, user_id,
+                        task["exclude_products"] or '[]',
+                        sorted(task["deny_products"] or []) or '[]',
+                        sorted(task["allow_contract_level"] or []) or '[]')
             _skip_time_f = bool(SKIP_TRADING_TIME_CHECK) or bool(_FORCE_RUN) or (str(env_label).lower() in ("simu", "7x24"))
             sync_ok = run_position_sync(
-                hold_std_path=hold_std_path,
+                hold_std_path=task["hold_std_path"],
                 main_contracts_path=MAIN_CONTRACTS_PATH,
                 trade_volume=1,
                 timeout=120,  # 首次建仓可能需要挂出50+合约的委托
-                conf=conf,
+                conf=task["conf"],
                 env_name=env_label,
                 logger=logger,
-                position_ratio=ratio,
-                allow_option=allow_option,
+                position_ratio=task["ratio"],
+                # 与正常同步链路保持一致：强制对齐只忽略冷却/时段，不绕过任何过滤条件
+                exclude_products=task["exclude_products"],
+                allow_contract_level=task["allow_contract_level"],
+                deny_products=task["deny_products"],
+                big_notional_exemption=BIG_NOTIONAL_EXEMPTION,
+                min_qty_hand=task["min_qty_hand"],
+                min_notional=task["min_notional"],
+                random_delay_enabled=task["random_delay_enabled"],
+                random_delay_max_ms=task["random_delay_max_ms"],
+                passive_mode=task["passive_mode"],
+                passive_wait_seconds=task["passive_wait_seconds"],
+                allow_option=task["allow_option"],
+                main_by_product_path=os.path.join(
+                    PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
+                ),
                 skip_trading_time_check=_skip_time_f,
             )
             if not sync_ok:
