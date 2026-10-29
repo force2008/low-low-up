@@ -206,9 +206,10 @@ class PositionSyncManagerBase(CTdSpiBase):
         self._instrument_exact_case: Dict[str, str] = {}  # UPPER -> exact case
         self._product_exchange_map: Dict[str, str] = {}  # ProductID -> ExchangeID
 
-        # 撤单响应事件
+        # 撤单等待：key = OrderSysID（_cancel_order_by_sysid）或 OrderRef（cancel_order）
+        # _cancel_results[k] = [None|True|False]，与 _cancel_events[k] 配套，避免多线程共用同一槽位互相覆盖
         self._cancel_events: Dict[str, threading.Event] = {}
-        self._cancel_result: Optional[List] = None
+        self._cancel_results: Dict[str, List] = {}
 
         # 说明：
         #  - 历史遗留的"_last_align_time（合约级对齐冷却）"与"_last_full_sync_time（2分钟完整对齐冷却）"
@@ -1231,48 +1232,65 @@ class PositionSyncManagerBase(CTdSpiBase):
     ):
         order_ref_raw = str(pInputOrderAction.OrderRef or "").strip('\x00') if pInputOrderAction else ""
         order_ref = order_ref_raw.strip() if order_ref_raw else ""
+        sys_id_raw = str(getattr(pInputOrderAction, "OrderSysID", "") or "").strip('\x00') if pInputOrderAction else ""
+        sys_id = sys_id_raw.strip() if sys_id_raw else ""
 
-        # 尝试多种方式匹配订单和撤单事件
+        # 撤单请求可能以 OrderRef（cancel_order）或 OrderSysID（_cancel_order_by_sysid）注册等待事件，
+        # 回调里对两者都做匹配：否则 OrderSysID 撤单永远匹配不上，每次都要卡满 3s 超时。
+        cand_keys = []
+        for _k in (
+            order_ref,
+            order_ref_raw,
+            order_ref_raw.lstrip() if order_ref_raw else "",
+            sys_id,
+            sys_id_raw,
+        ):
+            if _k and _k not in cand_keys:
+                cand_keys.append(_k)
+
         cancel_key = None
+        info = None
         with self._order_lock:
-            for key in (order_ref, order_ref_raw, order_ref_raw.lstrip() if order_ref_raw else ""):
-                if key and key in self._cancel_events:
+            for key in cand_keys:
+                if key in self._cancel_events:
                     cancel_key = key
                     break
-            info = None
-            for key in (order_ref, order_ref_raw, order_ref_raw.lstrip() if order_ref_raw else ""):
-                if key and key in self._orders:
+            for key in cand_keys:
+                if key in self._orders:
                     info = self._orders.get(key)
                     break
+            # 兜底：按 OrderSysID 反查本地订单
+            if info is None and sys_id:
+                for _oi in self._orders.values():
+                    if str(_oi.get("sys_id", "")).strip() == sys_id:
+                        info = _oi
+                        break
 
-        if pRspInfo and pRspInfo.ErrorID != 0:
-            display_ref = order_ref if order_ref else "未知"
-            self.print(
-                f"[撤单失败] OrderRef={display_ref} "
-                f"ErrorID={pRspInfo.ErrorID} {pRspInfo.ErrorMsg}"
-            )
-            if info:
-                with self._order_lock:
-                    cancel_result = getattr(self, '_cancel_result', None)
-                    if cancel_result is not None:
-                        cancel_result[0] = False
+        display_ref = order_ref if order_ref else (sys_id if sys_id else "未知")
+        err_id = pRspInfo.ErrorID if pRspInfo else 0
+        # ErrorID=26「完全成交或已经撤单」：该委托已不在途，撤单目标已达成 → 视为撤单完成
+        if err_id != 0 and err_id != 26:
+            self.print(f"[撤单失败] OrderRef={display_ref} ErrorID={err_id} {pRspInfo.ErrorMsg}")
+            ok = False
         else:
-            display_ref = order_ref if order_ref else "未知"
-            self.print(f"[撤单响应] OrderRef={display_ref}")
+            if err_id == 26:
+                self.print(f"[撤单响应] OrderRef={display_ref} ErrorID=26（已成交/已撤单），视为撤单完成")
+            else:
+                self.print(f"[撤单响应] OrderRef={display_ref}")
+            ok = True
             # 撤单成功，更新订单状态为已撤销
             if info:
                 info["status"] = self._OST_CANCELED
                 info["event"].set()
-                with self._order_lock:
-                    cancel_result = getattr(self, '_cancel_result', None)
-                    if cancel_result is not None:
-                        cancel_result[0] = True
 
         with self._order_lock:
             if cancel_key:
-                ev = self._cancel_events.pop(cancel_key, None)
-                if ev:
-                    ev.set()
+                _res = self._cancel_results.get(cancel_key)
+                if _res is not None:
+                    _res[0] = ok
+                _ev = self._cancel_events.pop(cancel_key, None)
+                if _ev:
+                    _ev.set()
 
     # ------------------------------------------------------------------
     # 辅助方法

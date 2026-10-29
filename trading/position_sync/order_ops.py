@@ -329,9 +329,15 @@ class PositionSyncManagerOrderOps:
 
         cancel_event = threading.Event()
         cancel_result = [None]  # None=未返回, True=成功, False=失败
+        cancel_key = matched_ref if matched_ref else order_ref
+        sys_id = str(info.get("sys_id", "")).strip()
         with self._order_lock:
-            self._cancel_events[matched_ref if matched_ref else order_ref] = cancel_event
-            self._cancel_result = cancel_result
+            # 双 key 注册同一事件：撤单响应按 OrderRef 或 OrderSysID 回来都能命中
+            self._cancel_events[cancel_key] = cancel_event
+            self._cancel_results[cancel_key] = cancel_result
+            if sys_id and sys_id != cancel_key:
+                self._cancel_events[sys_id] = cancel_event
+                self._cancel_results[sys_id] = cancel_result
 
         self._api.ReqOrderAction(req, 0)
 
@@ -342,9 +348,17 @@ class PositionSyncManagerOrderOps:
             if cancel_event.wait(timeout=0.5):
                 break
             waited += 0.5
-            # 检查结果是否已知
-            if cancel_result[0] is not None:
-                return cancel_result[0]
+            # 兜底：撤单成功回报（OnRtnOrder）会把本地订单状态置为「已撤销」
+            if str(info.get("status", "")) == self._OST_CANCELED:
+                cancel_result[0] = True
+                break
+
+        with self._order_lock:
+            self._cancel_events.pop(cancel_key, None)
+            self._cancel_results.pop(cancel_key, None)
+            if sys_id:
+                self._cancel_events.pop(sys_id, None)
+                self._cancel_results.pop(sys_id, None)
 
         # 超时或结果已知
         if cancel_result[0] is None:
@@ -417,9 +431,26 @@ class PositionSyncManagerOrderOps:
         req.OrderSysID = order_sys_id
         req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
 
+        # 按 sys_id 反查本地 OrderRef：
+        #  1) 部分柜台撤单响应只回 OrderRef，双 key 注册同一事件可提升命中率；
+        #  2) 等待循环里可用本地订单状态（OnRtnOrder 置为「已撤销」）做兜底，
+        #     避免响应丢失时每次都卡满 3s 超时（旧逻辑正是因此每单必超时）。
+        local_ref = None
+        _sid = str(order_sys_id or "").strip()
+        with self._order_lock:
+            for ref, oi in self._orders.items():
+                if str(oi.get("sys_id", "")).strip() == _sid:
+                    local_ref = ref
+                    break
+
         cancel_event = threading.Event()
-        self._cancel_events[order_sys_id] = cancel_event
-        self._cancel_result = [None]
+        cancel_result = [None]
+        with self._order_lock:
+            self._cancel_events[order_sys_id] = cancel_event
+            self._cancel_results[order_sys_id] = cancel_result
+            if local_ref:
+                self._cancel_events[local_ref] = cancel_event
+                self._cancel_results[local_ref] = cancel_result
 
         self.print(f"[撤单] 发送请求: {instrument_id} OrderSysID={order_sys_id}")
         ret = self._api.ReqOrderAction(req, 0)
@@ -431,8 +462,22 @@ class PositionSyncManagerOrderOps:
             if cancel_event.wait(timeout=0.5):
                 break
             waited += 0.5
+            # 兜底：撤单成功回报（OnRtnOrder）会把本地订单状态置为「已撤销」
+            if local_ref:
+                with self._order_lock:
+                    _oi = self._orders.get(local_ref)
+                    _st = str(_oi.get("status", "")) if _oi else ""
+                if _st == self._OST_CANCELED:
+                    cancel_result[0] = True
+                    break
 
-        result = self._cancel_result[0]
+        result = cancel_result[0]
+        with self._order_lock:
+            self._cancel_events.pop(order_sys_id, None)
+            self._cancel_results.pop(order_sys_id, None)
+            if local_ref:
+                self._cancel_events.pop(local_ref, None)
+                self._cancel_results.pop(local_ref, None)
         self.print(f"[撤单结果] OrderSysID={order_sys_id} result={result} waited={waited}s")
         if result is None:
             self.print(f"[撤单] OrderSysID={order_sys_id} 等待响应超时，保守处理")
@@ -787,7 +832,7 @@ class PositionSyncManagerOrderOps:
 
             # ------------------------------------------------------------------
             # 分支 2：非 passive 模式订单（默认 aggressive，成交时间优先）
-            #   · 保持原有逻辑：价格偏离 1 price_tick 就撤单重挂（30 秒循环一次）
+            #   · 价格偏离 < 2 个 price_tick 时保留原排队单；偏离 ≥2 个 tick 才撤单重挂（30 秒循环一次）
             # ------------------------------------------------------------------
             # 仅在 ratio==0 清仓模式下的平仓单才用 passive 排队价（多赚滑点）
             # 其余所有情况（对齐开仓、对齐平仓）都用 aggressive 吃单价（快速成交）
@@ -827,8 +872,9 @@ class PositionSyncManagerOrderOps:
             price_tick = info_obj.get("PriceTick", 1.0) if info_obj else 1.0
 
 
-            # 检查价格变化
-            if last_price > 0 and abs(current_price - last_price) > price_tick:
+            # 检查价格变化：排队价没变（偏离 < 2 个 tick）时保留原挂单，避免在同一价位反复
+            # 撤单重报、永远排在队尾成交不了；只有盘口偏离 ≥2 个 tick 才撤单重挂。
+            if last_price > 0 and abs(current_price - last_price) >= 2 * price_tick - 1e-9:
 
                 replace_count = info.get("replace_count", 0)
                 if replace_count >= self.MAX_REPLACE_COUNT:

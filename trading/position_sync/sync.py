@@ -135,8 +135,10 @@ def _should_keep_pending_order(
     """判断一条 CTP 在途委托在 sync 入口阶段是否跳过撤销。
 
     返回 (keep=True 不撤, 原因字符串)。
-    passive 模式下，开仓/平仓挂单统一按「挂单时长 < passive_wait」保留（与监控线程
-    _check_and_replace_pending_orders 的被动分支保持一致）；超过 wait 或非 passive 模式一律可撤。
+    · ratio=0 清仓模式：在途委托都是排队价平仓单，挂单时长 < passive_wait 时保留；
+    · passive 模式下，开仓/平仓挂单统一按「挂单时长 < passive_wait」保留（与监控线程
+      _check_and_replace_pending_orders 的被动分支保持一致）；
+    · 超过 wait 或非上述两种模式一律可撤。
     """
     use_passive = bool(getattr(self, '_passive_mode', False))
     wait_s = int(getattr(self, '_passive_wait_seconds', 300) or 300)
@@ -147,6 +149,20 @@ def _should_keep_pending_order(
         "0",
     )
     offset_label = "开仓" if is_open else "平仓"
+
+    # ratio=0 清仓模式：目标全部置 0，所有在途委托都是「排队价平仓单」（赚滑点、不急成交）。
+    # 这类挂单必须保留，否则 15s 同步入口每轮都会把排队单撤掉重报，单子永远排在队尾成交不了。
+    # 价格偏离由 30s 监控线程按「≥2 个 tick 才撤单重挂」统一处理；超过 passive_wait 仍未成交
+    # 才放回同步入口处理（避免挂单永久滞留）。
+    try:
+        _ratio = float(getattr(self, '_position_ratio', 1.0))
+    except (TypeError, ValueError):
+        _ratio = 1.0
+    if abs(_ratio) < 1e-9:
+        elapsed = _ctp_order_elapsed_seconds(o, time.time())
+        if elapsed < wait_s:
+            return True, f"liquidate-{offset_label} keep ({elapsed:.0f}s < {wait_s}s)"
+
     # passive 模式下开仓/平仓挂单都要保留：若只保留开仓而撤平仓，同步入口每轮都会把
     # 排队中的平仓限价单撤掉重挂，单子永远排在队尾、等不到成交（复现：20424 平仓挂单 16s 即被撤）
     if not use_passive:
