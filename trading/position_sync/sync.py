@@ -698,7 +698,7 @@ class PositionSyncManagerSync:
             #
             # 因为 sync_and_trade 有两个来源：
             #   A) run_position_sync_loop 明确感知 hold 文件 mtime 触发 → 这时 hold 文件肯定有变更；
-            #   B) _check_position_diff 定时巡检 / 关键时点 force_sync → 这时 hold 文件不一定变不变。
+            #   B) _check_position_diff 定时巡检 → 这时 hold 文件不一定变不变。
             # 只有 B 的情况下"同一份 hold 配置如果 15s 内反复触发，才需要 SYNC_COOLDOWN 拦住（CTP 持仓查询本身有刷新延迟）；
             # A 的情况下，hold 文件一旦有变更，必须立刻放行，否则就会出现“源账户下单 → 等 15s 才同步”这种 37s 级滑点。
             hold_std_path = getattr(self, "hold_std_path", None)
