@@ -215,14 +215,18 @@ def _normalize_rule(item: Dict[str, Any], index: int) -> Dict[str, Any]:
     minutes = parse_period(item.get("period") or "m5")
     pname = period_name(minutes)
 
+    enabled = bool(item.get("enabled", True))
+
+    # symbols：启用规则必填；禁用规则（草稿）允许留空
     symbols_raw = item.get("symbols")
-    if not isinstance(symbols_raw, list) or not symbols_raw:
+    if isinstance(symbols_raw, list) and symbols_raw:
+        symbols = [str(s).strip() for s in symbols_raw if str(s).strip()]
+    else:
+        symbols = []
+    if enabled and not symbols:
         raise ConfigError(
             f"规则「{name}」必须指定 symbols（本规则监控的合约列表），例如 [\"m2605\"]"
         )
-    symbols = [str(s).strip() for s in symbols_raw if str(s).strip()]
-    if not symbols:
-        raise ConfigError(f"规则「{name}」的 symbols 为空")
 
     params = item.get("params") or {}
     if not isinstance(params, dict):
@@ -290,7 +294,7 @@ def _normalize_rule(item: Dict[str, Any], index: int) -> Dict[str, Any]:
 
     return {
         "name": name,
-        "enabled": bool(item.get("enabled", True)),
+        "enabled": enabled,
         "symbols": symbols,
         "period": pname,
         "period_minutes": minutes,

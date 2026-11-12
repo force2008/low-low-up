@@ -5,7 +5,7 @@
 # @Description: 各期货品种交易时间配置
 
 import re
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional
 
 # ==================== 交易时间配置 ====================
@@ -364,3 +364,59 @@ def get_contracts_trading_status(instrument_ids: List[str], now: Optional[dateti
         {instrument_id: True/False}
     """
     return {inst: is_contract_trading_now(inst, now) for inst in instrument_ids}
+
+
+def get_session_start_times(instrument_ids: List[str]) -> List[time]:
+    """汇总给定合约集合会开盘的「交易时段开始时间」（去重、升序）。
+
+    只统计这些合约实际会开盘的时段，例如无夜盘品种不会包含 21:00：
+      - 中金所股指 / 国债：09:30、13:00
+      - 商品期货：09:00、10:30、13:30
+      - 有夜盘的品种：额外 21:00
+
+    Args:
+        instrument_ids: 合约代码列表，如 ["m2605", "IF2603"]
+
+    Returns:
+        升序的 time 列表；若全部无法识别则退化为商品日盘时段
+    """
+    starts = set()
+    for inst in instrument_ids:
+        product = _extract_product_id(inst)
+        if not product:
+            continue
+        product_upper = product.upper()
+        if product_upper in _CFFEX_STOCK_INDEX_PRODUCTS or product_upper in _CFFEX_TREASURY_PRODUCTS:
+            starts.add(time(9, 30))
+            starts.add(time(13, 0))
+        else:
+            starts.add(time(9, 0))
+            starts.add(time(10, 30))
+            starts.add(time(13, 30))
+        if get_trading_hours_info(product).get("has_night"):
+            starts.add(_NIGHT_START)
+
+    if not starts:
+        starts.update(t for t, _ in _COMMODITY_DAY_SESSIONS)
+    return sorted(starts)
+
+
+def get_next_session_start(instrument_ids: List[str], now: Optional[datetime] = None) -> datetime:
+    """返回给定合约集合中，now 之后最近的一次交易时段开始时间。
+
+    用于判断「离开盘还有多久」，从而决定是等待开盘还是直接退出。
+
+    Args:
+        instrument_ids: 合约代码列表
+        now: 可选，指定判断的时间点；默认使用 datetime.now()
+
+    Returns:
+        下一次交易时段开始的 datetime（若今天已无时段则取明天第一个时段）
+    """
+    if now is None:
+        now = datetime.now()
+    starts = get_session_start_times(instrument_ids)
+    for start in starts:
+        if start > now.time():
+            return datetime.combine(now.date(), start)
+    return datetime.combine(now.date() + timedelta(days=1), starts[0])

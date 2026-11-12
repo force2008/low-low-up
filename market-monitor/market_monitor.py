@@ -10,14 +10,21 @@
     python market_monitor.py -c my.json      # 指定配置文件
     python market_monitor.py --offline       # 离线自检：仅用本地 K 线库评估一次条件
     python market_monitor.py --no-notify     # 不发送飞书，只写信号文件
+
+运行时段（默认行为）：
+    只在订阅合约的交易时段运行；启动时若距下次开盘还早则直接退出，
+    盘中持续监控，所有合约收盘后（距下次开盘超过 PRE_OPEN_WAIT_SEC）自动退出。
+    交易日由 config/trade_date.json 判断（文件缺失则跳过检查）。
+    可用 --force / --skip-time-check 关闭上述判断，恢复常驻运行。
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as _time, timedelta
 from logging.handlers import RotatingFileHandler
 
 # 把项目根目录加入 sys.path，以复用 ctp / config / utils 等公共模块
@@ -41,6 +48,115 @@ except Exception as _exc:  # pragma: no cover - 取决于运行环境
     CMdSpiBase = object  # type: ignore
     _CTP_AVAILABLE = False
     _CTP_IMPORT_ERROR = _exc
+
+# 交易时段工具（离线模式下允许缺失）
+try:
+    from config.trading_time_config import is_contract_trading_now, get_next_session_start  # noqa: E402
+    _TIME_CONFIG_ERROR = None
+except Exception as _exc:  # pragma: no cover - 取决于运行环境
+    is_contract_trading_now = None  # type: ignore
+    get_next_session_start = None  # type: ignore
+    _TIME_CONFIG_ERROR = _exc
+
+
+# ==================== 运行时段控制 ====================
+# 启动时若距下次开盘超过该秒数，则判定为「非交易时段」，直接退出，避免长时间空转。
+# 取值需大于品种日内最短休市间隔（商品 10:15-10:30 共 15 分钟），
+# 同时覆盖 12:59 启动到 13:30 商品下午开盘的 31 分钟等待。
+PRE_OPEN_WAIT_SEC = 3600
+
+# 交易日历文件（由 utils/trade_date.py 生成）
+_TRADE_DATE_FILE = os.path.join(_PROJECT_ROOT, "config", "trade_date.json")
+
+# 单实例锁文件（防止计划任务重复拉起多个进程）
+_INSTANCE_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".market_monitor.lock")
+
+
+def is_trading_day(now: datetime = None) -> bool:
+    """判断 now 所属交易日是否可交易。
+
+    读取 config/trade_date.json；文件缺失或读取失败时放行（返回 True）并告警。
+    夜盘跨午夜：凌晨 03:00 之前同时认「前一天」为交易日。
+    """
+    now = now or datetime.now()
+    if not os.path.exists(_TRADE_DATE_FILE):
+        logger.warning("交易日历不存在：%s，跳过交易日检查（可运行 utils/trade_date.py 生成）", _TRADE_DATE_FILE)
+        return True
+    try:
+        with open(_TRADE_DATE_FILE, "r", encoding="utf-8") as fp:
+            trade_dates = set(json.load(fp))
+    except Exception as exc:
+        logger.warning("读取交易日历失败：%s，跳过交易日检查", exc)
+        return True
+
+    if now.date().isoformat() in trade_dates:
+        return True
+    # 凌晨属于前一交易日的夜盘
+    if now.time() < _time(3, 0):
+        if (now.date() - timedelta(days=1)).isoformat() in trade_dates:
+            return True
+    return False
+
+
+def any_contract_trading(symbols: list, now: datetime) -> bool:
+    """判断给定合约中是否有任一处于可交易时段"""
+    if is_contract_trading_now is None:
+        return True
+    for symbol in symbols:
+        try:
+            if is_contract_trading_now(symbol, now):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def next_session_start(symbols: list, now: datetime):
+    """返回给定合约集合下一次开盘时间；交易时段工具缺失时返回 None"""
+    if get_next_session_start is None:
+        return None
+    try:
+        return get_next_session_start(symbols, now)
+    except Exception as exc:
+        logger.warning("计算下次开盘时间失败：%s", exc)
+        return None
+
+
+def check_single_instance():
+    """获取单实例锁，已有实例在跑时返回 None"""
+    fd = None
+    try:
+        fd = os.open(_INSTANCE_LOCK_FILE, os.O_CREAT | os.O_RDWR)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except (IOError, OSError):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        return None
+
+
+def release_single_instance(fd) -> None:
+    """释放单实例锁"""
+    if fd is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
 
 
 # ==================== 日志 ====================
@@ -216,8 +332,14 @@ class MonitorMdSpi(CMdSpiBase):
 
 
 # ==================== 运行逻辑 ====================
-def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine) -> None:
-    """连接 CTP 行情，进入常驻监控循环"""
+def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
+             check_time: bool = True) -> None:
+    """连接 CTP 行情，进入常驻监控循环。
+
+    Args:
+        check_time: 为 True 时按交易时段运行——启动时距下次开盘过久则直接退出，
+            盘中持续监控，所有合约收盘后自动退出；为 False 时常驻运行。
+    """
     if not _CTP_AVAILABLE:
         logger.error("无法加载 CTP 行情模块，无法启动实时监控：%s", _CTP_IMPORT_ERROR)
         return
@@ -228,14 +350,55 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine) -
     conf = ctp_config.envs.get(env_name) or ctp_config.get_env_config()
     logger.info("使用 CTP 环境：%s（行情前置 %s）", env_name, conf.get("md"))
 
-    spi = MonitorMdSpi(aggregator, config["symbols"], conf)
+    symbols = config["symbols"]
+
+    # 启动前的时段判断：离开盘还早就直接退出，不建立行情连接
+    if check_time:
+        now = datetime.now()
+        if not any_contract_trading(symbols, now):
+            nxt = next_session_start(symbols, now)
+            remain = (nxt - now).total_seconds() if nxt else 0
+            if remain > PRE_OPEN_WAIT_SEC:
+                logger.info(
+                    "当前非交易时段（距下次开盘约 %.0f 分钟），程序退出",
+                    remain / 60.0,
+                )
+                return
+            logger.info(
+                "当前非交易时段，等待开盘：%s",
+                nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else "未知",
+            )
+
+    spi = MonitorMdSpi(aggregator, symbols, conf)
     spi.subscribe_market_data()
 
     interval = max(1, int(config["poll_interval_sec"]))
-    logger.info("进入监控循环：轮询间隔 %ss，订阅合约 %s", interval, ", ".join(config["symbols"]))
+    logger.info("进入监控循环：轮询间隔 %ss，订阅合约 %s", interval, ", ".join(symbols))
+
+    waiting_logged = not any_contract_trading(symbols, datetime.now()) if check_time else False
 
     try:
         while True:
+            if check_time:
+                now = datetime.now()
+                if not any_contract_trading(symbols, now):
+                    nxt = next_session_start(symbols, now)
+                    remain = (nxt - now).total_seconds() if nxt else 0
+                    if remain > PRE_OPEN_WAIT_SEC:
+                        logger.info("所有合约已收盘（距下次开盘约 %.0f 分钟），程序退出", remain / 60.0)
+                        break
+                    if not waiting_logged:
+                        logger.info(
+                            "所有合约已收盘，等待下次开盘：%s",
+                            nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else "未知",
+                        )
+                        waiting_logged = True
+                    time.sleep(min(interval, max(1, int(remain))))
+                    continue
+                if waiting_logged:
+                    logger.info("行情已开盘，开始监控")
+                    waiting_logged = False
+
             closed = aggregator.sweep_stale()
             for symbol, period, dt_str in closed:
                 logger.debug("K 线收盘 %s %s %s", symbol, period, dt_str)
@@ -275,6 +438,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", default=None, help="覆盖配置中的 CTP 环境（7x24/simu/online）")
     parser.add_argument("--offline", action="store_true", help="离线自检：不连接行情，只用本地 K 线库评估一次")
     parser.add_argument("--no-notify", action="store_true", help="不发送飞书通知，只写信号文件")
+    parser.add_argument("--force", action="store_true", help="跳过交易日与交易时段检查，强制常驻运行（测试用）")
+    parser.add_argument("--skip-time-check", action="store_true", help="只跳过交易时段检查（非交易日仍按日历判断）")
     parser.add_argument("--log-level", default="INFO", help="日志级别，默认 INFO")
     return parser.parse_args()
 
@@ -286,56 +451,79 @@ def main() -> int:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     setup_logging(os.path.join(base_dir, "logs"), args.log_level)
 
-    try:
-        config = load_config(args.config)
-    except ConfigError as exc:
-        logger.error("配置加载失败：%s", exc)
-        return 1
+    check_time = not (args.force or args.skip_time_check)
 
-    if args.env:
-        config["env"] = args.env
+    # 交易日检查（离线自检与 --force 不限制）
+    if not args.offline and not args.force:
+        if not is_trading_day(datetime.now()):
+            logger.info("今日不是交易日，程序退出")
+            return 0
 
-    logger.info("=" * 60)
-    logger.info("行情监控程序启动（只出信号，不下单）")
-    logger.info("配置文件：%s", os.path.abspath(args.config))
-    logger.info("监控合约：%s", ", ".join(config["symbols"]))
-    logger.info("监控周期：%s", ", ".join(sorted(config["periods"].keys())))
-    logger.info("规则数量：%d", len(config["rules"]))
-
-    # K 线本地库（持久化 + 重启预热）
-    store = None
-    if config["kline_db"]["enabled"]:
-        store = KlineStore(config["kline_db"]["path"])
-        logger.info("K 线本地库：%s", config["kline_db"]["path"])
-
-    aggregator = KlineAggregator(
-        symbols=config["symbols"],
-        periods=config["periods"],
-        history_bars=config["history_bars"],
-        store=store,
-    )
-    warmed = aggregator.warmup()
-    logger.info("历史 K 线预热：%d 根", warmed)
-
-    signal_store = SignalStore(config["signal_file"])
-    logger.info("信号文件：%s", config["signal_file"])
-
-    notifier = RuleNotifier(
-        enabled=config["feishu"]["enabled"] and not args.no_notify,
-        webhook_url=config["feishu"]["webhook"],
-    )
-    logger.info("飞书通知：%s", "已启用" if notifier.enabled else "未启用")
-
-    engine = MonitorEngine(config, aggregator, signal_store, notifier)
+    # 单实例锁（仅实时监控需要，离线自检可并发）
+    lock_fd = None
+    if not args.offline:
+        lock_fd = check_single_instance()
+        if lock_fd is None:
+            logger.warning("已有监控实例在运行，本次启动退出")
+            return 0
 
     try:
-        if args.offline:
-            run_offline(config, aggregator, engine)
-        else:
-            run_live(config, aggregator, engine)
+        try:
+            config = load_config(args.config)
+        except ConfigError as exc:
+            logger.error("配置加载失败：%s", exc)
+            return 1
+
+        if args.env:
+            config["env"] = args.env
+
+        logger.info("=" * 60)
+        logger.info("行情监控程序启动（只出信号，不下单）")
+        logger.info("配置文件：%s", os.path.abspath(args.config))
+        logger.info("监控合约：%s", ", ".join(config["symbols"]))
+        logger.info("监控周期：%s", ", ".join(sorted(config["periods"].keys())))
+        logger.info("规则数量：%d", len(config["rules"]))
+        logger.info("交易时段控制：%s", "已启用（收盘自动退出）" if check_time else "已关闭（常驻运行）")
+        if _TIME_CONFIG_ERROR is not None:
+            logger.warning("交易时段工具不可用（%s），已退化为常驻运行", _TIME_CONFIG_ERROR)
+            check_time = False
+
+        # K 线本地库（持久化 + 重启预热）
+        store = None
+        if config["kline_db"]["enabled"]:
+            store = KlineStore(config["kline_db"]["path"])
+            logger.info("K 线本地库：%s", config["kline_db"]["path"])
+
+        aggregator = KlineAggregator(
+            symbols=config["symbols"],
+            periods=config["periods"],
+            history_bars=config["history_bars"],
+            store=store,
+        )
+        warmed = aggregator.warmup()
+        logger.info("历史 K 线预热：%d 根", warmed)
+
+        signal_store = SignalStore(config["signal_file"])
+        logger.info("信号文件：%s", config["signal_file"])
+
+        notifier = RuleNotifier(
+            enabled=config["feishu"]["enabled"] and not args.no_notify,
+            webhook_url=config["feishu"]["webhook"],
+        )
+        logger.info("飞书通知：%s", "已启用" if notifier.enabled else "未启用")
+
+        engine = MonitorEngine(config, aggregator, signal_store, notifier)
+
+        try:
+            if args.offline:
+                run_offline(config, aggregator, engine)
+            else:
+                run_live(config, aggregator, engine, check_time=check_time)
+        finally:
+            if store is not None:
+                store.close()
     finally:
-        if store is not None:
-            store.close()
+        release_single_instance(lock_fd)
 
     return 0
 
