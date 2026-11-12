@@ -200,8 +200,8 @@
       "cooldown_sec": 3600
     },
     {
-      "name": "生猪挑战前期平台高点6068-开空",
-      "symbols": ["LH701"],
+      "name": "生猪挑战前期平台高点10000-开空",
+      "symbols": ["lh2701"],
       "enabled": true,
       "period": "m5",
       "type": "price_breakout",

@@ -5,12 +5,15 @@
 - :class:`KlineAggregator`：把 CTP tick 合成多周期 K 线，维护历史窗口
 """
 
+import logging
 import os
 import sqlite3
 import threading
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Deque, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # K 线元组：(datetime, open, high, low, close, volume)
 Bar = Tuple[str, float, float, float, float, int]
@@ -70,7 +73,7 @@ class KlineStore:
             )
             self._conn.commit()
         except Exception as exc:
-            print(f"K 线入库失败 {symbol} {period} {bar[0]}: {exc}")
+            logger.warning("K 线入库失败 %s %s %s: %s", symbol, period, bar[0], exc)
 
     def load_recent(self, symbol: str, period: str, limit: int) -> List[Bar]:
         """读取最近 limit 根 K 线（按时间正序返回）"""
@@ -84,7 +87,7 @@ class KlineStore:
                 (symbol, period, int(limit)),
             ).fetchall()
         except Exception as exc:
-            print(f"读取历史 K 线失败 {symbol} {period}: {exc}")
+            logger.warning("读取历史 K 线失败 %s %s: %s", symbol, period, exc)
             return []
 
         result: List[Bar] = []
@@ -134,6 +137,8 @@ class KlineAggregator:
         self._history: Dict[Tuple[str, str], Deque[Bar]] = {}
         # 合约上一次的累计成交量（用于计算增量）
         self._last_volume: Dict[str, int] = {}
+        # 已打印过「首个 tick」日志的合约（避免重复刷屏）
+        self._first_tick_logged: set = set()
 
         for symbol in self._symbols:
             for period in self._periods:
@@ -191,6 +196,13 @@ class KlineAggregator:
             return
 
         with self._lock:
+            if symbol not in self._first_tick_logged:
+                self._first_tick_logged.add(symbol)
+                logger.info(
+                    "收到行情 [%s] 首笔 最新价=%s 累计量=%s 时间=%s",
+                    symbol, price, cum_volume, dt.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+
             cum_volume = int(cum_volume or 0)
             last_volume = self._last_volume.get(symbol)
             if last_volume is None or cum_volume < last_volume:
@@ -299,6 +311,12 @@ class KlineAggregator:
             history[-1] = bar
         else:
             history.append(bar)
+
+        logger.info(
+            "K 线收盘 [%s] %s %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%d 持仓=%s",
+            key[0], key[1], bar[0], bar[1], bar[2], bar[3], bar[4], bar[5],
+            current.get("open_interest"),
+        )
 
         if self._store is not None:
             self._store.save_bar(key[0], key[1], bar)

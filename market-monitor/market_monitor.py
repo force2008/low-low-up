@@ -194,6 +194,8 @@ class MonitorEngine:
         self._last_fire_bar: dict = {}
         # (规则名, 合约) -> 上次触发的墙钟时间（用于冷却）
         self._last_fire_time: dict = {}
+        # (规则名, 合约) -> 上次打印「未触发」日志的 K 线时间（每根 K 线只打印一次）
+        self._last_eval_bar: dict = {}
 
     def evaluate(self, now: datetime = None) -> list:
         """评估所有规则，返回本轮命中的信号记录"""
@@ -217,25 +219,58 @@ class MonitorEngine:
             logger.error("[%s][%s] 条件计算失败：%s", rule["name"], symbol, exc)
             return None
 
+        key = (rule["name"], symbol)
+
         if not payload:
+            self._log_unmet(rule, symbol, closed_bars, forming_bar)
             return None
 
-        key = (rule["name"], symbol)
         bar_time = str(payload.get("bar_time", ""))
 
         # 同一根 K 线不重复触发
         if self._last_fire_bar.get(key) == bar_time:
+            logger.debug("[%s][%s] 命中但同一根 K 线已触发过（%s），跳过", rule["name"], symbol, bar_time)
             return None
 
         # 冷却时间
         cooldown = int(rule.get("cooldown_sec", 0))
         last_time = self._last_fire_time.get(key)
         if cooldown > 0 and last_time is not None and (now - last_time).total_seconds() < cooldown:
+            logger.debug("[%s][%s] 命中但仍在冷却期（%ss），跳过", rule["name"], symbol, cooldown)
             return None
 
+        logger.info(
+            "命中 [%s] %s %s(%s) 触发K线=%s 价格=%s 参数=%s 说明=%s",
+            rule["name"], symbol, rule["period"], rule["type"], bar_time,
+            payload.get("price"),
+            json.dumps(rule.get("params") or {}, ensure_ascii=False),
+            payload.get("detail", ""),
+        )
         self._last_fire_bar[key] = bar_time
         self._last_fire_time[key] = now
         return self._dispatch(rule, symbol, payload, now)
+
+    def _log_unmet(self, rule: dict, symbol: str, closed_bars: list, forming_bar) -> None:
+        """输出「未触发」评估日志；同一个 (规则, 合约) 每根 K 线只输出一次，避免刷屏"""
+        bar = forming_bar if forming_bar is not None else (closed_bars[-1] if closed_bars else None)
+        bar_time = str(bar[0]) if bar is not None else ""
+        key = (rule["name"], symbol)
+        if self._last_eval_bar.get(key) == bar_time:
+            return
+        self._last_eval_bar[key] = bar_time
+
+        params = json.dumps(rule.get("params") or {}, ensure_ascii=False)
+        if bar is None:
+            logger.info(
+                "未触发 [%s] %s %s 暂无 K 线数据（等待行情） 参数=%s",
+                rule["name"], symbol, rule["period"], params,
+            )
+            return
+        logger.info(
+            "未触发 [%s] %s %s(%s) 当前K线=%s O=%.4f H=%.4f L=%.4f C=%.4f 参数=%s",
+            rule["name"], symbol, rule["period"], rule["type"], bar_time,
+            float(bar[1]), float(bar[2]), float(bar[3]), float(bar[4]), params,
+        )
 
     def _dispatch(self, rule: dict, symbol: str, payload: dict, now: datetime) -> dict:
         """执行规则动作（写信号文件 / 飞书通知）"""
@@ -400,8 +435,8 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
                     waiting_logged = False
 
             closed = aggregator.sweep_stale()
-            for symbol, period, dt_str in closed:
-                logger.debug("K 线收盘 %s %s %s", symbol, period, dt_str)
+            if closed:
+                logger.debug("本轮收盘 %d 根过期 K 线", len(closed))
             engine.evaluate()
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -483,6 +518,17 @@ def main() -> int:
         logger.info("监控合约：%s", ", ".join(config["symbols"]))
         logger.info("监控周期：%s", ", ".join(sorted(config["periods"].keys())))
         logger.info("规则数量：%d", len(config["rules"]))
+        for rule in config["rules"]:
+            if not rule["enabled"]:
+                logger.info("规则[已禁用]：%s", rule["name"])
+                continue
+            logger.info(
+                "规则[启用]：%s | %s %s | 合约=%s | 动作=%s | 冷却=%ss | 参数=%s",
+                rule["name"], rule["period"], rule["type"],
+                ", ".join(rule["symbols"]), ", ".join(rule["actions"]),
+                rule.get("cooldown_sec", 0),
+                json.dumps(rule.get("params") or {}, ensure_ascii=False),
+            )
         logger.info("交易时段控制：%s", "已启用（收盘自动退出）" if check_time else "已关闭（常驻运行）")
         if _TIME_CONFIG_ERROR is not None:
             logger.warning("交易时段工具不可用（%s），已退化为常驻运行", _TIME_CONFIG_ERROR)
