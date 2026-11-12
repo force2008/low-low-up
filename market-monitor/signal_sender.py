@@ -79,6 +79,16 @@ class RuleNotifier:
                 print(f"飞书通知初始化失败，将只写信号文件：{exc}")
                 self.enabled = False
 
+    def send_text(self, text: str) -> bool:
+        """发送纯文本通知（用于程序启动/退出等生命周期消息），返回是否成功"""
+        if not self.enabled or self._notifier is None:
+            return False
+        try:
+            return bool(self._notifier.send_text(text))
+        except Exception as exc:
+            print(f"发送飞书通知失败：{exc}")
+            return False
+
     def send_signal(self, symbol: str, rule: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         """发送一条规则命中通知，返回是否成功"""
         if not self.enabled or self._notifier is None:

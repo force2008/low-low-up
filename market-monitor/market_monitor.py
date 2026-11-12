@@ -367,6 +367,40 @@ class MonitorMdSpi(CMdSpiBase):
 
 
 # ==================== 运行逻辑 ====================
+def _format_duration(seconds: float) -> str:
+    """把秒数格式化为「X 小时 Y 分」"""
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes = remainder // 60
+    return f"{hours} 小时 {minutes} 分" if hours else f"{minutes} 分"
+
+
+def _notify_start(notifier: RuleNotifier, config: dict, started_at: datetime) -> None:
+    """发送「程序启动」飞书通知"""
+    enabled_rules = sum(1 for rule in config["rules"] if rule["enabled"])
+    lines = [
+        "🟢 行情监控已启动\n",
+        f"时间：{started_at.strftime('%Y-%m-%d %H:%M:%S')}\n",
+        f"环境：{config.get('env') or '7x24'}\n",
+        f"合约：{', '.join(config['symbols'])}\n",
+        f"周期：{', '.join(sorted(config['periods']))}\n",
+        f"启用规则：{enabled_rules} 条\n",
+        f"轮询间隔：{config['poll_interval_sec']}s",
+    ]
+    ok = notifier.send_text("".join(lines))
+    logger.info("启动通知已发送" if ok else "启动通知未发送（未启用或发送失败）")
+
+
+def _notify_stop(notifier: RuleNotifier, started_at: datetime, stopped_at: datetime) -> None:
+    """发送「程序退出」飞书通知"""
+    lines = [
+        "🔴 行情监控已停止\n",
+        f"时间：{stopped_at.strftime('%Y-%m-%d %H:%M:%S')}\n",
+        f"运行时长：{_format_duration((stopped_at - started_at).total_seconds())}",
+    ]
+    ok = notifier.send_text("".join(lines))
+    logger.info("退出通知已发送" if ok else "退出通知未发送（未启用或发送失败）")
+
+
 def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
              check_time: bool = True) -> None:
     """连接 CTP 行情，进入常驻监控循环。
@@ -410,6 +444,10 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
     interval = max(1, int(config["poll_interval_sec"]))
     logger.info("进入监控循环：轮询间隔 %ss，订阅合约 %s", interval, ", ".join(symbols))
 
+    notifier = engine.notifier
+    started_at = datetime.now()
+    _notify_start(notifier, config, started_at)
+
     waiting_logged = not any_contract_trading(symbols, datetime.now()) if check_time else False
 
     try:
@@ -447,6 +485,7 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
         except Exception as exc:
             logger.warning("退出前刷新 K 线失败：%s", exc)
         spi.close()
+        _notify_stop(notifier, started_at, datetime.now())
         logger.info("行情监控已停止")
 
 

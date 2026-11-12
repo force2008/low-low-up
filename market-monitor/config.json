@@ -134,7 +134,7 @@
 
   "feishu": {
     "enabled": true,
-    "webhook": ""
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/c5b2b07d-95f7-4a4c-8a97-60feaaa260ac"
   },
 
 
