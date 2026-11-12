@@ -44,6 +44,7 @@ Thumbs.db
 kline_data/
 *.json
 !data/contracts/*.json
+!market-monitor/config.json
 
 # Temp
 --help
