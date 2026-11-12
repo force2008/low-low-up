@@ -11,7 +11,7 @@ import sqlite3
 import threading
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,7 @@ class KlineAggregator:
         periods: Dict[str, int],
         history_bars: int = _DEFAULT_HISTORY_BARS,
         store: Optional[KlineStore] = None,
+        session_end_check: Optional[Callable[[str, datetime], bool]] = None,
     ):
         """
         Args:
@@ -123,6 +124,9 @@ class KlineAggregator:
             periods: 周期名字典，如 ``{"m5": 5, "m60": 60}``
             history_bars: 每个 (合约, 周期) 保留的历史 K 线根数
             store: 可选，K 线持久化对象
+            session_end_check: 可选，``(symbol, dt) -> bool``，判断 dt 是否恰为交易时段
+                收盘时刻。收盘瞬间的行情快照不属于新周期，会并入上一根 K 线，
+                避免产生 11:30 / 15:00 这类空 K 线。为 None 时不做该判定。
         """
         self._lock = threading.RLock()
         self._symbols: List[str] = [str(s) for s in symbols]
@@ -130,6 +134,7 @@ class KlineAggregator:
         self._periods: Dict[str, int] = {str(k): int(v) for k, v in periods.items()}
         self._history_bars = max(30, int(history_bars))
         self._store = store
+        self._session_end_check = session_end_check
 
         # (symbol, period) -> 当前正在形成的 K 线
         self._current: Dict[Tuple[str, str], dict] = {}
@@ -222,15 +227,14 @@ class KlineAggregator:
                 if current is None:
                     self._current[key] = self._new_bar(kline_start, price, delta, open_interest, dt)
                 elif kline_start > current["time"]:
-                    self._close_bar(key, current)
-                    self._current[key] = self._new_bar(kline_start, price, delta, open_interest, dt)
+                    if self._is_session_end(symbol, kline_start):
+                        # 收盘时刻的行情快照不属于新周期，并入当前 K 线（补齐收盘价）
+                        self._update_bar(current, price, delta, open_interest, dt)
+                    else:
+                        self._close_bar(key, current)
+                        self._current[key] = self._new_bar(kline_start, price, delta, open_interest, dt)
                 else:
-                    current["close"] = float(price)
-                    current["high"] = max(current["high"], float(price))
-                    current["low"] = min(current["low"], float(price))
-                    current["volume"] += delta
-                    current["open_interest"] = float(open_interest or 0.0)
-                    current["timestamp"] = dt
+                    self._update_bar(current, price, delta, open_interest, dt)
 
     def sweep_stale(self, now: Optional[datetime] = None) -> List[Tuple[str, str, str]]:
         """收盘已过期的当前 K 线（无新 tick 时也能正常收盘）。
@@ -384,6 +388,26 @@ class KlineAggregator:
             "open_interest": float(open_interest or 0.0),
             "timestamp": dt,
         }
+
+    @staticmethod
+    def _update_bar(current: dict, price: float, delta: int, open_interest: float, dt: datetime) -> None:
+        """把一笔 tick 并入当前 K 线（更新收盘/最高/最低/成交量和持仓）"""
+        price = float(price)
+        current["close"] = price
+        current["high"] = max(current["high"], price)
+        current["low"] = min(current["low"], price)
+        current["volume"] += int(delta)
+        current["open_interest"] = float(open_interest or 0.0)
+        current["timestamp"] = dt
+
+    def _is_session_end(self, symbol: str, kline_start: datetime) -> bool:
+        """kline_start 是否恰为交易时段收盘时刻（此时不新开 K 线）"""
+        if self._session_end_check is None:
+            return False
+        try:
+            return bool(self._session_end_check(symbol, kline_start))
+        except Exception:
+            return False
 
     def _close_bar(self, key: Tuple[str, str], current: dict) -> None:
         """把当前 K 线收盘，写入历史窗口与本地库"""

@@ -52,10 +52,15 @@ except Exception as _exc:  # pragma: no cover - 取决于运行环境
 
 # 交易时段工具（离线模式下允许缺失）
 try:
-    from config.trading_time_config import is_contract_trading_now, get_next_session_start  # noqa: E402
+    from config.trading_time_config import (  # noqa: E402
+        is_contract_trading_now,
+        is_session_end_time,
+        get_next_session_start,
+    )
     _TIME_CONFIG_ERROR = None
 except Exception as _exc:  # pragma: no cover - 取决于运行环境
     is_contract_trading_now = None  # type: ignore
+    is_session_end_time = None  # type: ignore
     get_next_session_start = None  # type: ignore
     _TIME_CONFIG_ERROR = _exc
 
@@ -746,6 +751,7 @@ def main() -> int:
             periods=config["periods"],
             history_bars=config["history_bars"],
             store=store,
+            session_end_check=is_session_end_time,
         )
         warmed = aggregator.warmup()
         logger.info("历史 K 线预热：%d 根", warmed)

@@ -357,6 +357,48 @@ def is_contract_trading_now(instrument_id: str, now: Optional[datetime] = None) 
     return False
 
 
+def is_session_end_time(instrument_id: str, now: Optional[datetime] = None) -> bool:
+    """判断 now 是否正好落在该合约某个交易时段的收盘时刻。
+
+    收盘时刻（如商品 10:15 / 11:30 / 15:00，夜盘 23:00 / 次日 01:00）交易所仍会
+    推送一笔行情快照。这类快照不属于新周期，K 线合成时应并入上一根，
+    否则会在收盘边界生成一根几乎无成交的空 K 线。
+
+    Args:
+        instrument_id: 合约代码，如 "c2701", "FG701"
+        now: 可选，指定判断的时间点；默认使用 datetime.now()
+
+    Returns:
+        bool: 恰好是收盘时刻返回 True
+    """
+    product = _extract_product_id(instrument_id)
+    if not product:
+        return False
+
+    product_upper = product.upper()
+    if product_upper in _CFFEX_STOCK_INDEX_PRODUCTS:
+        day_sessions = _CFFEX_STOCK_INDEX_DAY_SESSIONS
+    elif product_upper in _CFFEX_TREASURY_PRODUCTS:
+        day_sessions = _CFFEX_TREASURY_DAY_SESSIONS
+    else:
+        day_sessions = _COMMODITY_DAY_SESSIONS
+
+    t = (now or datetime.now()).time()
+    if any(t == end for _, end in day_sessions):
+        return True
+
+    info = get_trading_hours_info(product)
+    night_end_time = info.get("night_end_time")
+    if info.get("has_night") and night_end_time and night_end_time != "未知":
+        try:
+            end_h, end_m = map(int, night_end_time.split(":"))
+        except Exception:
+            return False
+        if t == time(end_h, end_m):
+            return True
+    return False
+
+
 def get_contracts_trading_status(instrument_ids: List[str], now: Optional[datetime] = None) -> Dict[str, bool]:
     """批量判断多个合约当前是否可交易。
 
