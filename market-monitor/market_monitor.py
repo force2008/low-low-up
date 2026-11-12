@@ -19,6 +19,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -180,6 +181,64 @@ def setup_logging(log_dir: str, level: str = "INFO") -> None:
     root.addHandler(stream_handler)
 
 
+class ConfigReloader:
+    """监控配置文件内容指纹，内容变化时返回一次 True。
+
+    先用 ``os.stat``（mtime + size）做短路判断，指针未变则直接跳过；
+    指针变了再计算文件 md5，仅当内容真正不同才判定为「已修改」，
+    因此对「仅 touch 文件」或「写回相同内容」不会触发重载。
+    """
+
+    def __init__(self, path: str):
+        self.path = os.path.abspath(path)
+        self._stat = None
+        self._digest = None
+        self._prime()
+
+    def _prime(self) -> None:
+        """记录初始指纹"""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            self._stat = None
+            self._digest = None
+            return
+        self._stat = (st.st_mtime_ns, st.st_size)
+        try:
+            self._digest = self._md5()
+        except OSError:
+            self._digest = None
+
+    def _md5(self) -> str:
+        """按块计算文件 md5，避免一次性读入大文件"""
+        digest = hashlib.md5()
+        with open(self.path, "rb") as fp:
+            for chunk in iter(lambda: fp.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def changed(self) -> bool:
+        """内容发生变化时返回 True（每次变更只返回一次 True）"""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return False  # 文件被删除/不可读：保持现状，不触发重载
+
+        fingerprint = (st.st_mtime_ns, st.st_size)
+        if fingerprint == self._stat:
+            return False  # stat 未变，内容必然未变（短路）
+
+        self._stat = fingerprint
+        try:
+            digest = self._md5()
+        except OSError:
+            return False
+        if digest == self._digest:
+            return False  # 仅时间戳变化，内容未变
+        self._digest = digest
+        return True
+
+
 # ==================== 监控引擎 ====================
 class MonitorEngine:
     """遍历规则，评估条件并派发动作。"""
@@ -329,6 +388,34 @@ class MonitorMdSpi(CMdSpiBase):
         ret = self._api.SubscribeMarketData(encoded, len(encoded))
         logger.info("已发送订阅请求（%d 个合约），返回码=%s", len(encoded), ret)
 
+    def subscribe_symbols(self, symbols: list) -> None:
+        """热加载：增量订阅新增合约"""
+        pending = [s for s in symbols if s and s not in self._symbol_set]
+        if not pending:
+            return
+        encoded = [s.encode("utf-8") for s in pending]
+        ret = self._api.SubscribeMarketData(encoded, len(encoded))
+        self._symbol_set.update(pending)
+        self._symbols.extend(pending)
+        logger.info("热加载：增量订阅 %d 个合约 %s（返回码=%s）", len(pending), ", ".join(pending), ret)
+
+    def unsubscribe_symbols(self, symbols: list) -> None:
+        """热加载：退订已移除的合约"""
+        pending = [s for s in symbols if s in self._symbol_set]
+        if not pending:
+            return
+        encoded = [s.encode("utf-8") for s in pending]
+        try:
+            ret = self._api.UnSubscribeMarketData(encoded, len(encoded))
+        except Exception as exc:
+            logger.warning("热加载：退订 %s 失败：%s", ", ".join(pending), exc)
+            return
+        self._symbol_set.difference_update(pending)
+        for s in pending:
+            if s in self._symbols:
+                self._symbols.remove(s)
+        logger.info("热加载：退订 %d 个合约 %s（返回码=%s）", len(pending), ", ".join(pending), ret)
+
     def OnRtnDepthMarketData(self, pDepthMarketData):
         """行情推送回调"""
         try:
@@ -401,13 +488,79 @@ def _notify_stop(notifier: RuleNotifier, started_at: datetime, stopped_at: datet
     logger.info("退出通知已发送" if ok else "退出通知未发送（未启用或发送失败）")
 
 
+def _reload_config(config_path: str, config: dict, aggregator: KlineAggregator,
+                   engine: MonitorEngine, spi: "MonitorMdSpi", allow_notify: bool) -> None:
+    """热加载 config.json：重新读取并应用到运行期组件（就地更新 config）。
+
+    可热更：rules / symbols（含订阅增减）/ periods（新增）/ feishu / poll_interval_sec。
+    不可热更（env / kline_db / signal_file / history_bars）：保留旧值并提示需重启。
+    配置非法时放弃本次重载，沿用旧配置继续运行。
+    """
+    try:
+        new_config = load_config(config_path)
+    except ConfigError as exc:
+        logger.error("热加载失败，沿用旧配置：%s", exc)
+        return
+
+    logger.info("检测到 config.json 变更，开始热加载...")
+
+    # 不可热更项：比对后保留旧值
+    for key, label in (
+        ("env", "env"),
+        ("kline_db", "kline_db"),
+        ("signal_file", "signal_file"),
+        ("history_bars", "history_bars"),
+    ):
+        if new_config.get(key) != config.get(key):
+            logger.warning("热加载：%s 变更无法热更，需重启生效（本次忽略）", label)
+        new_config[key] = config.get(key)
+
+    # 合约与周期：调整聚合器，并同步 CTP 订阅
+    changes = aggregator.reconfigure(new_config["symbols"], new_config["periods"])
+    if changes["added_symbols"]:
+        spi.subscribe_symbols(changes["added_symbols"])
+    if changes["removed_symbols"]:
+        spi.unsubscribe_symbols(changes["removed_symbols"])
+
+    # 规则
+    old_rules = {rule["name"] for rule in config["rules"]}
+    new_rules = {rule["name"] for rule in new_config["rules"]}
+    engine.rules = new_config["rules"]
+
+    # 飞书通知：仅在配置变化时重建
+    if new_config["feishu"] != config.get("feishu"):
+        engine.notifier = RuleNotifier(
+            enabled=new_config["feishu"]["enabled"] and allow_notify,
+            webhook_url=new_config["feishu"]["webhook"],
+        )
+        logger.info("热加载：飞书通知已更新（%s）", "已启用" if engine.notifier.enabled else "未启用")
+
+    # 就地更新配置（engine.config 与 config 为同一对象）
+    config.clear()
+    config.update(new_config)
+
+    logger.info(
+        "热加载完成：合约 %d 个（%s），周期 %s，启用规则 %d 条，轮询 %ss",
+        len(config["symbols"]), ", ".join(config["symbols"]),
+        ", ".join(sorted(config["periods"])),
+        sum(1 for rule in config["rules"] if rule["enabled"]),
+        config["poll_interval_sec"],
+    )
+    for name in sorted(new_rules - old_rules):
+        logger.info("热加载：新增规则 [%s]", name)
+    for name in sorted(old_rules - new_rules):
+        logger.info("热加载：移除规则 [%s]", name)
+
+
 def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
-             check_time: bool = True) -> None:
+             check_time: bool = True, config_path: str = None, allow_notify: bool = True) -> None:
     """连接 CTP 行情，进入常驻监控循环。
 
     Args:
         check_time: 为 True 时按交易时段运行——启动时距下次开盘过久则直接退出，
             盘中持续监控，所有合约收盘后自动退出；为 False 时常驻运行。
+        config_path: 监控配置文件路径，用于热加载；为空则不做热加载。
+        allow_notify: 是否允许发送飞书（对应 --no-notify）。
     """
     if not _CTP_AVAILABLE:
         logger.error("无法加载 CTP 行情模块，无法启动实时监控：%s", _CTP_IMPORT_ERROR)
@@ -444,14 +597,23 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
     interval = max(1, int(config["poll_interval_sec"]))
     logger.info("进入监控循环：轮询间隔 %ss，订阅合约 %s", interval, ", ".join(symbols))
 
-    notifier = engine.notifier
+    # 配置热加载：仅当 config.json 内容变化（md5 变化）时重载一次
+    reloader = ConfigReloader(config_path) if config_path else None
+    if reloader is not None:
+        logger.info("配置热加载：已启用（%s 内容变化时自动重载）", os.path.basename(config_path))
+
     started_at = datetime.now()
-    _notify_start(notifier, config, started_at)
+    _notify_start(engine.notifier, config, started_at)
 
     waiting_logged = not any_contract_trading(symbols, datetime.now()) if check_time else False
 
     try:
         while True:
+            if reloader is not None and reloader.changed():
+                _reload_config(config_path, config, aggregator, engine, spi, allow_notify)
+                symbols = config["symbols"]
+                interval = max(1, int(config["poll_interval_sec"]))
+
             if check_time:
                 now = datetime.now()
                 if not any_contract_trading(symbols, now):
@@ -485,7 +647,7 @@ def run_live(config: dict, aggregator: KlineAggregator, engine: MonitorEngine,
         except Exception as exc:
             logger.warning("退出前刷新 K 线失败：%s", exc)
         spi.close()
-        _notify_stop(notifier, started_at, datetime.now())
+        _notify_stop(engine.notifier, started_at, datetime.now())
         logger.info("行情监控已停止")
 
 
@@ -603,7 +765,12 @@ def main() -> int:
             if args.offline:
                 run_offline(config, aggregator, engine)
             else:
-                run_live(config, aggregator, engine, check_time=check_time)
+                run_live(
+                    config, aggregator, engine,
+                    check_time=check_time,
+                    config_path=os.path.abspath(args.config),
+                    allow_notify=not args.no_notify,
+                )
         finally:
             if store is not None:
                 store.close()

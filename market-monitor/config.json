@@ -119,6 +119,15 @@
     "  python market_monitor.py --offline        不连行情，用本地 K 线库评估一次（改完配置先自检）",
     "  python market_monitor.py --no-notify      不发飞书，只写信号文件",
     "",
+    "",
+    "【六】配置热加载",
+    "",
+    "  实时监控运行期间会自动监测本文件：仅当文件内容变化（md5 变化）时重载一次，",
+    "  无需重启程序。可热更：rules / symbols / periods / feishu / poll_interval_sec；",
+    "  其中 symbols 变化会自动补订阅与退订，新增周期会自动从本地库预热历史。",
+    "  env / kline_db / signal_file / history_bars 变更无法热更，会提示需重启并忽略本次改动。",
+    "  改错导致 JSON 非法时会放弃本次重载，沿用旧配置继续运行。",
+    "",
     "============================================================================"
   ],
 

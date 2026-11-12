@@ -258,6 +258,95 @@ class KlineAggregator:
                 self._close_bar(key, current)
             self._current.clear()
 
+    # ==================== 热加载 ====================
+    def reconfigure(self, symbols: List[str], periods: Dict[str, int]) -> Dict[str, list]:
+        """热加载：按新配置调整订阅合约与周期。
+
+        - 新增的合约/周期会补齐历史窗口（并从本地库预热）
+        - 已移除的合约会清空其内存数据
+        - 已存在的周期只增不减（移除周期不影响已订阅合约）
+
+        Args:
+            symbols: 新的合约列表（启用规则合约的并集）
+            periods: 新的周期字典，如 ``{"m5": 5, "m60": 60}``
+
+        Returns:
+            ``{"added_symbols": [...], "removed_symbols": [...], "added_periods": [...]}``
+        """
+        new_symbols = [str(s) for s in symbols]
+        new_periods = {str(k): int(v) for k, v in periods.items()}
+        added_symbols: List[str] = []
+        removed_symbols: List[str] = []
+        added_periods: List[str] = []
+
+        with self._lock:
+            # 周期：只增不减
+            for name, minutes in new_periods.items():
+                if name in self._periods:
+                    continue
+                self._periods[name] = minutes
+                for symbol in self._symbols:
+                    self._history[(symbol, name)] = deque(maxlen=self._history_bars)
+                added_periods.append(name)
+
+            # 合约：新增
+            new_set = set(new_symbols)
+            for symbol in new_symbols:
+                if symbol in self._symbol_set:
+                    continue
+                self._symbols.append(symbol)
+                self._symbol_set.add(symbol)
+                for period in self._periods:
+                    self._history[(symbol, period)] = deque(maxlen=self._history_bars)
+                added_symbols.append(symbol)
+
+            # 合约：移除
+            for symbol in list(self._symbols):
+                if symbol in new_set:
+                    continue
+                self._symbol_set.discard(symbol)
+                self._symbols.remove(symbol)
+                for period in self._periods:
+                    self._history.pop((symbol, period), None)
+                    self._current.pop((symbol, period), None)
+                self._last_volume.pop(symbol, None)
+                self._first_tick_logged.discard(symbol)
+                removed_symbols.append(symbol)
+
+        # 预热新增的 (合约, 周期)：新增合约的全部周期 + 既有合约的新增周期
+        keys: List[Tuple[str, str]] = [(s, p) for s in added_symbols for p in self._periods]
+        keys += [(s, p) for p in added_periods for s in self._symbols if s not in added_symbols]
+        warm = self.warmup_keys(keys) if keys else 0
+        if keys:
+            logger.info(
+                "热加载：合约 +%s -%s，周期 +%s，预热 %d 根",
+                added_symbols, removed_symbols, added_periods, warm,
+            )
+
+        return {
+            "added_symbols": added_symbols,
+            "removed_symbols": removed_symbols,
+            "added_periods": added_periods,
+        }
+
+    def warmup_keys(self, keys: List[Tuple[str, str]]) -> int:
+        """从本地库预热指定 (合约, 周期) 的历史窗口，返回加载的 K 线根数"""
+        if self._store is None:
+            return 0
+        total = 0
+        with self._lock:
+            for key in keys:
+                history = self._history.get(key)
+                if history is None:
+                    continue
+                bars = self._store.load_recent(key[0], key[1], self._history_bars)
+                if not bars:
+                    continue
+                history.clear()
+                history.extend(bars)
+                total += len(bars)
+        return total
+
     # ==================== 快照 ====================
     def get_snapshot(self, symbol: str, period: str) -> Tuple[List[Bar], Optional[Bar]]:
         """获取某合约某周期的历史 K 线 + 当前正在形成的 K 线。
