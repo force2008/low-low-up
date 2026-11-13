@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>行情监控 · 规则编辑器</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #f5f6f8; color: #1f2329;
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  code { font-family: Consolas, "Courier New", monospace; }
+
+  /* ---------- 顶栏 ---------- */
+  .bar {
+    position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px;
+    padding: 12px 20px; background: #fff; border-bottom: 1px solid #e4e6eb;
+  }
+  .bar .logo { font-size: 16px; font-weight: 600; }
+  .bar .sub { color: #8a9099; margin-left: 6px; font-size: 13px; }
+  .bar .path { color: #8a9099; font-size: 12px; }
+  .bar .spacer { flex: 1; }
+  .btn {
+    padding: 6px 14px; border: 1px solid #d0d3d9; border-radius: 6px;
+    background: #fff; color: #1f2329; cursor: pointer; font-size: 13px;
+  }
+  .btn:hover { border-color: #b8bcc4; background: #fafbfc; }
+  .btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.primary:hover { background: #1d4fd7; }
+  .btn.primary:disabled { background: #a8bff5; border-color: #a8bff5; cursor: default; }
+  .btn.danger:hover { border-color: #f0a3a3; color: #d93026; background: #fff5f5; }
+  .dirty { color: #d97706; font-size: 12px; }
+
+  /* ---------- 状态条 ---------- */
+  .status {
+    margin: 12px 20px 0; padding: 10px 14px; border-radius: 6px; font-size: 13px;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .status.ok { background: #eaf7ee; color: #16794a; border: 1px solid #bfe6cd; }
+  .status.err { background: #fdeceb; color: #b3261e; border: 1px solid #f4c4c1; }
+  .hidden { display: none; }
+
+  /* ---------- 汇总 ---------- */
+  .summary {
+    margin: 12px 20px; padding: 10px 14px; background: #eef4ff; border: 1px solid #d3e0fb;
+    border-radius: 6px; font-size: 13px; color: #24468f;
+  }
+  .summary.warn { background: #fff7e8; border-color: #f6dfae; color: #94540a; }
+
+  /* ---------- 规则卡片 ---------- */
+  .list { padding: 0 20px 40px; display: flex; flex-direction: column; gap: 12px; }
+  .rule {
+    background: #fff; border: 1px solid #e4e6eb; border-radius: 8px; overflow: hidden;
+  }
+  .rule.disabled { background: #fbfbfc; }
+  .rule.disabled .rule-body { opacity: .62; }
+  .rule-head {
+    display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+    border-bottom: 1px solid #eef0f3;
+  }
+  .rule.disabled .rule-head { border-bottom-color: #f4f5f7; }
+  .rule-head .idx {
+    width: 22px; height: 22px; border-radius: 50%; background: #eef1f6; color: #616a75;
+    font-size: 12px; display: flex; align-items: center; justify-content: center; flex: none;
+  }
+  .rule-head input.name {
+    flex: 1; min-width: 200px; padding: 5px 8px; font-size: 14px; font-weight: 500;
+    border: 1px solid transparent; border-radius: 6px; background: transparent;
+  }
+  .rule-head input.name:hover { border-color: #e4e6eb; }
+  .rule-head input.name:focus { border-color: #2563eb; background: #fff; outline: none; }
+  .sw { display: inline-flex; align-items: center; gap: 6px; flex: none; cursor: pointer; user-select: none; }
+  .sw input { width: 16px; height: 16px; accent-color: #2563eb; cursor: pointer; }
+  .sw span { font-size: 12px; color: #616a75; }
+  .rule-head .ops { display: flex; gap: 6px; flex: none; }
+  .rule-head .ops .btn { padding: 4px 10px; font-size: 12px; }
+
+  .rule-body { padding: 14px; display: grid; gap: 12px; }
+  .grid {
+    display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field > label { font-size: 12px; color: #616a75; }
+  .field input[type=text], .field input[type=number], .field select {
+    padding: 6px 8px; border: 1px solid #d0d3d9; border-radius: 6px; font-size: 13px;
+    background: #fff; color: #1f2329; width: 100%;
+  }
+  .field input:focus, .field select:focus { border-color: #2563eb; outline: none; }
+  .field .hint { font-size: 11px; color: #9aa1ab; }
+
+  .divider { height: 1px; background: #eef0f3; margin: 2px 0; }
+  .sect-title { font-size: 12px; color: #8a9099; margin-bottom: -4px; }
+  .actions-row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  .actions-row .sw span { font-size: 13px; color: #1f2329; }
+</style>
+</head>
+<body>
+
+<div class="bar">
+  <span><span class="logo">行情监控</span><span class="sub">规则编辑器</span></span>
+  <span class="path"><code id="cfgPath">加载中…</code></span>
+  <span class="spacer"></span>
+  <span class="dirty hidden" id="dirtyTag">● 未保存</span>
+  <button class="btn" id="btnReload">重新加载</button>
+  <button class="btn" id="btnAdd">+ 新增规则</button>
+  <button class="btn primary" id="btnSave" disabled>保存</button>
+</div>
+
+<div class="status hidden" id="status"></div>
+<div class="summary" id="summary"></div>
+<main class="list" id="ruleList"></main>
+
+<script>
+"use strict";
+
+const PERIODS = ["m5", "m15", "m30", "m60", "m120", "m240", "d1"];
+
+const TYPE_LABEL = {
+  price_breakout: "价格突破固定价位",
+  boll_touch: "触碰布林带",
+  max_bearish_candle: "近期最大阴线",
+  max_bullish_candle: "近期最大阳线",
+};
+
+const OPT_LABEL = {
+  source: {
+    price: "最新价（未完成K线收盘）", high: "本根最高", low: "本根最低",
+    close: "最后一根已收盘K线收盘价", range: "区间覆盖轨道（range）",
+  },
+  band: { upper: "上轨", middle: "中轨", lower: "下轨" },
+  measure: { body: "实体（body）", range: "全幅（range）" },
+  operator: { ">=": "≥", "<=": "≤", ">": ">", "<": "<" },
+  direction: { "": "未指定", short: "开空（short）", long: "开多（long）" },
+};
+
+/* 各条件类型的参数字段定义 */
+const PARAM_DEFS = {
+  price_breakout: [
+    { key: "price", label: "目标价位", kind: "number", step: "any", required: true },
+    { key: "operator", label: "比较符", kind: "select", options: [">=", "<=", ">", "<"], def: ">=" },
+    { key: "source", label: "取值口径", kind: "select", options: ["price", "high", "low", "close"], def: "price" },
+    { key: "tolerance", label: "容差（价格）", kind: "number", step: "any", def: 0 },
+  ],
+  boll_touch: [
+    { key: "period", label: "布林周期", kind: "number", def: 20 },
+    { key: "multiplier", label: "标准差倍数", kind: "number", step: "any", def: 2 },
+    { key: "band", label: "轨道", kind: "select", options: ["upper", "middle", "lower"], def: "upper" },
+    { key: "source", label: "触碰口径", kind: "select", options: ["range", "price", "high", "low"], def: "range" },
+    { key: "operator", label: "比较符", kind: "select", options: [">=", "<=", ">", "<"],
+      visible: (p) => p.source && p.source !== "range" },
+    { key: "tolerance_pct", label: "容差比例（如 0.001）", kind: "number", step: "any", def: 0,
+      visible: (p) => p.source && p.source !== "range" },
+  ],
+  max_bearish_candle: [
+    { key: "lookback", label: "回看根数", kind: "number", def: 20 },
+    { key: "measure", label: "比较口径", kind: "select", options: ["body", "range"], def: "body" },
+  ],
+};
+PARAM_DEFS.max_bullish_candle = PARAM_DEFS.max_bearish_candle;
+
+const state = { path: "", rules: [], dirty: false };
+
+/* ---------------- 工具 ---------------- */
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function parseSymbols(text) {
+  return String(text || "").split(/[\s,，、]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function paramDefs(type) { return PARAM_DEFS[type] || []; }
+
+function defaultParams(type) {
+  const out = {};
+  paramDefs(type).forEach(d => { if (d.def !== undefined) out[d.key] = d.def; });
+  return out;
+}
+
+function newRule() {
+  return {
+    name: "新规则",
+    enabled: false,
+    symbols: [],
+    period: "m5",
+    type: "price_breakout",
+    params: defaultParams("price_breakout"),
+    actions: ["feishu"],
+    cooldown_sec: 3600,
+  };
+}
+
+function optLabel(group, value) {
+  const m = OPT_LABEL[group];
+  return (m && m[value]) || value;
+}
+
+/* ---------------- 状态提示 ---------------- */
+function showStatus(kind, text) {
+  const el = document.getElementById("status");
+  el.className = "status " + kind;
+  el.textContent = text;
+  if (kind === "ok") setTimeout(() => el.classList.add("hidden"), 4000);
+}
+function hideStatus() { document.getElementById("status").classList.add("hidden"); }
+
+function markDirty(dirty) {
+  state.dirty = dirty;
+  document.getElementById("dirtyTag").classList.toggle("hidden", !dirty);
+  document.getElementById("btnSave").disabled = !dirty;
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderSummary() {
+  const enabled = state.rules.filter(r => r.enabled);
+  const symbols = [];
+  enabled.forEach(r => (r.symbols || []).forEach(s => { if (!symbols.includes(s)) symbols.push(s); }));
+  const el = document.getElementById("summary");
+  if (!state.rules.length) {
+    el.className = "summary warn";
+    el.textContent = "还没有规则，点右上角「新增规则」。";
+    return;
+  }
+  if (!symbols.length) {
+    el.className = "summary warn";
+    el.textContent = `启用规则 ${enabled.length} 条，但没有任何合约 —— 至少要为一条启用规则填写 symbols，否则保存会被拒绝。`;
+    return;
+  }
+  el.className = "summary";
+  el.textContent = `启用规则 ${enabled.length} / ${state.rules.length} 条 · 订阅合约（${symbols.length}）：${symbols.join(", ")}`;
+}
+
+function selectHTML(idx, field, group, options, value, extra) {
+  const opts = options.map(o => {
+    const v = String(o);
+    const label = group ? optLabel(group, v) : v;
+    return `<option value="${esc(v)}"${String(value) === v ? " selected" : ""}>${esc(label)}</option>`;
+  }).join("");
+  return `<select data-idx="${idx}" data-field="${field}"${extra || ""}>${opts}</select>`;
+}
+
+function paramFieldHTML(idx, def, params) {
+  const raw = params[def.key];
+  const value = raw === undefined || raw === null ? (def.def !== undefined ? def.def : "") : raw;
+  const req = def.required ? ` <span style="color:#d93026">*</span>` : "";
+  let control;
+  if (def.kind === "select") {
+    control = selectHTML(idx, "", "", def.options, value, ` data-param="${esc(def.key)}"`);
+  } else if (def.kind === "number") {
+    control = `<input type="number" step="${esc(def.step || "1")}" data-idx="${idx}" data-param="${esc(def.key)}" value="${esc(value)}">`;
+  } else {
+    control = `<input type="text" data-idx="${idx}" data-param="${esc(def.key)}" value="${esc(value)}">`;
+  }
+  return `<div class="field"><label>${esc(def.label)}${req}</label>${control}</div>`;
+}
+
+function ruleBodyHTML(rule, idx) {
+  const params = rule.params || {};
+  const pfields = paramDefs(rule.type)
+    .filter(d => !d.visible || d.visible(params))
+    .map(d => paramFieldHTML(idx, d, params))
+    .join("");
+
+  const actSignal = (rule.actions || []).includes("signal");
+  const actFeishu = (rule.actions || []).includes("feishu");
+
+  return `
+    <div class="grid">
+      <div class="field">
+        <label>合约 symbols <span style="color:#d93026">*</span></label>
+        <input type="text" data-idx="${idx}" data-field="symbols" value="${esc((rule.symbols || []).join(", "))}"
+               placeholder="多个用逗号分隔，如 c2701, AP701">
+        <span class="hint">交易所原生命名区分大小写：CZCE/CFFEX 大写（FG701、IF2603），SHFE/DCE/INE/GFEX 小写（c2701、lh2701）</span>
+      </div>
+      <div class="field">
+        <label>周期 period</label>
+        ${selectHTML(idx, "period", "", PERIODS, rule.period || "m5")}
+      </div>
+      <div class="field">
+        <label>条件类型 type</label>
+        ${selectHTML(idx, "type", "", Object.keys(TYPE_LABEL), rule.type,
+                     ' data-label="' + esc(Object.keys(TYPE_LABEL).map(k => TYPE_LABEL[k]).join("|")) + '"')}
+      </div>
+      <div class="field">
+        <label>方向 direction</label>
+        ${selectHTML(idx, "direction", "direction", ["", "short", "long"], rule.direction || "")}
+      </div>
+      <div class="field">
+        <label>冷却 cooldown_sec</label>
+        <input type="number" min="0" step="1" data-idx="${idx}" data-field="cooldown_sec"
+               value="${esc(rule.cooldown_sec === undefined ? 1800 : rule.cooldown_sec)}">
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <div class="sect-title">条件参数 params — ${esc(TYPE_LABEL[rule.type] || rule.type)}</div>
+    <div class="grid">${pfields}</div>
+
+    <div class="divider"></div>
+    <div class="sect-title">动作 actions</div>
+    <div class="actions-row">
+      <label class="sw"><input type="checkbox" data-idx="${idx}" data-action="signal"${actSignal ? " checked" : ""}><span>signal（写入信号文件）</span></label>
+      <label class="sw"><input type="checkbox" data-idx="${idx}" data-action="feishu"${actFeishu ? " checked" : ""}><span>feishu（飞书通知）</span></label>
+    </div>
+  `;
+}
+
+function renderRule(card, rule, idx) {
+  card.className = "rule" + (rule.enabled ? "" : " disabled");
+  card.dataset.idx = idx;
+
+  const head = card.querySelector(".rule-head");
+  head.innerHTML = `
+    <span class="idx">${idx + 1}</span>
+    <label class="sw" title="启用 / 停用">
+      <input type="checkbox" data-idx="${idx}" data-field="enabled"${rule.enabled ? " checked" : ""}>
+      <span>${rule.enabled ? "启用" : "停用"}</span>
+    </label>
+    <input class="name" type="text" data-idx="${idx}" data-field="name" value="${esc(rule.name)}" placeholder="规则名">
+    <span class="ops">
+      <button class="btn" data-op="copy">复制</button>
+      <button class="btn danger" data-op="del">删除</button>
+    </span>
+  `;
+  card.querySelector(".rule-body").innerHTML = ruleBodyHTML(rule, idx);
+}
+
+function renderAll() {
+  const list = document.getElementById("ruleList");
+  list.innerHTML = "";
+  state.rules.forEach((rule, idx) => {
+    const card = document.createElement("section");
+    card.className = "rule";
+    card.innerHTML = `<div class="rule-head"></div><div class="rule-body"></div>`;
+    renderRule(card, rule, idx);
+    list.appendChild(card);
+  });
+  renderSummary();
+}
+
+/* ---------------- 事件 ---------------- */
+const listEl = document.getElementById("ruleList");
+
+listEl.addEventListener("input", (e) => {
+  const el = e.target;
+  const card = el.closest(".rule");
+  if (!card) return;
+  const idx = Number(card.dataset.idx);
+  const rule = state.rules[idx];
+  if (!rule) return;
+
+  const field = el.dataset.field;
+  const param = el.dataset.param;
+  const action = el.dataset.action;
+
+  if (field === "enabled") {
+    rule.enabled = el.checked;
+    renderRule(card, rule, idx);
+    renderSummary();
+    markDirty(true);
+    return;
+  }
+  if (field === "name") { rule.name = el.value; markDirty(true); return; }
+  if (field === "symbols") { rule.symbols = parseSymbols(el.value); renderSummary(); markDirty(true); return; }
+  if (field === "period") { rule.period = el.value; markDirty(true); return; }
+  if (field === "direction") { rule.direction = el.value; markDirty(true); return; }
+  if (field === "cooldown_sec") {
+    const v = parseInt(el.value, 10);
+    rule.cooldown_sec = isNaN(v) ? 0 : v;
+    markDirty(true);
+    return;
+  }
+  if (field === "type") {
+    rule.type = el.value;
+    rule.params = defaultParams(rule.type);
+    renderRule(card, rule, idx);
+    markDirty(true);
+    return;
+  }
+  if (action) {
+    const set = new Set(rule.actions || []);
+    if (el.checked) set.add(action); else set.delete(action);
+    rule.actions = ["signal", "feishu"].filter(a => set.has(a));
+    markDirty(true);
+    return;
+  }
+  if (param) {
+    rule.params = rule.params || {};
+    const def = paramDefs(rule.type).find(d => d.key === param);
+    const empty = el.value === "";
+    if (empty) {
+      delete rule.params[param];
+    } else if (def && def.kind === "number") {
+      const num = Number(el.value);
+      if (isNaN(num)) delete rule.params[param]; else rule.params[param] = num;
+    } else {
+      rule.params[param] = el.value;
+    }
+    /* source 变化会改变 operator / 容差 的显隐，需要重绘参数区 */
+    if (param === "source") {
+      const keep = document.activeElement;
+      renderRule(card, rule, idx);
+      if (keep && el.dataset.param) { /* 焦点不还原，下拉框不受影响 */ }
+    }
+    markDirty(true);
+    return;
+  }
+});
+
+listEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-op]");
+  if (!btn) return;
+  const card = btn.closest(".rule");
+  const idx = Number(card.dataset.idx);
+  const op = btn.dataset.op;
+
+  if (op === "del") {
+    const rule = state.rules[idx];
+    if (!confirm(`确定删除规则「${rule.name}」？`)) return;
+    state.rules.splice(idx, 1);
+    renderAll();
+    markDirty(true);
+  } else if (op === "copy") {
+    const clone = JSON.parse(JSON.stringify(state.rules[idx]));
+    clone.name = (clone.name || "规则") + "-副本";
+    clone.enabled = false;
+    state.rules.splice(idx + 1, 0, clone);
+    renderAll();
+    markDirty(true);
+  }
+});
+
+document.getElementById("btnAdd").addEventListener("click", () => {
+  state.rules.push(newRule());
+  renderAll();
+  markDirty(true);
+  const cards = listEl.querySelectorAll(".rule");
+  if (cards.length) cards[cards.length - 1].scrollIntoView({ block: "center", behavior: "smooth" });
+});
+
+document.getElementById("btnReload").addEventListener("click", async () => {
+  if (state.dirty && !confirm("有未保存的修改，重新加载会丢弃它们，继续？")) return;
+  await load();
+});
+
+document.getElementById("btnSave").addEventListener("click", async () => {
+  const btn = document.getElementById("btnSave");
+  btn.disabled = true;
+  btn.textContent = "保存中…";
+  try {
+    const resp = await fetch("/api/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rules: state.rules }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      showStatus("err", "保存失败：" + (data.error || resp.status));
+    } else {
+      state.rules = data.rules || state.rules;
+      renderAll();
+      markDirty(false);
+      showStatus("ok", data.message || "已保存");
+    }
+  } catch (err) {
+    showStatus("err", "保存失败：" + err);
+  } finally {
+    btn.textContent = "保存";
+    btn.disabled = !state.dirty;
+  }
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (state.dirty) { e.preventDefault(); e.returnValue = ""; }
+});
+
+/* ---------------- 加载 ---------------- */
+async function load() {
+  try {
+    const resp = await fetch("/api/config");
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || resp.status);
+    state.path = data.path;
+    state.rules = data.rules || [];
+    document.getElementById("cfgPath").textContent = data.path;
+    hideStatus();
+    renderAll();
+    markDirty(false);
+  } catch (err) {
+    showStatus("err", "加载配置失败：" + err);
+  }
+}
+
+load();
+</script>
+</body>
+</html>
