@@ -175,7 +175,7 @@ def main() -> int:
     parser.add_argument("-c", "--config", default=os.path.join(_BASE_DIR, "config.json"),
                         help="配置文件路径，默认同目录 config.json")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（所有网卡）")
-    parser.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
+    parser.add_argument("--port", type=int, default=9000, help="监听端口，默认 9000")
     args = parser.parse_args()
 
     config_path = os.path.abspath(args.config)
