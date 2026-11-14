@@ -94,6 +94,44 @@
   .sect-title { font-size: 12px; color: #8a9099; margin-bottom: -4px; }
   .actions-row { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
   .actions-row .sw span { font-size: 13px; color: #1f2329; }
+
+  /* 手机端专用短标签：桌面端不显示 */
+  .t-mini { display: none; }
+
+  /* ---------- 手机端适配 ---------- */
+  @media (max-width: 640px) {
+    /* 顶栏：压成单行，隐藏次要信息，避免换行占高度 */
+    .bar { gap: 8px; padding: 8px 12px; }
+    .bar .sub, .bar .path, .bar .spacer { display: none; }
+    .bar .logo { font-size: 15px; }
+    .bar .dirty { font-size: 11px; }
+    .bar .btn { padding: 5px 9px; font-size: 12px; }
+    .t-full { display: none; }
+    .t-mini { display: inline; }
+
+    /* 状态 / 汇总：压缩留白 */
+    .status { margin: 8px 10px 0; padding: 8px 10px; font-size: 12px; }
+    .summary { margin: 8px 10px; padding: 8px 10px; font-size: 12px; }
+
+    /* 规则卡片：紧凑排布 */
+    .list { padding: 0 10px 24px; gap: 8px; }
+    .rule-head { padding: 8px 10px; gap: 8px; }
+    .rule-head .sw span { display: none; }
+    .rule-head input.name { min-width: 0; padding: 4px 6px; }
+    .rule-head .ops { gap: 4px; }
+    .rule-head .ops .btn { padding: 4px 8px; font-size: 12px; }
+    .rule-body { padding: 10px; gap: 10px; }
+
+    /* 字段两列，减少纵向行数；首列合约独占整行，便于看提示 */
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; }
+    .rule-body > .grid:first-child > .field:first-child { grid-column: 1 / -1; }
+    .field .hint { font-size: 10px; line-height: 1.4; }
+    .actions-row { gap: 14px; }
+
+    /* 输入控件用 16px，避免 iOS 聚焦时自动放大页面 */
+    .field input[type=text], .field input[type=number], .field select,
+    .rule-head input.name { font-size: 16px; }
+  }
 </style>
 </head>
 <body>
@@ -103,8 +141,8 @@
   <span class="path"><code id="cfgPath">加载中…</code></span>
   <span class="spacer"></span>
   <span class="dirty hidden" id="dirtyTag">● 未保存</span>
-  <button class="btn" id="btnReload">重新加载</button>
-  <button class="btn" id="btnAdd">+ 新增规则</button>
+  <button class="btn" id="btnReload"><span class="t-full">重新加载</span><span class="t-mini">重载</span></button>
+  <button class="btn" id="btnAdd"><span class="t-full">+ 新增规则</span><span class="t-mini">+ 新增</span></button>
   <button class="btn primary" id="btnSave" disabled>保存</button>
 </div>
 

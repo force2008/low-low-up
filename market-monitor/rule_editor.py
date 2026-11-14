@@ -12,8 +12,9 @@
 则不落盘，错误信息会返回给页面。
 
 运行：
-    python rule_editor.py                  # http://127.0.0.1:8765
+    python rule_editor.py                  # http://0.0.0.0:8765（默认监听所有网卡）
     python rule_editor.py --port 9000      # 换端口
+    python rule_editor.py --host 127.0.0.1 # 仅本机可访问
     python rule_editor.py -c config.json   # 指定配置文件
 
 依赖：仅 Python 标准库。
@@ -173,7 +174,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="market-monitor 规则编辑器")
     parser.add_argument("-c", "--config", default=os.path.join(_BASE_DIR, "config.json"),
                         help="配置文件路径，默认同目录 config.json")
-    parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（所有网卡）")
     parser.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
     args = parser.parse_args()
 
