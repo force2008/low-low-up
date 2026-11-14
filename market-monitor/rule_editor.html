@@ -101,7 +101,7 @@
   /* ---------- 手机端适配 ---------- */
   @media (max-width: 640px) {
     /* 顶栏：压成单行，隐藏次要信息，避免换行占高度 */
-    .bar { gap: 8px; padding: 8px 12px; }
+    .bar { gap: 6px; padding: 8px 12px; }
     .bar .sub, .bar .path, .bar .spacer { display: none; }
     .bar .logo { font-size: 15px; }
     .bar .dirty { font-size: 11px; }
@@ -143,6 +143,7 @@
   <span class="dirty hidden" id="dirtyTag">● 未保存</span>
   <button class="btn" id="btnReload"><span class="t-full">重新加载</span><span class="t-mini">重载</span></button>
   <button class="btn" id="btnAdd"><span class="t-full">+ 新增规则</span><span class="t-mini">+ 新增</span></button>
+  <button class="btn" id="btnImport"><span class="t-full">数据预加载</span><span class="t-mini">导入</span></button>
   <button class="btn primary" id="btnSave" disabled>保存</button>
 </div>
 
@@ -238,11 +239,11 @@ function optLabel(group, value) {
 }
 
 /* ---------------- 状态提示 ---------------- */
-function showStatus(kind, text) {
+function showStatus(kind, text, autoHide = true) {
   const el = document.getElementById("status");
   el.className = "status " + kind;
   el.textContent = text;
-  if (kind === "ok") setTimeout(() => el.classList.add("hidden"), 4000);
+  if (kind === "ok" && autoHide) setTimeout(() => el.classList.add("hidden"), 4000);
 }
 function hideStatus() { document.getElementById("status").classList.add("hidden"); }
 
@@ -509,6 +510,30 @@ document.getElementById("btnSave").addEventListener("click", async () => {
   } finally {
     btn.textContent = "保存";
     btn.disabled = !state.dirty;
+  }
+});
+
+document.getElementById("btnImport").addEventListener("click", async () => {
+  const btn = document.getElementById("btnImport");
+  if (!confirm("将从天勤拉取历史 K 线并写入本地库（按 config.json 现有内容，未保存的规则改动不生效），耗时可能较长。现在开始导入？")) return;
+
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.textContent = "导入中…";
+  showStatus("ok", "数据导入中，请稍候（可能需要数十秒到数分钟）…", false);
+  try {
+    const resp = await fetch("/api/import", { method: "POST" });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) {
+      showStatus("err", "导入失败：" + (data.error || resp.status) + (data.output ? "\n" + data.output : ""), false);
+    } else {
+      showStatus("ok", "数据导入完成。\n" + (data.output || ""), false);
+    }
+  } catch (err) {
+    showStatus("err", "导入失败：" + err, false);
+  } finally {
+    btn.innerHTML = original;
+    btn.disabled = false;
   }
 });
 

@@ -12,10 +12,12 @@
 则不落盘，错误信息会返回给页面。
 
 运行：
-    python rule_editor.py                  # http://0.0.0.0:8765（默认监听所有网卡）
+    python rule_editor.py                  # http://0.0.0.0:9000（默认监听所有网卡）
     python rule_editor.py --port 9000      # 换端口
     python rule_editor.py --host 127.0.0.1 # 仅本机可访问
     python rule_editor.py -c config.json   # 指定配置文件
+
+页面上的「数据预加载」按钮会调用 data/import_kline.py，按当前配置导入一次历史 K 线。
 
 依赖：仅 Python 标准库。
 """
@@ -23,7 +25,9 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +38,10 @@ from config_loader import ConfigError, load_config  # noqa: E402
 from conditions import SUPPORTED_TYPES  # noqa: E402
 
 _HTML_FILE = os.path.join(_BASE_DIR, "rule_editor.html")
+_IMPORT_SCRIPT = os.path.join(_BASE_DIR, "data", "import_kline.py")
+
+# 保证同一时间只有一个数据导入任务在跑
+_import_lock = threading.Lock()
 
 
 # ==================== 配置文件读写 ====================
@@ -124,6 +132,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/rules":
             return self._api_save_rules()
+        if path == "/api/import":
+            return self._api_import_kline()
         self._send_json(404, {"ok": False, "error": f"未知路径：{path}"})
 
     # ---------- 页面 ----------
@@ -167,6 +177,43 @@ class _Handler(BaseHTTPRequestHandler):
             "ok": True,
             "message": "已保存；正在运行的监控程序会在下一次轮询内自动热加载",
             "rules": [_public_rule(rule) for rule in config["rules"]],
+        })
+
+    # ---------- 数据预加载 ----------
+    def _api_import_kline(self):
+        """触发 data/import_kline.py 导入一次历史 K 线（同步等待结果）"""
+        if not os.path.exists(_IMPORT_SCRIPT):
+            return self._send_json(500, {"ok": False, "error": f"未找到导入脚本：{_IMPORT_SCRIPT}"})
+        if not _import_lock.acquire(blocking=False):
+            return self._send_json(409, {"ok": False, "error": "已有导入任务正在运行，请稍候"})
+
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"  # 统一子进程输出编码，避免中文乱码
+        env["PYTHONUTF8"] = "1"
+        try:
+            proc = subprocess.run(
+                [sys.executable, _IMPORT_SCRIPT, "-c", self.config_path],
+                cwd=_BASE_DIR,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            return self._send_json(504, {"ok": False, "error": "导入超时（超过 30 分钟）"})
+        except Exception as exc:
+            return self._send_json(500, {"ok": False, "error": f"启动导入失败：{exc}"})
+        finally:
+            _import_lock.release()
+
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return self._send_json(200 if proc.returncode == 0 else 500, {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "message": "数据导入完成" if proc.returncode == 0 else "数据导入失败",
+            "output": output[-8000:],
         })
 
 
