@@ -268,6 +268,23 @@ def _normalize_rule(item: Dict[str, Any], index: int) -> Dict[str, Any]:
         if source not in ("price", "high", "low", "close"):
             raise ConfigError(f"规则「{name}」的 price_breakout.source 只能是 price/high/low/close")
         params["source"] = source
+    elif rule_type in ("max_bearish_candle", "max_bullish_candle"):
+        try:
+            params["lookback"] = max(2, int(params.get("lookback") or 20))
+        except (TypeError, ValueError):
+            raise ConfigError(f"规则「{name}」的 lookback 必须是整数（回看根数，最小 2）")
+        color_basis = str(params.get("color_basis") or "prev_close").strip().lower()
+        if color_basis not in ("prev_close", "open"):
+            raise ConfigError(f"规则「{name}」的 color_basis 只能是 prev_close / open")
+        params["color_basis"] = color_basis
+        measure = str(params.get("measure") or "change").strip().lower()
+        if measure not in ("change", "body", "range"):
+            raise ConfigError(f"规则「{name}」的 measure 只能是 change / body / range")
+        params["measure"] = measure
+        realtime = params.get("realtime", True)
+        if isinstance(realtime, str):
+            realtime = realtime.strip().lower() not in ("false", "0", "no", "off", "")
+        params["realtime"] = bool(realtime)
 
     direction = _normalize_direction(item.get("direction"))
 
