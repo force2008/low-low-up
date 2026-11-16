@@ -61,71 +61,117 @@ def _nums(bar) -> Tuple[Any, float, float, float, float, float]:
     return bar[0], float(bar[1]), float(bar[2]), float(bar[3]), float(bar[4]), float(bar[5])
 
 
-def _candle_size(bar, measure: str) -> float:
-    """计算 K 线幅度。
+def _candle_size(bar, measure: str, prev_close: Optional[float] = None) -> Optional[float]:
+    """计算 K 线「大小」。
 
-    - ``measure="body"``：实体大小（阴线为 open-close，阳线为 close-open）
-    - ``measure="range"``：全幅（high-low）
+    - ``measure="change"``：涨跌幅 |收盘 - 前收|（需要前一根收盘价，缺失时返回 None）
+    - ``measure="body"``：实体 |收盘 - 开盘|
+    - ``measure="range"``：全幅 最高 - 最低
     """
     if measure == "range":
         return float(bar[2]) - float(bar[3])
-    bar_open = float(bar[1])
+    if measure == "change":
+        if prev_close is None:
+            return None
+        return abs(float(bar[4]) - float(prev_close))
+    return abs(float(bar[4]) - float(bar[1]))
+
+
+def _candle_direction(bar, color_basis: str, prev_close: Optional[float]) -> int:
+    """K 线方向：1=阳(涨) / -1=阴(跌) / 0=平或无法判定。
+
+    - ``color_basis="prev_close"``：收盘 > 前收 为阳，收盘 < 前收 为阴
+    - ``color_basis="open"``：收盘 > 开盘 为阳，收盘 < 开盘 为阴
+    """
     bar_close = float(bar[4])
-    return abs(bar_close - bar_open)
+    if color_basis == "open":
+        ref = float(bar[1])
+    else:
+        if prev_close is None:
+            return 0
+        ref = float(prev_close)
+    if bar_close > ref:
+        return 1
+    if bar_close < ref:
+        return -1
+    return 0
 
 
 def _eval_max_extreme_candle(
     closed_bars: List[Bar],
     params: Dict[str, Any],
+    forming_bar: Optional[Bar],
     is_bearish: bool,
 ) -> Optional[Dict[str, Any]]:
-    """通用实现：最后一根已收盘 K 线是否为「近期最大阴/阳线」"""
-    if len(closed_bars) < 2:
-        return None
+    """通用实现：当前 K 线是否为「近期最大阴/阳线」。
 
+    参数：
+        - lookback：回看根数，默认 20，最小 2
+        - color_basis：阴阳依据，prev_close=较前一根收盘价（默认）/ open=较开盘价
+        - measure：大小口径，change=涨跌幅|收-前收|（默认）/ body=实体 / range=全幅
+        - realtime：是否盘中实时，默认 True（用未收盘 K 线判定）；False 则仅收盘后判定
+    """
     lookback = max(2, int(params.get("lookback", 20)))
-    measure = str(params.get("measure") or "body").strip().lower()
-    if measure not in ("body", "range"):
-        measure = "body"
+    measure = str(params.get("measure") or "change").strip().lower()
+    if measure not in ("change", "body", "range"):
+        measure = "change"
+    color_basis = str(params.get("color_basis") or "prev_close").strip().lower()
+    if color_basis not in ("prev_close", "open"):
+        color_basis = "prev_close"
+    realtime = bool(params.get("realtime", True))
 
-    last = closed_bars[-1]
-    _, last_open, _, _, last_close, _ = _nums(last)
-
-    # 阴线要求收 < 开；阳线要求收 > 开
-    if is_bearish and not last_close < last_open:
+    # 选定「当前 K 线」：实时优先用未收盘 K 线，否则退回最后一根已收盘 K 线
+    use_forming = realtime and forming_bar is not None
+    if use_forming:
+        current = forming_bar
+        history = closed_bars
+    elif closed_bars:
+        current = closed_bars[-1]
+        history = closed_bars[:-1]
+    else:
         return None
-    if not is_bearish and not last_close > last_open:
+    if not history:
+        return None  # 至少需要一根参照 K 线
+
+    want = -1 if is_bearish else 1
+
+    # 当前 K 线的方向与大小
+    cur_prev_close = float(history[-1][4])
+    if _candle_direction(current, color_basis, cur_prev_close) != want:
+        return None
+    cur_size = _candle_size(current, measure, cur_prev_close)
+    if cur_size is None or cur_size <= 0:
         return None
 
-    last_size = _candle_size(last, measure)
-    if last_size <= 0:
-        return None
-
-    window = closed_bars[-min(lookback, len(closed_bars)):]
+    # 历史对照窗口：当前 K 线之前的最近 lookback-1 根
+    take_n = min(lookback - 1, len(history))
+    start = len(history) - take_n
     others: List[float] = []
-    for bar in window[:-1]:
-        _, bar_open, _, _, bar_close, _ = _nums(bar)
-        if is_bearish and bar_close >= bar_open:
+    for offset in range(take_n):
+        seq_idx = start + offset
+        bar = history[seq_idx]
+        prev_close = float(history[seq_idx - 1][4]) if seq_idx - 1 >= 0 else None
+        if _candle_direction(bar, color_basis, prev_close) != want:
             continue
-        if not is_bearish and bar_close <= bar_open:
-            continue
-        size = _candle_size(bar, measure)
-        if size > 0:
+        size = _candle_size(bar, measure, prev_close)
+        if size is not None and size > 0:
             others.append(size)
 
     max_other = max(others) if others else 0.0
-    if last_size < max_other:
+    if cur_size < max_other:
         return None
 
     kind = "阴" if is_bearish else "阳"
-    measure_cn = "实体" if measure == "body" else "振幅"
+    measure_cn = {"change": "涨跌幅", "body": "实体", "range": "振幅"}[measure]
+    basis_cn = "较前收" if color_basis == "prev_close" else "较开盘"
+    timing_cn = "盘中实时" if use_forming else "收盘确认"
     return {
-        "bar_time": str(last[0]),
-        "price": last_close,
+        "bar_time": str(current[0]),
+        "price": float(current[4]),
         "direction": "short" if is_bearish else "long",
         "detail": (
-            f"近 {lookback} 根内最大{kind}线触发：{measure_cn}={last_size:.2f}"
-            f"（此前最大={max_other:.2f}）"
+            f"近 {lookback} 根内最大{kind}线触发（{basis_cn}，{measure_cn}，{timing_cn}）："
+            f"{cur_size:.2f}（此前最大={max_other:.2f}）"
         ),
     }
 
@@ -135,8 +181,8 @@ def eval_max_bearish_candle(
     params: Dict[str, Any],
     forming_bar: Optional[Bar] = None,
 ) -> Optional[Dict[str, Any]]:
-    """近期最大阴线：最后一根已收盘 K 线是近 lookback 根内最大的阴线（默认按实体）"""
-    return _eval_max_extreme_candle(closed_bars, params, is_bearish=True)
+    """近期最大阴线：当前 K 线是近 lookback 根内最大的阴线（默认较前收、涨跌幅、盘中实时）"""
+    return _eval_max_extreme_candle(closed_bars, params, forming_bar, is_bearish=True)
 
 
 def eval_max_bullish_candle(
@@ -144,8 +190,8 @@ def eval_max_bullish_candle(
     params: Dict[str, Any],
     forming_bar: Optional[Bar] = None,
 ) -> Optional[Dict[str, Any]]:
-    """近期最大阳线：最后一根已收盘 K 线是近 lookback 根内最大的阳线（默认按实体）"""
-    return _eval_max_extreme_candle(closed_bars, params, is_bearish=False)
+    """近期最大阳线：当前 K 线是近 lookback 根内最大的阳线（默认较前收、涨跌幅、盘中实时）"""
+    return _eval_max_extreme_candle(closed_bars, params, forming_bar, is_bearish=False)
 
 
 def eval_boll_touch(
