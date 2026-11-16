@@ -130,92 +130,282 @@
     "",
     "============================================================================"
   ],
-
   "env": "online",
   "poll_interval_sec": 3,
   "history_bars": 240,
   "signal_file": "signals/monitor_signals.json",
-
   "kline_db": {
     "enabled": true,
     "path": "data/monitor_kline.db"
   },
-
   "feishu": {
     "enabled": true,
     "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/c5b2b07d-95f7-4a4c-8a97-60feaaa260ac"
   },
-
-
   "rules": [
     {
-      "name": "ao挑战前期平台高点2667-开空",
-      "enabled": true,
-      "symbols": ["ao2701"],
-      "period": "m5",
-      "type": "price_breakout",
-      "params": { "price": 2667, "operator": ">=", "source": "price" },
-      "direction": "short",
-      "actions": ["signal", "feishu"],
-      "cooldown_sec": 3600
-    },
-    {
       "name": "FG挑战前期平台高点891-开空",
-      "symbols": ["FG701"],
       "enabled": true,
+      "symbols": [
+        "FG701"
+      ],
       "period": "m5",
       "type": "price_breakout",
-      "params": { "price": 891, "operator": ">=", "source": "price" },
-      "actions": ["feishu"],
+      "params": {
+        "price": 924,
+        "operator": ">=",
+        "source": "price"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     },
     {
-      "name": "UR挑战前期平台高点1753-开空",
-      "symbols": ["UR701"],
+      "name": "SA挑战前期平台高点993-开空",
       "enabled": true,
+      "symbols": [
+        "SA701"
+      ],
       "period": "m5",
       "type": "price_breakout",
-      "params": { "price": 1753, "operator": ">=", "source": "price" },
-      "actions": ["feishu"],
+      "params": {
+        "price": 992,
+        "operator": ">=",
+        "source": "price"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     },
     {
       "name": "玉米挑战前期平台低点2220-开空",
-      "symbols": ["c2701"],
       "enabled": true,
+      "symbols": [
+        "c2701"
+      ],
       "period": "m5",
       "type": "price_breakout",
-      "params": { "price": 2220, "operator": ">=", "source": "price" },
-      "actions": ["feishu"],
+      "params": {
+        "price": 2220,
+        "operator": ">=",
+        "source": "price"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     },
     {
       "name": "苹果挑战前期平台高点6068-开空",
-      "symbols": ["AP701"],
       "enabled": true,
+      "symbols": [
+        "AP701"
+      ],
       "period": "m5",
       "type": "price_breakout",
-      "params": { "price": 6068, "operator": ">=", "source": "price" },
-      "actions": ["feishu"],
+      "params": {
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 6240
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     },
     {
-      "name": "苹果m60触碰布林中轨-告警",
-      "enabled": false,
-      "period": "m60",
-      "type": "boll_touch",
-      "params": { "period": 20, "multiplier": 2.0, "band": "middle", "source": "price", "operator": "<=", "tolerance_pct": 0.0 },
-      "actions": ["feishu"],
+      "name": "棉花5分钟最大阴线-告警",
+      "enabled": true,
+      "symbols": [
+        "CF701"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     },
     {
       "name": "生猪挑战前期平台高点10000-开空",
-      "symbols": ["lh2701"],
       "enabled": true,
+      "symbols": [
+        "lh2701"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "鸡蛋1小时k线最大阴线",
+      "enabled": true,
+      "symbols": [
+        "jd2612"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "多晶硅破前低",
+      "enabled": true,
+      "symbols": [
+        "ps2701"
+      ],
       "period": "m5",
       "type": "price_breakout",
-      "params": { "price": 10000, "operator": ">=", "source": "price" },
-      "actions": ["feishu"],
+      "params": {
+        "operator": "<=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 32845
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "烧碱5分钟最大阳线",
+      "enabled": true,
+      "symbols": [
+        "SH701"
+      ],
+      "period": "m5",
+      "type": "max_bullish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "不锈钢日线回踩中轨",
+      "enabled": true,
+      "symbols": [
+        "ss2701"
+      ],
+      "period": "d1",
+      "type": "boll_touch",
+      "params": {
+        "period": 20,
+        "multiplier": 2,
+        "band": "middle",
+        "source": "price",
+        "tolerance_pct": 0,
+        "operator": "<="
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "棕榈5分钟最大阴线",
+      "enabled": true,
+      "symbols": [
+        "p2701"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "ru5分钟最大阴线",
+      "enabled": true,
+      "symbols": [
+        "ru2701"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "Jm最大5分钟阴线",
+      "enabled": true,
+      "symbols": [
+        "jm2701"
+      ],
+      "period": "m5",
+      "type": "max_bearish_candle",
+      "params": {
+        "lookback": 20,
+        "measure": "body"
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "Ao创新低2528",
+      "enabled": true,
+      "symbols": [
+        "ao2701"
+      ],
+      "period": "m5",
+      "type": "price_breakout",
+      "params": {
+        "operator": "<=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 2528
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
       "cooldown_sec": 3600
     }
   ]

@@ -21,12 +21,7 @@ REM Otherwise probe the usual conda locations and keep the first that
 REM can actually import sqlite3 + numpy (some envs ship a broken
 REM _sqlite3 DLL, which market_monitor.py needs).
 for %%P in (
-    "C:\Users\force\.conda\envs\python310\python.exe"
-    "C:\Users\force\.conda\envs\bigtrade\python.exe"
-    "C:\ProgramData\miniconda3\envs\python310\python.exe"
-    "%USERPROFILE%\miniconda3\envs\python310\python.exe"
-    "%LOCALAPPDATA%\Programs\Python\Python313\python.exe"
-    "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    "D:\Miniconda\envs\python310\python.exe"
 ) do (
     if not defined PY if exist %%P (
         %%P -c "import sqlite3, numpy" >nul 2>nul && set "PY=%%~P"
@@ -51,7 +46,7 @@ if not defined PY (
 REM ---------- 2. run ----------
 cd /d "%~dp0"
 echo [START] %date% %time%  python=%PY%
-"%PY%" market_monitor.py %*
+"%PY%" market_monitor.py --env online %*
 set "RC=%ERRORLEVEL%"
 echo [EXIT ] %date% %time%  rc=%RC%
 endlocal & exit /b %RC%
