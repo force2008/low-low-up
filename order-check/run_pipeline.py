@@ -239,7 +239,14 @@ for h in logger.handlers:
 # 导出用 pyautogui 按「固定桌面绝对坐标」点击，一旦有人用 RDP 登录，桌面会被接管/
 # 切成分辨率不同的会话，点击全部错位。这里在每次导出前把会话交还控制台(console)。
 # 实现见 console_keepalive.py（与 account_monitor.py 共用同一份逻辑）。
-from console_keepalive import ensure_console_session
+try:
+    from console_keepalive import ensure_console_session
+except ImportError as _e:
+    def ensure_console_session(logger=None, force=False):
+        (logger or logging.getLogger(__name__)).error(
+            "[会话] 未找到 console_keepalive 模块(%s)，本次跳过会话保活", _e
+        )
+        return False
 # =================================================
 
 # ==================== CTP 环境检测 ====================

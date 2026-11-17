@@ -81,7 +81,14 @@ def send_feishu_text(text):
 # 具体实现见 console_keepalive.py（与 run_pipeline.py 共用同一份逻辑）：
 #   每次调用都会以 INFO/WARNING 打印「自身会话 / RDP 会话 / 全部会话」，
 #   不会像以前那样在多数分支静默跳过，方便确认保活到底有没有生效。
-from console_keepalive import ensure_console_session
+try:
+    from console_keepalive import ensure_console_session
+except ImportError as _e:
+    def ensure_console_session(logger=None, force=False):
+        (logger or logging.getLogger(__name__)).error(
+            "[会话] 未找到 console_keepalive 模块(%s)，本次跳过会话保活", _e
+        )
+        return False
 
 # 周期检查间隔（秒）；每次导出前也会再查一次，双保险
 CONSOLE_KEEPALIVE_INTERVAL = 60
