@@ -235,6 +235,13 @@ for h in logger.handlers:
     h.flush()
 # =================================================
 
+# ==================== 会话保活：把 RDP 会话切回控制台 ====================
+# 导出用 pyautogui 按「固定桌面绝对坐标」点击，一旦有人用 RDP 登录，桌面会被接管/
+# 切成分辨率不同的会话，点击全部错位。这里在每次导出前把会话交还控制台(console)。
+# 实现见 console_keepalive.py（与 account_monitor.py 共用同一份逻辑）。
+from console_keepalive import ensure_console_session
+# =================================================
+
 # ==================== CTP 环境检测 ====================
 try:
     from config import config as _ctp_config
@@ -1151,6 +1158,8 @@ def run_once() -> bool:
     logger.info("=" * 50)
     logger.info("开始执行: 导出 -> 持仓差异对比")
     logger.info(">>> 步骤 1/3: 执行自动导出...")
+    # 导出前先做一次会话保活：桌面被 RDP 抢占时，pyautogui 固定坐标会全部错位
+    ensure_console_session(logger)
     try:
         import automate_export
         success = automate_export.main()
@@ -1441,6 +1450,8 @@ def main():
 
     # 启动时先执行导出，获取最新持仓数据
     logger.info(">>> 启动时先执行导出...")
+    # 导出前先做一次会话保活：桌面被 RDP 抢占时，pyautogui 固定坐标会全部错位
+    ensure_console_session(logger)
     try:
         import automate_export
         export_ok = automate_export.main()
