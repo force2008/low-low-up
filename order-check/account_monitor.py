@@ -22,6 +22,7 @@ import json
 import logging
 import glob
 import csv
+import subprocess
 import faulthandler
 from logging.handlers import RotatingFileHandler
 
@@ -75,6 +76,101 @@ def send_feishu_text(text):
         logger.info("[飞书] 通知发送状态: %s", resp.status_code)
     except Exception as e:
         logger.error("[飞书] 通知发送失败: %s", e)
+
+
+# ==================== 会话保活：把 RDP 会话切回控制台 ====================
+# 背景：
+#   导出步骤(automate_export.py)用 pyautogui 按「固定桌面坐标」点击，依赖一个
+#   活跃且分辨率固定的桌面。用微软远程桌面(RDP)登录后：
+#     1) Windows 会新建/接管一个 RDP 会话，控制台(VNC)会话被断开；
+#     2) RDP 会话的分辨率由客户端(手机端)决定，且会话会「记住」该分辨率。
+#   于是 VNC 里看到的桌面尺寸/坐标全变了，导出点击全部错位、失败。
+#
+# 解决：
+#   用 tscon 把当前会话「归还」给控制台(console)，系统相当于「有人正坐在机器前
+#   使用桌面」——桌面持续在虚拟显示器上按固定分辨率渲染，即使断开 RDP 也不会
+#   黑屏，GUI 自动化/导出继续可用。
+#
+# 注意：
+#   - tscon 需要管理员权限，否则报「拒绝访问」；
+#   - 切换瞬间你当前的 RDP 连接会被断开（提示「另一个用户已连接」），属正常现象；
+#   - CONSOLE_KEEPALIVE_INTERVAL <= 0 时只在启动瞬间检查一次，不做周期检查。
+CONSOLE_KEEPALIVE_INTERVAL = 60  # 秒
+
+
+def _get_process_session_id():
+    """获取当前进程所在的 Windows 会话 ID"""
+    try:
+        import ctypes
+        sid = ctypes.c_ulong(0)
+        ok = ctypes.windll.kernel32.ProcessIdToSessionId(
+            ctypes.c_ulong(os.getpid()), ctypes.byref(sid)
+        )
+        return sid.value if ok else None
+    except Exception:
+        return None
+
+
+def _query_session_name(session_id):
+    """用 qwinsta 查询指定会话的「会话名 / 状态」"""
+    try:
+        out = subprocess.check_output(["qwinsta"], stderr=subprocess.STDOUT)
+    except Exception as e:
+        logger.debug("[会话] qwinsta 执行失败: %s", e)
+        return None, None
+
+    text = out.decode("gbk", errors="ignore")
+    target = str(session_id)
+    for line in text.splitlines():
+        tokens = line.replace(">", " ").split()
+        if target in tokens:
+            idx = tokens.index(target)
+            name = tokens[0]
+            state = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+            return name, state
+    return None, None
+
+
+def ensure_console_session():
+    """若程序当前运行在 RDP 会话中，则把该会话切回控制台(console)。
+
+    Returns:
+        bool: 本次是否真正执行了切换
+    """
+    if os.name != "nt":
+        return False
+
+    session_id = _get_process_session_id()
+    if session_id is None:
+        logger.debug("[会话] 未能获取当前会话 ID，跳过切换")
+        return False
+
+    name, state = _query_session_name(session_id)
+    if not name:
+        logger.debug("[会话] 未能解析当前会话(id=%s)，跳过切换", session_id)
+        return False
+
+    if name.lower().startswith("console"):
+        logger.debug("[会话] 当前已在控制台会话(%s)，无需切换", name)
+        return False
+
+    logger.warning(
+        "[会话] 当前运行在 RDP 会话 %s (id=%s, 状态=%s)，切换到控制台...",
+        name, session_id, state,
+    )
+    try:
+        proc = subprocess.run(
+            ["tscon.exe", str(session_id), "/dest:console"],
+            capture_output=True, text=True, timeout=15,
+        )
+        msg = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode == 0:
+            logger.info("[会话] 已切回控制台会话 (rc=0) %s", msg)
+            return True
+        logger.error("[会话] 切换失败 rc=%s %s（请以管理员身份运行）", proc.returncode, msg)
+    except Exception as e:
+        logger.error("[会话] 执行 tscon 失败: %s", e)
+    return False
 
 
 # ==================== 交易时间段配置 ====================
@@ -437,6 +533,9 @@ def main():
     if not _is_trading_day():
         return
 
+    # 启动即做一次会话保活：若当前在 RDP 会话中，切回控制台，避免桌面坐标失效
+    switched_to_console = ensure_console_session()
+
     logger.info("=" * 50)
     logger.info("账户资金监控程序已启动")
     logger.info("当前时段结束时间: %s", _RESPONSIBLE_SESSION_END)
@@ -446,13 +545,17 @@ def main():
     # 启动时发送通知
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     session_end_str = _RESPONSIBLE_SESSION_END.strftime('%H:%M')
-    send_feishu_text(
+    startup_msg = (
         f"🚀 账户监控已启动\n"
         f"时间: {now_str}\n"
         f"时段结束: {session_end_str}"
     )
+    if switched_to_console:
+        startup_msg += "\n🖥️ 已从RDP切回控制台（桌面保活）"
+    send_feishu_text(startup_msg)
 
     last_export_time = 0
+    last_session_check = time.time()
     consecutive_failures = 0
     max_consecutive_failures = 3
 
@@ -460,6 +563,13 @@ def main():
         try:
             now = datetime.datetime.now()
             now_time = now.time()
+
+            # 周期性会话保活：期间若有人用 RDP 登录，会话会被抢占/切换，
+            # 导致桌面坐标失效，这里自动切回控制台
+            if CONSOLE_KEEPALIVE_INTERVAL > 0 and \
+                    now.timestamp() - last_session_check >= CONSOLE_KEEPALIVE_INTERVAL:
+                last_session_check = now.timestamp()
+                ensure_console_session()
 
             # 检查是否超过时段结束时间（7x24/simu/--force 模式跳过，允许非交易时段持续运行）
             _need_exit_session_end = bool(is_after_session_end(now_time, _RESPONSIBLE_SESSION_END)) and not _SKIP_TRADING_CHECK
