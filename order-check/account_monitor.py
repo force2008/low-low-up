@@ -22,6 +22,8 @@ import json
 import logging
 import glob
 import csv
+import io
+import contextlib
 import faulthandler
 from logging.handlers import RotatingFileHandler
 
@@ -75,6 +77,23 @@ def send_feishu_text(text):
         logger.info("[飞书] 通知发送状态: %s", resp.status_code)
     except Exception as e:
         logger.error("[飞书] 通知发送失败: %s", e)
+
+
+# ==================== 会话保活：把 RDP 会话切回控制台 ====================
+# 具体实现见 console_keepalive.py（与 run_pipeline.py 共用同一份逻辑）：
+#   每次调用都会以 INFO/WARNING 打印「自身会话 / RDP 会话 / 全部会话」，
+#   不会像以前那样在多数分支静默跳过，方便确认保活到底有没有生效。
+try:
+    from console_keepalive import ensure_console_session
+except ImportError as _e:
+    def ensure_console_session(logger=None, force=False):
+        (logger or logging.getLogger(__name__)).error(
+            "[会话] 未找到 console_keepalive 模块(%s)，本次跳过会话保活", _e
+        )
+        return False
+
+# 周期检查间隔（秒）；每次导出前也会再查一次，双保险
+CONSOLE_KEEPALIVE_INTERVAL = 60
 
 
 # ==================== 交易时间段配置 ====================
@@ -163,12 +182,28 @@ _RESPONSIBLE_SESSION_END = get_session_end_time(datetime.datetime.now().time())
 # ==================== 导出功能 ====================
 def run_export():
     """执行自动导出，使用 local_account_config.py 的配置"""
+    # 导出前先做一次会话保活：若桌面被 RDP 抢占，pyautogui 的固定坐标会全部错位
+    ensure_console_session(logger)
+    # account_export 内部全部用 print，计划任务下 stdout 无处可见、全部丢失。
+    # 这里把它的输出接进日志：失败时逐行打出来，就能看清卡在哪一步。
+    buf = io.StringIO()
     try:
         import account_export
-        success = account_export.main()
+        t0 = time.time()
+        with contextlib.redirect_stdout(buf):
+            success = account_export.main()
+        elapsed = time.time() - t0
+        if success:
+            logger.info("[导出] 成功，耗时 %.1f 秒", elapsed)
+        else:
+            logger.warning("[导出] 失败，耗时 %.1f 秒，过程输出如下:", elapsed)
+            for line in buf.getvalue().splitlines():
+                logger.warning("[导出]   %s", line)
         return success
     except Exception as e:
         logger.error("[导出] 导出步骤异常: %s", e)
+        for line in buf.getvalue().splitlines():
+            logger.warning("[导出]   %s", line)
         return False
 
 
@@ -437,6 +472,9 @@ def main():
     if not _is_trading_day():
         return
 
+    # 启动即做一次会话保活：若当前在 RDP 会话中，切回控制台，避免桌面坐标失效
+    switched_to_console = ensure_console_session(logger)
+
     logger.info("=" * 50)
     logger.info("账户资金监控程序已启动")
     logger.info("当前时段结束时间: %s", _RESPONSIBLE_SESSION_END)
@@ -446,13 +484,17 @@ def main():
     # 启动时发送通知
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     session_end_str = _RESPONSIBLE_SESSION_END.strftime('%H:%M')
-    send_feishu_text(
+    startup_msg = (
         f"🚀 账户监控已启动\n"
         f"时间: {now_str}\n"
         f"时段结束: {session_end_str}"
     )
+    if switched_to_console:
+        startup_msg += "\n🖥️ 已从RDP切回控制台（桌面保活）"
+    send_feishu_text(startup_msg)
 
     last_export_time = 0
+    last_session_check = time.time()
     consecutive_failures = 0
     max_consecutive_failures = 3
 
@@ -460,6 +502,13 @@ def main():
         try:
             now = datetime.datetime.now()
             now_time = now.time()
+
+            # 周期性会话保活：期间若有人用 RDP 登录，会话会被抢占/切换，
+            # 导致桌面坐标失效，这里自动切回控制台
+            if CONSOLE_KEEPALIVE_INTERVAL > 0 and \
+                    now.timestamp() - last_session_check >= CONSOLE_KEEPALIVE_INTERVAL:
+                last_session_check = now.timestamp()
+                ensure_console_session(logger)
 
             # 检查是否超过时段结束时间（7x24/simu/--force 模式跳过，允许非交易时段持续运行）
             _need_exit_session_end = bool(is_after_session_end(now_time, _RESPONSIBLE_SESSION_END)) and not _SKIP_TRADING_CHECK

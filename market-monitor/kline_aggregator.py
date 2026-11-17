@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+"""行情 tick 聚合为分钟 K 线，并维护内存滚动窗口。
+
+- :class:`KlineStore`：把已收盘 K 线持久化到本地 SQLite，供重启后预热
+- :class:`KlineAggregator`：把 CTP tick 合成多周期 K 线，维护历史窗口
+"""
+
+import logging
+import os
+import sqlite3
+import threading
+from collections import deque
+from datetime import datetime, timedelta
+from typing import Callable, Deque, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# K 线元组：(datetime, open, high, low, close, volume)
+Bar = Tuple[str, float, float, float, float, int]
+
+_DEFAULT_HISTORY_BARS = 240
+
+
+def bar_time(dt: datetime, minutes: int) -> datetime:
+    """返回 dt 所在周期 K 线的起始时间"""
+    step = max(1, int(minutes))
+    minutes_since_midnight = dt.hour * 60 + dt.minute
+    bucket = (minutes_since_midnight // step) * step
+    return dt.replace(
+        hour=(bucket // 60) % 24,
+        minute=bucket % 60,
+        second=0,
+        microsecond=0,
+    )
+
+
+class KlineStore:
+    """本地 K 线持久化（SQLite）。"""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        directory = os.path.dirname(os.path.abspath(db_path))
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kline (
+                symbol   TEXT NOT NULL,
+                period   TEXT NOT NULL,
+                datetime TEXT NOT NULL,
+                open     REAL NOT NULL,
+                high     REAL NOT NULL,
+                low      REAL NOT NULL,
+                close    REAL NOT NULL,
+                volume   INTEGER NOT NULL,
+                PRIMARY KEY (symbol, period, datetime)
+            )
+            """
+        )
+        self._conn.commit()
+
+    def save_bar(self, symbol: str, period: str, bar: Bar) -> None:
+        """写入/更新一根已收盘 K 线"""
+        try:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO kline
+                (symbol, period, datetime, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, period, str(bar[0]), bar[1], bar[2], bar[3], bar[4], bar[5]),
+            )
+            self._conn.commit()
+        except Exception as exc:
+            logger.warning("K 线入库失败 %s %s %s: %s", symbol, period, bar[0], exc)
+
+    def load_recent(self, symbol: str, period: str, limit: int) -> List[Bar]:
+        """读取最近 limit 根 K 线（按时间正序返回）"""
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT datetime, open, high, low, close, volume FROM kline
+                WHERE symbol = ? AND period = ?
+                ORDER BY datetime DESC LIMIT ?
+                """,
+                (symbol, period, int(limit)),
+            ).fetchall()
+        except Exception as exc:
+            logger.warning("读取历史 K 线失败 %s %s: %s", symbol, period, exc)
+            return []
+
+        result: List[Bar] = []
+        for row in reversed(rows):
+            result.append(
+                (str(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), int(row[5] or 0))
+            )
+        return result
+
+    def close(self) -> None:
+        """关闭数据库连接"""
+        try:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+        except Exception:
+            pass
+
+
+class KlineAggregator:
+    """把 tick 合成多周期 K 线，并维护每根 K 线的历史窗口。"""
+
+    def __init__(
+        self,
+        symbols: List[str],
+        periods: Dict[str, int],
+        history_bars: int = _DEFAULT_HISTORY_BARS,
+        store: Optional[KlineStore] = None,
+        session_end_check: Optional[Callable[[str, datetime], bool]] = None,
+    ):
+        """
+        Args:
+            symbols: 订阅的合约列表
+            periods: 周期名字典，如 ``{"m5": 5, "m60": 60}``
+            history_bars: 每个 (合约, 周期) 保留的历史 K 线根数
+            store: 可选，K 线持久化对象
+            session_end_check: 可选，``(symbol, dt) -> bool``，判断 dt 是否恰为交易时段
+                收盘时刻。收盘瞬间的行情快照不属于新周期，会并入上一根 K 线，
+                避免产生 11:30 / 15:00 这类空 K 线。为 None 时不做该判定。
+        """
+        self._lock = threading.RLock()
+        self._symbols: List[str] = [str(s) for s in symbols]
+        self._symbol_set = set(self._symbols)
+        self._periods: Dict[str, int] = {str(k): int(v) for k, v in periods.items()}
+        self._history_bars = max(30, int(history_bars))
+        self._store = store
+        self._session_end_check = session_end_check
+
+        # (symbol, period) -> 当前正在形成的 K 线
+        self._current: Dict[Tuple[str, str], dict] = {}
+        # (symbol, period) -> 已收盘 K 线队列
+        self._history: Dict[Tuple[str, str], Deque[Bar]] = {}
+        # 合约上一次的累计成交量（用于计算增量）
+        self._last_volume: Dict[str, int] = {}
+        # 已打印过「首个 tick」日志的合约（避免重复刷屏）
+        self._first_tick_logged: set = set()
+
+        for symbol in self._symbols:
+            for period in self._periods:
+                self._history[(symbol, period)] = deque(maxlen=self._history_bars)
+
+    # ==================== 属性 ====================
+    @property
+    def symbols(self) -> List[str]:
+        """订阅的合约列表"""
+        return list(self._symbols)
+
+    @property
+    def periods(self) -> Dict[str, int]:
+        """周期名 -> 分钟数"""
+        return dict(self._periods)
+
+    # ==================== 预热 ====================
+    def warmup(self) -> int:
+        """从本地 K 线库预热历史窗口，返回加载的 K 线根数"""
+        if self._store is None:
+            return 0
+
+        total = 0
+        with self._lock:
+            for symbol in self._symbols:
+                for period in self._periods:
+                    bars = self._store.load_recent(symbol, period, self._history_bars)
+                    if not bars:
+                        continue
+                    history = self._history[(symbol, period)]
+                    history.clear()
+                    history.extend(bars)
+                    total += len(bars)
+        return total
+
+    # ==================== 行情接入 ====================
+    def add_tick(
+        self,
+        symbol: str,
+        price: float,
+        cum_volume: int,
+        open_interest: float,
+        dt: datetime,
+    ) -> None:
+        """接入一个 tick，更新各周期当前 K 线，跨周期时收盘上一根。
+
+        Args:
+            symbol: 合约代码
+            price: 最新价
+            cum_volume: 当日累计成交量（CTP 的 Volume 字段）
+            open_interest: 持仓量
+            dt: tick 时间
+        """
+        if symbol not in self._symbol_set or price is None or price <= 0:
+            return
+
+        with self._lock:
+            if symbol not in self._first_tick_logged:
+                self._first_tick_logged.add(symbol)
+                logger.info(
+                    "收到行情 [%s] 首笔 最新价=%s 累计量=%s 时间=%s",
+                    symbol, price, cum_volume, dt.strftime("%Y-%m-%d %H:%M:%S"),
+                )
+
+            cum_volume = int(cum_volume or 0)
+            last_volume = self._last_volume.get(symbol)
+            if last_volume is None or cum_volume < last_volume:
+                # 新的一天或首次收到，累计量即为增量
+                delta = cum_volume
+            else:
+                delta = cum_volume - last_volume
+            if delta < 0:
+                delta = 0
+            self._last_volume[symbol] = cum_volume
+
+            for period, minutes in self._periods.items():
+                key = (symbol, period)
+                kline_start = bar_time(dt, minutes)
+                current = self._current.get(key)
+
+                if current is None:
+                    self._current[key] = self._new_bar(kline_start, price, delta, open_interest, dt)
+                elif kline_start > current["time"]:
+                    if self._is_session_end(symbol, kline_start):
+                        # 收盘时刻的行情快照不属于新周期，并入当前 K 线（补齐收盘价）
+                        self._update_bar(current, price, delta, open_interest, dt)
+                    else:
+                        self._close_bar(key, current)
+                        self._current[key] = self._new_bar(kline_start, price, delta, open_interest, dt)
+                else:
+                    self._update_bar(current, price, delta, open_interest, dt)
+
+    def sweep_stale(self, now: Optional[datetime] = None) -> List[Tuple[str, str, str]]:
+        """收盘已过期的当前 K 线（无新 tick 时也能正常收盘）。
+
+        Returns:
+            已收盘的记录列表 ``[(symbol, period, datetime), ...]``
+        """
+        now = now or datetime.now()
+        closed: List[Tuple[str, str, str]] = []
+        with self._lock:
+            for key, current in list(self._current.items()):
+                minutes = self._periods.get(key[1], 0)
+                if minutes <= 0:
+                    continue
+                if now >= current["time"] + timedelta(minutes=minutes):
+                    self._close_bar(key, current)
+                    closed.append((key[0], key[1], current["time"].strftime("%Y-%m-%d %H:%M:%S")))
+                    del self._current[key]
+        return closed
+
+    def flush_all(self) -> None:
+        """收盘所有当前 K 线（退出时调用）"""
+        with self._lock:
+            for key, current in list(self._current.items()):
+                self._close_bar(key, current)
+            self._current.clear()
+
+    # ==================== 热加载 ====================
+    def reconfigure(self, symbols: List[str], periods: Dict[str, int]) -> Dict[str, list]:
+        """热加载：按新配置调整订阅合约与周期。
+
+        - 新增的合约/周期会补齐历史窗口（并从本地库预热）
+        - 已移除的合约会清空其内存数据
+        - 已存在的周期只增不减（移除周期不影响已订阅合约）
+
+        Args:
+            symbols: 新的合约列表（启用规则合约的并集）
+            periods: 新的周期字典，如 ``{"m5": 5, "m60": 60}``
+
+        Returns:
+            ``{"added_symbols": [...], "removed_symbols": [...], "added_periods": [...]}``
+        """
+        new_symbols = [str(s) for s in symbols]
+        new_periods = {str(k): int(v) for k, v in periods.items()}
+        added_symbols: List[str] = []
+        removed_symbols: List[str] = []
+        added_periods: List[str] = []
+
+        with self._lock:
+            # 周期：只增不减
+            for name, minutes in new_periods.items():
+                if name in self._periods:
+                    continue
+                self._periods[name] = minutes
+                for symbol in self._symbols:
+                    self._history[(symbol, name)] = deque(maxlen=self._history_bars)
+                added_periods.append(name)
+
+            # 合约：新增
+            new_set = set(new_symbols)
+            for symbol in new_symbols:
+                if symbol in self._symbol_set:
+                    continue
+                self._symbols.append(symbol)
+                self._symbol_set.add(symbol)
+                for period in self._periods:
+                    self._history[(symbol, period)] = deque(maxlen=self._history_bars)
+                added_symbols.append(symbol)
+
+            # 合约：移除
+            for symbol in list(self._symbols):
+                if symbol in new_set:
+                    continue
+                self._symbol_set.discard(symbol)
+                self._symbols.remove(symbol)
+                for period in self._periods:
+                    self._history.pop((symbol, period), None)
+                    self._current.pop((symbol, period), None)
+                self._last_volume.pop(symbol, None)
+                self._first_tick_logged.discard(symbol)
+                removed_symbols.append(symbol)
+
+        # 预热新增的 (合约, 周期)：新增合约的全部周期 + 既有合约的新增周期
+        keys: List[Tuple[str, str]] = [(s, p) for s in added_symbols for p in self._periods]
+        keys += [(s, p) for p in added_periods for s in self._symbols if s not in added_symbols]
+        warm = self.warmup_keys(keys) if keys else 0
+        if keys:
+            logger.info(
+                "热加载：合约 +%s -%s，周期 +%s，预热 %d 根",
+                added_symbols, removed_symbols, added_periods, warm,
+            )
+
+        return {
+            "added_symbols": added_symbols,
+            "removed_symbols": removed_symbols,
+            "added_periods": added_periods,
+        }
+
+    def warmup_keys(self, keys: List[Tuple[str, str]]) -> int:
+        """从本地库预热指定 (合约, 周期) 的历史窗口，返回加载的 K 线根数"""
+        if self._store is None:
+            return 0
+        total = 0
+        with self._lock:
+            for key in keys:
+                history = self._history.get(key)
+                if history is None:
+                    continue
+                bars = self._store.load_recent(key[0], key[1], self._history_bars)
+                if not bars:
+                    continue
+                history.clear()
+                history.extend(bars)
+                total += len(bars)
+        return total
+
+    # ==================== 快照 ====================
+    def get_snapshot(self, symbol: str, period: str) -> Tuple[List[Bar], Optional[Bar]]:
+        """获取某合约某周期的历史 K 线 + 当前正在形成的 K 线。
+
+        Returns:
+            ``(closed_bars, forming_bar)``，``forming_bar`` 可能为 None
+        """
+        key = (symbol, period)
+        with self._lock:
+            closed = list(self._history.get(key, []))
+            current = self._current.get(key)
+            forming: Optional[Bar] = None
+            if current is not None:
+                forming = (
+                    current["time"].strftime("%Y-%m-%d %H:%M:%S"),
+                    current["open"],
+                    current["high"],
+                    current["low"],
+                    current["close"],
+                    int(current["volume"]),
+                )
+            return closed, forming
+
+    # ==================== 内部方法 ====================
+    @staticmethod
+    def _new_bar(kline_start: datetime, price: float, volume: int, open_interest: float, dt: datetime) -> dict:
+        price = float(price)
+        return {
+            "time": kline_start,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": int(volume),
+            "open_interest": float(open_interest or 0.0),
+            "timestamp": dt,
+        }
+
+    @staticmethod
+    def _update_bar(current: dict, price: float, delta: int, open_interest: float, dt: datetime) -> None:
+        """把一笔 tick 并入当前 K 线（更新收盘/最高/最低/成交量和持仓）"""
+        price = float(price)
+        current["close"] = price
+        current["high"] = max(current["high"], price)
+        current["low"] = min(current["low"], price)
+        current["volume"] += int(delta)
+        current["open_interest"] = float(open_interest or 0.0)
+        current["timestamp"] = dt
+
+    def _is_session_end(self, symbol: str, kline_start: datetime) -> bool:
+        """kline_start 是否恰为交易时段收盘时刻（此时不新开 K 线）"""
+        if self._session_end_check is None:
+            return False
+        try:
+            return bool(self._session_end_check(symbol, kline_start))
+        except Exception:
+            return False
+
+    def _close_bar(self, key: Tuple[str, str], current: dict) -> None:
+        """把当前 K 线收盘，写入历史窗口与本地库"""
+        bar: Bar = (
+            current["time"].strftime("%Y-%m-%d %H:%M:%S"),
+            current["open"],
+            current["high"],
+            current["low"],
+            current["close"],
+            int(current["volume"]),
+        )
+        history = self._history[key]
+        if history and history[-1][0] == bar[0]:
+            history[-1] = bar
+        else:
+            history.append(bar)
+
+        logger.info(
+            "K 线收盘 [%s] %s %s  O=%.4f H=%.4f L=%.4f C=%.4f V=%d 持仓=%s",
+            key[0], key[1], bar[0], bar[1], bar[2], bar[3], bar[4], bar[5],
+            current.get("open_interest"),
+        )
+
+        if self._store is not None:
+            self._store.save_bar(key[0], key[1], bar)
