@@ -22,6 +22,8 @@ import json
 import logging
 import glob
 import csv
+import io
+import contextlib
 import faulthandler
 from logging.handlers import RotatingFileHandler
 
@@ -182,12 +184,26 @@ def run_export():
     """执行自动导出，使用 local_account_config.py 的配置"""
     # 导出前先做一次会话保活：若桌面被 RDP 抢占，pyautogui 的固定坐标会全部错位
     ensure_console_session(logger)
+    # account_export 内部全部用 print，计划任务下 stdout 无处可见、全部丢失。
+    # 这里把它的输出接进日志：失败时逐行打出来，就能看清卡在哪一步。
+    buf = io.StringIO()
     try:
         import account_export
-        success = account_export.main()
+        t0 = time.time()
+        with contextlib.redirect_stdout(buf):
+            success = account_export.main()
+        elapsed = time.time() - t0
+        if success:
+            logger.info("[导出] 成功，耗时 %.1f 秒", elapsed)
+        else:
+            logger.warning("[导出] 失败，耗时 %.1f 秒，过程输出如下:", elapsed)
+            for line in buf.getvalue().splitlines():
+                logger.warning("[导出]   %s", line)
         return success
     except Exception as e:
         logger.error("[导出] 导出步骤异常: %s", e)
+        for line in buf.getvalue().splitlines():
+            logger.warning("[导出]   %s", line)
         return False
 
 
