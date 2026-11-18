@@ -11,7 +11,7 @@
     - 读取CSV中的账号、动态权益、保证金、持盈、平盈
     - 发送飞书通知
     - 收盘后自动退出
-    - 02:30退出前删除今天导出的文件
+    - 早盘开盘前（上午盘任务09:00启动时）清理上一交易日（夜盘）的导出文件
 """
 
 import sys
@@ -128,7 +128,7 @@ def get_session_end_time(now_time):
     """根据当前时间，返回本次任务应负责到的时段结束时间。
 
     多时段定时任务模式：
-      - 08:59/12:59/20:59 各启动一次
+      - 09:00/13:00/21:00 各启动一次
       - 上午盘窗口：02:30 ~ 11:30 → 退出 11:30
       - 下午盘窗口：11:30 ~ 15:15 → 退出 15:15
       - 夜盘窗口：15:15 ~ 02:30 → 退出 02:30
@@ -493,6 +493,12 @@ def main():
         startup_msg += "\n🖥️ 已从RDP切回控制台（桌面保活）"
     send_feishu_text(startup_msg)
 
+    # 早盘开盘前（上午盘任务09:00启动）清理上一交易日（夜盘）的导出文件，
+    # 使 positions-web 从夜盘结束到早盘开盘前一直有数据可访问
+    if not _SKIP_TRADING_CHECK and _RESPONSIBLE_SESSION_END == datetime.time(11, 30, 0):
+        logger.info("[启动] 早盘开盘前，清理上一交易日导出文件...")
+        cleanup_export_files()
+
     last_export_time = 0
     last_session_check = time.time()
     consecutive_failures = 0
@@ -515,11 +521,9 @@ def main():
             if _need_exit_session_end:
                 logger.info("[主循环] 已到达时段结束时间 %s，准备退出", _RESPONSIBLE_SESSION_END)
 
-                # 夜盘结束，清理文件
+                # 夜盘结束仅退出，不再清理（改到早盘开盘前清理，保证 positions-web 到早上仍有数据可读）
                 if _RESPONSIBLE_SESSION_END == datetime.time(2, 30, 0):
-                    logger.info("[主循环] 夜盘结束，清理导出文件...")
                     send_feishu_text("🌙 夜盘结束，账户监控退出")
-                    cleanup_export_files()
                 elif _RESPONSIBLE_SESSION_END == datetime.time(15, 15, 0):
                     send_feishu_text("☀️ 日盘结束，账户监控退出")
                 else:
