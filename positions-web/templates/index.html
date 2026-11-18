@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账户权益总览</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">账户权益总览</a>
+    <div class="meta" id="meta">加载中…</div>
+  </header>
+
+  <main>
+    <div class="card">
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th class="num">动态权益</th>
+            <th class="num">保证金</th>
+            <th class="num">持盈</th>
+            <th class="num">平盈</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="5" class="empty">正在加载…</td></tr>
+        </tbody>
+        <tfoot id="foot"></tfoot>
+      </table>
+    </div>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script>PF.loadAccounts();</script>
+</body>
+</html>
