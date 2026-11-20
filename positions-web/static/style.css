@@ -76,14 +76,19 @@ main { padding: 12px; }
 
 table.grid {
   width: 100%;
+  min-width: 450px;        /* 窗口比这还窄时改成横向滚动（.card 里滚） */
+  table-layout: fixed;      /* 列宽只认下面写死的 width，其余列平分剩余空间 */
   border-collapse: collapse;
   font-variant-numeric: tabular-nums;
 }
-
+table.grid1 {
+  min-width: 400px;        /* 窗口比这还窄时改成横向滚动（.card 里滚） */
+}
 th, td {
-  padding: 6px 10px;
+  padding: 2px 4px;
   border-bottom: 1px solid var(--line);
   white-space: nowrap;
+  overflow: hidden;         /* 万一列比内容窄，裁掉而不是挤到隔壁列 */
   text-align: left;
 }
 
@@ -97,8 +102,14 @@ thead th {
   font-weight: 600;
 }
 
-td.num, th.num { text-align: right; }
-
+td.num, th.num { text-align: right; padding:0 2px}
+/* 只给「短列」写死宽度，没写宽度的数字列平分剩下的全部空间，所以数字列要宽就调小这些值。
+   数值按最长内容留了余量：账号 10 字符 ≈ 78px（没有持仓文件时还会多一个「–」）… */
+th.account, td.account {width: 80px}      /* 账号 */
+th.code, td.code   { width: 60px }         /* 合约ID，如 ag2702 */
+th.direction, td.direction {width: 40px}   /* 买卖 */
+th.qty, td.qty     { width: 46px }         /* 今仓，如 20.00 */
+th.pos, td.pos     { width: 52px }         /* 持仓量 */
 tbody tr:hover { background: #f7f9fc; }
 tbody tr:last-child td { border-bottom: none; }
 

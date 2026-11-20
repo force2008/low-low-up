@@ -5,7 +5,12 @@
 数据来源：account_monitor.py 从融航风控端导出的 CSV（默认 E:\\ronghang\\data）
 
     操作账户 YYYY-MM-DD HH-MM-SS.csv        —— 全部账号的权益汇总
-    {账号}当前持仓 YYYY-MM-DD HH-MM-SS.csv  —— 单个账号的持仓明细
+   操作账户总持仓合约 *.csv                 —— 各账号的持仓保证金（账号级子行）
+   {账号}当前持仓 YYYY-MM-DD HH-MM-SS.csv  —— 单个账号的持仓明细
+
+注意：融航导出的『当前持仓』里『占用保证金』列恒为 0，真实值只在
+『操作账户总持仓合约』的账号级子行里，所以持仓页按（账号, 合约, 方向）
+从该文件回填保证金。
 
 缓存机制：
 
@@ -36,6 +41,7 @@ from flask import Flask, jsonify, render_template
 ACCOUNT_FILE_GLOB = "操作账户 *.csv"          # 账户汇总文件（注意「操作账户」后有空格，
                                                # 这样不会误匹配「操作账户总持仓品种 xxx.csv」）
 POSITION_FILE_SUFFIX = "当前持仓"              # 持仓文件：{账号}当前持仓 YYYY-MM-DD HH-MM-SS.csv
+TOTAL_POSITION_FILE_GLOB = "*操作账户总持仓合约*.csv"   # 账号级持仓保证金来源
 
 # 详情页展示的持仓列：(CSV 列名, 是否按数值处理)
 POSITION_COLUMNS = (
@@ -161,6 +167,50 @@ def _clean_for_cache(payload):
 
 # ==================== 解析 ====================
 
+def _read_margin_lookup(path):
+    """读取『操作账户总持仓合约』，返回 {账号: {(合约, 方向): 持仓保证金}}
+
+    该文件是两级结构：『展开』为「+」的是合约分组行（合约列是合约代码），
+    其余是账号级子行（合约列是账号、合约名列是所属合约）。两种键都记下，
+    取值时按『当前持仓』里的合约ID 或 合约名依次尝试。
+    """
+    if not path:
+        return {}
+    rows, _ = _read_csv_rows(path)
+
+    lookup = {}
+    group_code = ""
+    for row in rows:
+        normalized = {(key or "").strip(): (value or "").strip() for key, value in row.items()}
+        if normalized.get("展开", "").startswith("+"):
+            group_code = normalized.get("合约", "")
+            continue
+        account = normalized.get("合约", "")
+        direction = normalized.get("方向", "")
+        contract = normalized.get("合约名", "")
+        margin = _to_number(normalized.get("持仓保证金"))
+        if not account or not direction or margin is None:
+            continue
+        table = lookup.setdefault(account, {})
+        if contract:
+            table[(contract, direction)] = margin
+        if group_code:
+            table[(group_code, direction)] = margin
+    return lookup
+
+
+def _lookup_margin(margin_lookup, account, row):
+    """按（账号, 合约, 方向）取真实占用保证金，取不到返回 None"""
+    table = (margin_lookup or {}).get(account)
+    if not table:
+        return None
+    direction = row.get("买卖", "")
+    for key in (row.get("合约ID", ""), row.get("合约名", "")):
+        if key and (key, direction) in table:
+            return table[(key, direction)]
+    return None
+
+
 def _parse_accounts(csv_path, source_name):
     rows, encoding = _read_csv_rows(csv_path)
     accounts = []
@@ -193,7 +243,7 @@ def _parse_accounts(csv_path, source_name):
     }
 
 
-def _parse_positions(csv_path, account, source_name):
+def _parse_positions(csv_path, account, source_name, margin_lookup=None):
     rows, encoding = _read_csv_rows(csv_path)
     positions = []
 
@@ -205,6 +255,10 @@ def _parse_positions(csv_path, account, source_name):
         item = {}
         for column, is_number in POSITION_COLUMNS:
             item[column] = _to_number(normalized.get(column)) if is_number else normalized.get(column, "")
+        # 『当前持仓』的占用保证金恒为 0，用『操作账户总持仓合约』里的真实值覆盖
+        margin = _lookup_margin(margin_lookup, account, normalized)
+        if margin is not None:
+            item["占用保证金"] = margin
         positions.append(item)
 
     return {
@@ -287,12 +341,15 @@ def get_positions(account):
     """单账号持仓：有新的持仓文件就重建缓存，否则直接返回缓存"""
     source_path = _find_position_file(account)
     source_name = os.path.basename(source_path) if source_path else None
+    margin_path = _pick_latest(glob.glob(os.path.join(DATA_DIR, TOTAL_POSITION_FILE_GLOB)))
+    margin_source = os.path.basename(margin_path) if margin_path else None
     cache_path = _position_cache_path(account)
 
     with _cache_lock:
         cached = _load_cache(cache_path)
 
-        if cached and cached.get("source") == source_name:
+        if (cached and cached.get("source") == source_name
+                and cached.get("margin_source") == margin_source):
             cached["cached"] = True
             cached["has_source"] = True
             return cached
@@ -305,13 +362,16 @@ def get_positions(account):
             return {
                 "account": account,
                 "source": None,
+                "margin_source": margin_source,
                 "generated_at": None,
                 "cached": False,
                 "has_source": False,
                 "positions": [],
             }
 
-        payload = _parse_positions(source_path, account, source_name)
+        payload = _parse_positions(source_path, account, source_name,
+                                   _read_margin_lookup(margin_path))
+        payload["margin_source"] = margin_source
         _save_cache(cache_path, _clean_for_cache(payload))
         logger.info("[缓存] %s 持仓已重建：%s（%d 条）", account, source_name, len(payload["positions"]))
         payload["cached"] = False
