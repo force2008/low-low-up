@@ -87,9 +87,9 @@ var PF = (function () {
         return '<tr>' +
           '<td>' + accountCell + '</td>' +
           '<td class="num">' + fmt(item.equity) + '</td>' +
-          '<td class="num">' + fmt(item.margin) + '</td>' +
           '<td class="num ' + numClass(item.hold_profit) + '">' + fmt(item.hold_profit) + '</td>' +
           '<td class="num ' + numClass(item.close_profit) + '">' + fmt(item.close_profit) + '</td>' +
+          '<td class="num">' + fmt(item.margin) + '</td>' +
           '</tr>';
       }).join('');
 
@@ -98,9 +98,9 @@ var PF = (function () {
         ? '<tr>' +
             '<td>合 计</td>' +
             '<td class="num">' + fmt(total.equity) + '</td>' +
-            '<td class="num">' + fmt(total.margin) + '</td>' +
             '<td class="num ' + numClass(total.hold_profit) + '">' + fmt(total.hold_profit) + '</td>' +
             '<td class="num ' + numClass(total.close_profit) + '">' + fmt(total.close_profit) + '</td>' +
+            '<td class="num">' + fmt(total.margin) + '</td>' +
           '</tr>'
         : '';
     }).catch(function (err) {
