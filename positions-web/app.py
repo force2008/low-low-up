@@ -7,6 +7,7 @@
     操作账户 YYYY-MM-DD HH-MM-SS.csv        —— 全部账号的权益汇总
    操作账户总持仓合约 *.csv                 —— 各账号的持仓保证金（账号级子行）
    {账号}当前持仓 YYYY-MM-DD HH-MM-SS.csv  —— 单个账号的持仓明细
+   {账号} 成交明细 YYYY-MM-DD HH-MM-SS.csv  —— 单个账号的成交明细
 
 注意：融航导出的『当前持仓』里『占用保证金』列恒为 0，真实值只在
 『操作账户总持仓合约』的账号级子行里，所以持仓页按（账号, 合约, 方向）
@@ -16,6 +17,7 @@
 
     cache/accounts.json            账户列表整理结果
     cache/positions/{账号}.json    单账号持仓整理结果
+    cache/trades/{账号}.json       单账号成交整理结果
 
 每次请求先扫描数据目录拿到最新的源文件；若与缓存里记录的 source 文件名不同，
 说明产生了新的一批导出，就重新解析并覆盖缓存；否则直接返回缓存内容，
@@ -41,6 +43,7 @@ from flask import Flask, jsonify, render_template
 ACCOUNT_FILE_GLOB = "操作账户 *.csv"          # 账户汇总文件（注意「操作账户」后有空格，
                                                # 这样不会误匹配「操作账户总持仓品种 xxx.csv」）
 POSITION_FILE_SUFFIX = "当前持仓"              # 持仓文件：{账号}当前持仓 YYYY-MM-DD HH-MM-SS.csv
+TRADE_FILE_SUFFIX = "成交明细"                # 成交文件：{账号} 成交明细 YYYY-MM-DD HH-MM-SS.csv
 TOTAL_POSITION_FILE_GLOB = "*操作账户总持仓合约*.csv"   # 账号级持仓保证金来源
 
 # 详情页展示的持仓列：(CSV 列名, 是否按数值处理)
@@ -53,6 +56,18 @@ POSITION_COLUMNS = (
     ("持仓量", True),
     ("逐笔开仓均价", True),
     ("占用保证金", True),
+)
+
+# 成交明细页展示列：(CSV 列名, 是否按数值处理)
+TRADE_COLUMNS = (
+    ("成交时间", False),
+    ("合约", False),
+    ("买卖", False),
+    ("开平", False),
+    ("成交数量", True),
+    ("成交价格", True),
+    ("投保", False),
+    ("成交编号", False),
 )
 
 
@@ -71,6 +86,7 @@ PORT = int(os.environ.get("POSITIONS_PORT", "8000"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 POSITION_CACHE_DIR = os.path.join(CACHE_DIR, "positions")
+TRADE_CACHE_DIR = os.path.join(CACHE_DIR, "trades")
 
 app = Flask(__name__)
 logger = logging.getLogger("positions-web")
@@ -270,6 +286,57 @@ def _parse_positions(csv_path, account, source_name, margin_lookup=None):
     }
 
 
+def _trade_sort_key(trade):
+    """成交明细排序键：按『同一交易日内的时间先后』，用于倒序展示（最新在最上）。
+
+    融航成交明细只有 HH:MM:SS、没有日期，而一个交易日的先后是：
+        前夜夜盘(20:00-23:59) → 跨零点夜盘(00:00-03:59) → 日盘(其余时段)
+    所以不能拿裸时钟直接比大小（21:00 其实是该交易日最早的一批成交），
+    要把夜盘放到日盘之前，才能得到正确的时序。
+    """
+    raw = str(trade.get("成交时间") or "").strip()
+    matched = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", raw)
+    if not matched:
+        return (-1, 0.0)                      # 时间缺失/异常 → 排到最后
+    hour = int(matched.group(1))
+    minute = int(matched.group(2))
+    second = int(matched.group(3) or 0)
+    minutes = hour * 60 + minute + second / 60.0
+    if hour >= 20:
+        bucket = 0                            # 前夜夜盘：该交易日最早
+    elif hour < 4:
+        bucket = 1                            # 跨零点夜盘：次之
+    else:
+        bucket = 2                            # 日盘：该交易日最晚
+    return (bucket, minutes)
+
+
+def _parse_trades(csv_path, account, source_name):
+    rows, encoding = _read_csv_rows(csv_path)
+    trades = []
+
+    for row in rows:
+        normalized = {(key or "").strip(): (value or "").strip() for key, value in row.items()}
+        contract = normalized.get("合约") or normalized.get("合约名") or ""
+        if not contract:
+            continue
+        item = {}
+        for column, is_number in TRADE_COLUMNS:
+            item[column] = _to_number(normalized.get(column)) if is_number else normalized.get(column, "")
+        trades.append(item)
+
+    # 按交易日内时间倒序：最新成交排最上面（同一时间的多笔保持原相对顺序）
+    trades.sort(key=_trade_sort_key, reverse=True)
+
+    return {
+        "account": account,
+        "source": source_name,
+        "encoding": encoding,
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "trades": trades,
+    }
+
+
 def _list_position_files():
     """扫描数据目录，返回 {账号: 最新持仓文件路径}"""
     if not os.path.isdir(DATA_DIR):
@@ -293,9 +360,37 @@ def _find_position_file(account, mapping=None):
     return lowered.get(account.lower())
 
 
+def _list_trade_files():
+    """扫描数据目录，返回 {账号: 最新成交文件路径}"""
+    if not os.path.isdir(DATA_DIR):
+        return {}
+    grouped = {}
+    for name in os.listdir(DATA_DIR):
+        if not name.lower().endswith(".csv") or TRADE_FILE_SUFFIX not in name:
+            continue
+        account = name.split(TRADE_FILE_SUFFIX)[0].strip()
+        if not account:
+            continue
+        grouped.setdefault(account, []).append(os.path.join(DATA_DIR, name))
+    return {account: _pick_latest(paths) for account, paths in grouped.items()}
+
+
+def _find_trade_file(account, mapping=None):
+    mapping = mapping if mapping is not None else _list_trade_files()
+    if account in mapping:
+        return mapping[account]
+    lowered = {key.lower(): value for key, value in mapping.items()}
+    return lowered.get(account.lower())
+
+
 def _position_cache_path(account):
     safe = re.sub(r"[^\w\-]", "_", account)
     return os.path.join(POSITION_CACHE_DIR, "%s.json" % safe)
+
+
+def _trade_cache_path(account):
+    safe = re.sub(r"[^\w\-]", "_", account)
+    return os.path.join(TRADE_CACHE_DIR, "%s.json" % safe)
 
 
 # ==================== 对外数据 ====================
@@ -379,6 +474,42 @@ def get_positions(account):
         return payload
 
 
+def get_trades(account):
+    """单账号成交明细：有新的成交文件就重建缓存，否则直接返回缓存"""
+    source_path = _find_trade_file(account)
+    source_name = os.path.basename(source_path) if source_path else None
+    cache_path = _trade_cache_path(account)
+
+    with _cache_lock:
+        cached = _load_cache(cache_path)
+
+        if cached and cached.get("source") == source_name:
+            cached["cached"] = True
+            cached["has_source"] = True
+            return cached
+
+        if source_path is None:
+            if cached:
+                cached["cached"] = True
+                cached["has_source"] = False
+                return cached
+            return {
+                "account": account,
+                "source": None,
+                "generated_at": None,
+                "cached": False,
+                "has_source": False,
+                "trades": [],
+            }
+
+        payload = _parse_trades(source_path, account, source_name)
+        _save_cache(cache_path, _clean_for_cache(payload))
+        logger.info("[缓存] %s 成交明细已重建：%s（%d 条）", account, source_name, len(payload["trades"]))
+        payload["cached"] = False
+        payload["has_source"] = True
+        return payload
+
+
 # ==================== 路由 ====================
 
 @app.route("/")
@@ -389,6 +520,11 @@ def index():
 @app.route("/position/<path:account>")
 def position_page(account):
     return render_template("position.html", account=account)
+
+
+@app.route("/trades/<path:account>")
+def trades_page(account):
+    return render_template("trades.html", account=account)
 
 
 @app.route("/api/accounts")
@@ -403,6 +539,11 @@ def api_accounts():
 @app.route("/api/positions/<account>")
 def api_positions(account):
     return jsonify(get_positions(account))
+
+
+@app.route("/api/trades/<account>")
+def api_trades(account):
+    return jsonify(get_trades(account))
 
 
 if __name__ == "__main__":

@@ -154,8 +154,53 @@ var PF = (function () {
     });
   }
 
+  /* ---------- 详情页：单账号成交明细 ---------- */
+  function loadTrades(account) {
+    var rowsEl = document.getElementById('rows');
+    var footEl = document.getElementById('foot');
+    var metaEl = document.getElementById('meta');
+
+    fetchJSON('/api/trades/' + encodeURIComponent(account)).then(function (data) {
+      renderMeta(metaEl, data);
+      var list = data.trades || [];
+      if (!list.length) {
+        rowsEl.innerHTML = '<tr><td colspan="8" class="empty">' +
+          (data.has_source ? '该账号当前没有成交记录' : '未找到该账号的成交明细文件') +
+          '</td></tr>';
+        footEl.innerHTML = '';
+        return;
+      }
+
+      rowsEl.innerHTML = list.map(function (item) {
+        return '<tr>' +
+          '<td class="dim">' + esc(item['成交时间']) + '</td>' +
+          '<td>' + esc(item['合约']) + '</td>' +
+          '<td class="' + sideClass(item['买卖']) + '">' + esc(item['买卖']) + '</td>' +
+          '<td>' + esc(item['开平']) + '</td>' +
+          '<td class="num">' + fmt(item['成交数量']) + '</td>' +
+          '<td class="num">' + fmt(item['成交价格']) + '</td>' +
+          '<td>' + esc(item['投保']) + '</td>' +
+          '</tr>';
+      }).join('');
+
+      var buyQty = 0;
+      var sellQty = 0;
+      list.forEach(function (item) {
+        var qty = Number(item['成交数量']) || 0;
+        if (item['买卖'] === '买') buyQty += qty;
+        else if (item['买卖'] === '卖') sellQty += qty;
+      });
+      footEl.innerHTML = '<tr><td colspan="8">合计 ' + list.length + ' 笔 · ' +
+        '买入 ' + buyQty + ' 手 · 卖出 ' + sellQty + ' 手 · 共 ' + (buyQty + sellQty) + ' 手</td></tr>';
+    }).catch(function (err) {
+      metaEl.textContent = '加载失败';
+      rowsEl.innerHTML = '<tr><td colspan="8" class="error">加载失败：' + esc(err.message) + '</td></tr>';
+    });
+  }
+
   return {
     loadAccounts: loadAccounts,
-    loadPositions: loadPositions
+    loadPositions: loadPositions,
+    loadTrades: loadTrades
   };
 })();
