@@ -74,6 +74,13 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 为 True 时：_do_sync 和 _check_position_diff 不再调用 get_contracts_trading_status 过滤，
         # 非开盘时间（周末/节假日/夜间非连续交易段）也能正常对齐和提交委托，专供测试/仿真环境使用。
         skip_trading_time_check: bool = False,
+        # ---- 源账户标识（用于「只跟新增」基准文件名 hold-baseline-{源账户}.json）----
+        source_account: str = None,
+        # ---- 只跟新增（默认 False=照抄源账户全部持仓）----
+        # True：首次启用时自动把源账户当时持仓记为基准并持久化，之后只跟「超出基准的增量」，
+        #       源账户之前的历史老仓不跟；目标账户已镜像的老仓会被判为超额并按限价平掉。
+        #       重置：删除 hold-baseline-{源账户}.json 即可。
+        follow_new_only: bool = False,
     ):
         # ratio/ration 支持：正数跟单 / 0 清仓 / 负数对冲（任意实数合法，仅 NaN/inf 才报错）
         if position_ratio != position_ratio or position_ratio in (float("inf"), float("-inf")):
@@ -173,6 +180,12 @@ class PositionSyncManagerBase(CTdSpiBase):
         # 8.1) 期权跟单开关（默认 False=屏蔽源账户期权持仓）
         # ------------------------------------------------------------------
         self._allow_option: bool = bool(allow_option)
+
+        # ------------------------------------------------------------------
+        # 8.2) 源账户标识 + 只跟新增（基准快照，两者配合使用）
+        # ------------------------------------------------------------------
+        self._source_account: Optional[str] = str(source_account).strip() if source_account else None
+        self._follow_new_only: bool = bool(follow_new_only)
 
         # ------------------------------------------------------------------
         # 9) 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式）
@@ -386,6 +399,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         passive_mode=None,
         passive_wait_seconds=None,
         allow_option=None,
+        follow_new_only=None,
     ) -> dict:
         """运行时动态刷新 target 配置。
 
@@ -410,6 +424,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         old_passive_mode = bool(getattr(self, '_passive_mode', False))
         old_passive_wait = int(getattr(self, '_passive_wait_seconds', 300))
         old_allow_option = bool(getattr(self, '_allow_option', False))
+        old_follow_new_only = bool(getattr(self, '_follow_new_only', False))
 
         ratio_status = 'kept'
         exclude_status = 'kept'
@@ -422,6 +437,7 @@ class PositionSyncManagerBase(CTdSpiBase):
         passive_mode_status = 'kept'
         passive_wait_status = 'kept'
         allow_option_status = 'kept'
+        follow_new_only_status = 'kept'
 
         # -------- 1. ratio --------
         if position_ratio is not None:
@@ -617,10 +633,33 @@ class PositionSyncManagerBase(CTdSpiBase):
                 self._allow_option = v
                 allow_option_status = 'changed'
 
+        # -------- 12. follow_new_only（只跟新增）--------
+        if follow_new_only is not None:
+            if isinstance(follow_new_only, bool):
+                v = follow_new_only
+            elif isinstance(follow_new_only, (int, float)):
+                v = bool(follow_new_only)
+            elif isinstance(follow_new_only, str):
+                s = follow_new_only.strip().lower()
+                if s in ("1", "true", "yes", "on", "开启", "启用"):
+                    v = True
+                elif s in ("0", "false", "no", "off", "关闭", "禁用"):
+                    v = False
+                else:
+                    v = old_follow_new_only
+            else:
+                v = old_follow_new_only
+            if v == old_follow_new_only:
+                follow_new_only_status = 'unchanged'
+            else:
+                self._follow_new_only = v
+                follow_new_only_status = 'changed'
+
         changed_lst = [s for s in (
             ratio_status, exclude_status, allow_status, deny_status,
             min_qty_status, min_not_status, rnd_en_status, rnd_ms_status,
             passive_mode_status, passive_wait_status, allow_option_status,
+            follow_new_only_status,
         ) if s == 'changed']
         changed = len(changed_lst) > 0
         if changed:
@@ -636,6 +675,7 @@ class PositionSyncManagerBase(CTdSpiBase):
                 f"passive_mode {old_passive_mode}->{getattr(self, '_passive_mode', False)} ({passive_mode_status})",
                 f"passive_wait {old_passive_wait}->{getattr(self, '_passive_wait_seconds', 300)} ({passive_wait_status})",
                 f"allow_option {old_allow_option}->{getattr(self, '_allow_option', False)} ({allow_option_status})",
+                f"follow_new_only {old_follow_new_only}->{getattr(self, '_follow_new_only', False)} ({follow_new_only_status})",
             ]
             changed_lines = [ln for ln in lines if '(changed)' in ln]
             self.print(
@@ -655,6 +695,7 @@ class PositionSyncManagerBase(CTdSpiBase):
             'passive_mode': (getattr(self, '_passive_mode', False), old_passive_mode, passive_mode_status),
             'passive_wait': (getattr(self, '_passive_wait_seconds', 300), old_passive_wait, passive_wait_status),
             'allow_option': (getattr(self, '_allow_option', False), old_allow_option, allow_option_status),
+            'follow_new_only': (getattr(self, '_follow_new_only', False), old_follow_new_only, follow_new_only_status),
         }
 
     def _notify_async(self, text: str):

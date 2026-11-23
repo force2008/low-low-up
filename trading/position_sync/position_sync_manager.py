@@ -87,6 +87,9 @@ def run_position_sync(
     passive_wait_seconds: int = 300,
     # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）
     allow_option: bool = False,
+    # 源账户标识 + 只跟新增（只跟源账户相对基准快照的新增持仓，老仓不跟）
+    source_account: str = None,
+    follow_new_only: bool = False,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
 ) -> bool:
@@ -104,6 +107,7 @@ def run_position_sync(
         if deny_products:
             print(f"  deny_products={sorted(deny_products)}")
         print(f"  passive_mode={passive_mode}, passive_wait_seconds={passive_wait_seconds}s")
+        print(f"  source_account={source_account}, follow_new_only={follow_new_only}")
         print(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式建议=True）")
         mgr = PositionSyncManager(
             hold_std_path=hold_std_path,
@@ -124,6 +128,8 @@ def run_position_sync(
             passive_wait_seconds=passive_wait_seconds,
             allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
+            source_account=source_account,
+            follow_new_only=follow_new_only,
         )
         if logger:
             mgr.set_logger(logger)
@@ -175,6 +181,8 @@ def run_position_sync_loop(
     # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）；
     # 目标账户配置 allowOption=1 时为 True，期权按普通合约跟单。
     allow_option: bool = False,
+    # 只跟新增：True=只跟源账户相对基准快照的新增持仓（老仓不跟），可被热加载覆盖
+    follow_new_only: bool = False,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
     # 【启动时首轮同步延迟】进程起来后，等多少秒再做首次 sync_and_trade（防止CTP登录还没完成就查仓超时）
@@ -216,12 +224,13 @@ def run_position_sync_loop(
         random_delay_max_ms: 随机延迟最大毫秒数
         passive_mode: 被动挂单模式开关（套利跟单账户用，True=排队价挂单，5分钟内不撤）
         passive_wait_seconds: 被动模式下的排队等待窗口秒数（默认300=5分钟）
-        source_account: 源账号，用于热加载定位
+        follow_new_only: 只跟新增开关（True=只跟源账户相对基准快照的新增持仓，老仓不跟）
+        source_account: 源账号，用于热加载定位 + 「只跟新增」基准文件名
         target_user_id: 目标账号，用于热加载定位
-        runtime_config_resolver: callable(source, user) -> 12-tuple
+        runtime_config_resolver: callable(source, user) -> 13-tuple
                                  (ratio, exclude, allow_level, deny, min_qty, min_notional,
                                   rnd_enabled, rnd_max_ms, passive_mode, passive_wait_seconds,
-                                  allow_option, matched_target)
+                                  allow_option, follow_new_only, matched_target)
                                  返回 None 表示保持当前值不变。
     Returns:
         bool: 是否正常结束
@@ -258,6 +267,7 @@ def run_position_sync_loop(
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
         _log(f"  allow_option={allow_option}（{'跟单期权' if allow_option else '默认屏蔽源账户期权持仓'}）")
+        _log(f"  follow_new_only={follow_new_only}（{'只跟新增持仓，源账户老仓不跟' if follow_new_only else '默认照抄源账户全部持仓'}）")
         _log(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式=True，非开盘时间仍允许对齐和提交委托）")
         try:
             _first_d_s = int(first_sync_delay_seconds or 0)
@@ -297,6 +307,8 @@ def run_position_sync_loop(
             passive_wait_seconds=passive_wait_seconds,
             allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
+            source_account=source_account,
+            follow_new_only=follow_new_only,
         )
         if logger:
             mgr.set_logger(logger)
@@ -374,15 +386,16 @@ def run_position_sync_loop(
                     _last_reload_ts = _now
                     try:
                         _rr = runtime_config_resolver(source_account, target_user_id)
-                        # 解析函数返回 12-tuple (ratio, exclude, allow_level, deny,
+                        # 解析函数返回 13-tuple (ratio, exclude, allow_level, deny,
                         #                      min_qty, min_notional, rnd_enabled, rnd_max_ms,
-                        #                      passive_mode, passive_wait_seconds, allow_option, matched)
+                        #                      passive_mode, passive_wait_seconds, allow_option,
+                        #                      follow_new_only, matched)
                         # 任一值为 None 表示保持当前值不变
-                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 12:
+                        if isinstance(_rr, (tuple, list)) and len(_rr) >= 13:
                             (new_ratio, new_exclude, new_allow_level, new_deny,
                              new_min_qty, new_min_not, new_rnd_en, new_rnd_ms,
                              new_passive_mode, new_passive_wait_sec,
-                             new_allow_option, _matched) = _rr
+                             new_allow_option, new_follow_new_only, _matched) = _rr
                             try:
                                 mgr.apply_runtime_target_config(
                                     position_ratio=new_ratio,
@@ -396,6 +409,7 @@ def run_position_sync_loop(
                                     passive_mode=new_passive_mode,
                                     passive_wait_seconds=new_passive_wait_sec,
                                     allow_option=new_allow_option,
+                                    follow_new_only=new_follow_new_only,
                                 )
                             except Exception as _ae:
                                 _log(f"[热更新] 应用配置异常: {_ae}")
