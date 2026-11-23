@@ -306,6 +306,122 @@ def generate_hold_std(account=None, output_path=None):
     return True
 
 
+# ==================== 套利对子（SPD）识别 ====================
+# 郑商所套利指令 "SPD A&B"（合约名 SPD-A/B）在持仓里会落成「买 A + 卖 B」两条腿分开的持仓。
+# 为了让两腿跟单时豁免「非主流通」过滤（否则远月腿如 MA702 会被 allow_level 拦掉导致对冲被打破），
+# 这里从源账户的「所有委托」CSV 中识别出所有出现过的套利对子，累积持久化到 arb-pairs.json。
+_ARB_PAIRS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'arb-pairs.json')
+
+
+def _parse_arb_pair_from_row(row):
+    """从一行委托记录中解析套利对子两条腿 -> (legA, legB) 或 None。
+
+    识别形态（郑商所 SPD 套利指令）：
+      · 合约   = "SPD MA701&MA702"
+      · 合约名 = "SPD-MA701/MA702"
+    """
+    name = str(row.get("合约名") or "").strip()
+    raw = str(row.get("合约") or "").strip()
+    legs = None
+    if name.upper().startswith("SPD-"):
+        legs = name[4:].split("/")
+    elif raw.upper().startswith("SPD "):
+        legs = raw[4:].split("&")
+    if not legs or len(legs) != 2:
+        return None
+    a = legs[0].strip().upper()
+    b = legs[1].strip().upper()
+    if not a or not b or a == b:
+        return None
+    return (a, b)
+
+
+def load_arb_pairs():
+    """读取已持久化的套利对子列表 [[A, B], ...]。"""
+    if os.path.exists(_ARB_PAIRS_FILE):
+        try:
+            with open(_ARB_PAIRS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return list(data.get('pairs') or [])
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def save_arb_pairs(pairs):
+    """原子写入套利对子列表（去重 + 规范化排序）。"""
+    norm = []
+    seen = set()
+    for p in pairs or []:
+        try:
+            a, b = str(p[0]).strip().upper(), str(p[1]).strip().upper()
+        except Exception:
+            continue
+        if not a or not b or a == b:
+            continue
+        key = tuple(sorted((a, b)))
+        if key in seen:
+            continue
+        seen.add(key)
+        norm.append(list(key))
+    payload = {"version": 1, "pairs": norm}
+    tmp = f"{_ARB_PAIRS_FILE}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _ARB_PAIRS_FILE)
+    except Exception as e:
+        print(f"[警告] 保存 arb-pairs.json 失败: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    return norm
+
+
+def generate_arb_pairs(account=None, max_files=30):
+    """扫描源账户「所有委托」CSV，识别 SPD 套利对子并（累积）持久化到 arb-pairs.json。
+
+    - 只扫描最近 max_files 个委托文件（默认 30），并与已有登记合并，避免重复识别。
+    - 返回 True 表示扫描成功（即使没识别到新对子）。
+    """
+    if account is None:
+        account = ACCOUNT
+    pattern = os.path.join(DATA_DIR, f"{account} 所有委托 *.csv")
+    files = glob.glob(pattern)
+    if not files:
+        print(f"未找到 '{account}' 委托文件，跳过套利对子识别")
+        return False
+    files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    files = files[:max_files]
+
+    existing = load_arb_pairs()
+    found = []
+    for fp in files:
+        try:
+            rows = read_csv_as_dicts(fp)
+        except Exception:
+            continue
+        for row in rows or []:
+            # 兼容 BOM / 列名带空格：先归一化 key
+            norm = {(k or '').strip().lstrip('\ufeff'): v for k, v in row.items()}
+            pair = _parse_arb_pair_from_row(norm)
+            if pair:
+                found.append(pair)
+    merged = save_arb_pairs(list(existing) + found)
+    print(f"套利对子识别完成：本次扫描 {len(files)} 个委托文件，识别 {len(found)} 条 SPD 记录，"
+          f"累计已登记 {len(merged)} 个对子 -> {_ARB_PAIRS_FILE}")
+    for p in merged:
+        print(f"  · SPD {p[0]}&{p[1]}")
+    return True
+
+
 def generate_hold():
     """
     占位函数，不再使用
