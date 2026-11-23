@@ -156,9 +156,10 @@
       "period": "m5",
       "type": "price_breakout",
       "params": {
-        "price": 924,
         "operator": ">=",
-        "source": "price"
+        "source": "price",
+        "tolerance": 0,
+        "price": 911
       },
       "direction": null,
       "actions": [
@@ -167,7 +168,7 @@
       "cooldown_sec": 3600
     },
     {
-      "name": "SA挑战前期平台高点993-开空",
+      "name": "SA挑战前期平台高点983-开空",
       "enabled": true,
       "symbols": [
         "SA701"
@@ -175,7 +176,7 @@
       "period": "m5",
       "type": "price_breakout",
       "params": {
-        "price": 992,
+        "price": 983,
         "operator": ">=",
         "source": "price"
       },
@@ -216,7 +217,7 @@
         "operator": ">=",
         "source": "price",
         "tolerance": 0,
-        "price": 6240
+        "price": 6185
       },
       "direction": null,
       "actions": [
@@ -231,10 +232,12 @@
         "CF701"
       ],
       "period": "m5",
-      "type": "max_bearish_candle",
+      "type": "price_breakout",
       "params": {
-        "lookback": 20,
-        "measure": "body"
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 15620
       },
       "direction": null,
       "actions": [
@@ -249,10 +252,12 @@
         "lh2701"
       ],
       "period": "m5",
-      "type": "max_bearish_candle",
+      "type": "price_breakout",
       "params": {
-        "lookback": 20,
-        "measure": "body"
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 9810
       },
       "direction": null,
       "actions": [
@@ -264,13 +269,15 @@
       "name": "鸡蛋1小时k线最大阴线",
       "enabled": true,
       "symbols": [
-        "jd2612"
+        "jd2701"
       ],
       "period": "m5",
       "type": "max_bearish_candle",
       "params": {
         "lookback": 20,
-        "measure": "body"
+        "color_basis": "prev_close",
+        "measure": "change",
+        "realtime": true
       },
       "direction": null,
       "actions": [
@@ -305,10 +312,12 @@
         "SH701"
       ],
       "period": "m5",
-      "type": "max_bullish_candle",
+      "type": "price_breakout",
       "params": {
-        "lookback": 20,
-        "measure": "body"
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 1538
       },
       "direction": null,
       "actions": [
@@ -322,15 +331,13 @@
       "symbols": [
         "ss2701"
       ],
-      "period": "d1",
-      "type": "boll_touch",
+      "period": "m5",
+      "type": "price_breakout",
       "params": {
-        "period": 20,
-        "multiplier": 2,
-        "band": "middle",
+        "operator": ">=",
         "source": "price",
-        "tolerance_pct": 0,
-        "operator": "<="
+        "tolerance": 0,
+        "price": 14040
       },
       "direction": null,
       "actions": [
@@ -348,7 +355,9 @@
       "type": "max_bearish_candle",
       "params": {
         "lookback": 20,
-        "measure": "body"
+        "measure": "body",
+        "color_basis": "prev_close",
+        "realtime": true
       },
       "direction": null,
       "actions": [
@@ -366,7 +375,9 @@
       "type": "max_bearish_candle",
       "params": {
         "lookback": 20,
-        "measure": "body"
+        "measure": "body",
+        "color_basis": "prev_close",
+        "realtime": true
       },
       "direction": null,
       "actions": [
@@ -381,10 +392,12 @@
         "jm2701"
       ],
       "period": "m5",
-      "type": "max_bearish_candle",
+      "type": "price_breakout",
       "params": {
-        "lookback": 20,
-        "measure": "body"
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 1445.5
       },
       "direction": null,
       "actions": [
@@ -398,13 +411,74 @@
       "symbols": [
         "ao2701"
       ],
+      "period": "m60",
+      "type": "boll_touch",
+      "params": {
+        "period": 20,
+        "multiplier": 2,
+        "band": "middle",
+        "source": "range",
+        "tolerance_pct": 0
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "大豆开始向上空间",
+      "enabled": true,
+      "symbols": [
+        "A2701"
+      ],
+      "period": "m5",
+      "type": "price_breakout",
+      "params": {
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 5043
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "豆粕小时W底，破3077",
+      "enabled": true,
+      "symbols": [
+        "M2701"
+      ],
       "period": "m5",
       "type": "price_breakout",
       "params": {
         "operator": "<=",
         "source": "price",
         "tolerance": 0,
-        "price": 2528
+        "price": 3077
+      },
+      "direction": null,
+      "actions": [
+        "feishu"
+      ],
+      "cooldown_sec": 3600
+    },
+    {
+      "name": "pk小时上破7776",
+      "enabled": true,
+      "symbols": [
+        "PK703"
+      ],
+      "period": "m5",
+      "type": "price_breakout",
+      "params": {
+        "operator": ">=",
+        "source": "price",
+        "tolerance": 0,
+        "price": 7736
       },
       "direction": null,
       "actions": [
