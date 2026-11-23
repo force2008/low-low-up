@@ -520,6 +520,147 @@ class PositionSyncManagerData:
             q = 0
         return float(max(q, 0)) * float(price) * float(vm)
 
+    # ------------------------------------------------------------------
+    # 【只跟新增】源基准快照 + 【套利对子】两腿豁免 所需的辅助方法
+    # ------------------------------------------------------------------
+    def _config_dir(self) -> str:
+        """与 hold-std 文件同目录（order-check），用于存放基准 / 套利对子文件。"""
+        if getattr(self, 'hold_std_path', None):
+            return os.path.dirname(os.path.abspath(self.hold_std_path))
+        return PROJECT_ROOT
+
+    def _baseline_path(self) -> Optional[str]:
+        """源基准文件路径：hold-baseline-{源账户}.json（按源账户共享，其所有目标账户共用同一基准）。"""
+        src = getattr(self, '_source_account', None)
+        if not src:
+            return None
+        return os.path.join(self._config_dir(), f"hold-baseline-{src}.json")
+
+    def _load_baseline(self) -> Optional[Dict[Tuple[str, int], int]]:
+        """加载源基准快照；文件不存在返回 None（表示「首次启用」）。"""
+        path = self._baseline_path()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.print(f"[只跟新增] 读取基准文件失败({path}): {e}，本轮按空基准处理")
+            return {}
+        agg: Dict[Tuple[str, int], int] = {}
+        raw = data.get('baseline') if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                try:
+                    c, d = str(k).rsplit('|', 1)
+                    agg[(c.strip().upper(), int(d))] = int(v)
+                except (ValueError, TypeError):
+                    continue
+        return agg
+
+    def _save_baseline(self, agg: Dict[Tuple[str, int], int]) -> None:
+        """把源账户当前持仓快照写盘（原子写入，避免并发读到半写文件）。"""
+        path = self._baseline_path()
+        if not path:
+            return
+        payload = {
+            "version": 1,
+            "source_account": getattr(self, '_source_account', None),
+            "baseline": {f"{c}|{d}": int(v) for (c, d), v in agg.items()},
+        }
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except Exception as e:
+            self.print(f"[只跟新增] 写入基准文件失败({path}): {e}")
+
+    def _apply_new_only_baseline(self, src_agg: Dict[Tuple[str, int], int]) -> Dict[Tuple[str, int], int]:
+        """【只跟新增】把源持仓减去基准，返回增量（每个 key 的 max(0, 当前 - 基准)）。
+
+        - 基准文件不存在 → 视为「首次启用」：把当前源持仓快照为基准并持久化，本轮返回空（不跟）。
+        - 基准文件存在 → 只保留源账户在基准"之上"的新增部分；老仓（<=基准）一律不跟。
+        重置方式：删除 {order-check}/hold-baseline-{源账户}.json 即可重新快照。
+        """
+        baseline = self._load_baseline()
+        if baseline is None:
+            self._save_baseline(src_agg)
+            total = sum(src_agg.values())
+            path = self._baseline_path()
+            self.print(
+                f"[只跟新增] 首次启用自动快照：源账户当前持仓已记为基准并持久化"
+                f"（{len(src_agg)} 个合约 / 共 {total} 手）→ {path}；本轮不跟单，"
+                f"之后仅跟基准之上的新增。如需重置，删除该基准文件即可。"
+            )
+            return {}
+        delta: Dict[Tuple[str, int], int] = {}
+        added_total = 0
+        for key, qty in src_agg.items():
+            d = int(qty) - int(baseline.get(key, 0))
+            if d > 0:
+                delta[key] = d
+                added_total += d
+        self.print(
+            f"[只跟新增] 已加载源基准（{len(baseline)} 个合约），本次相对基准的新增："
+            f"{len(delta)} 个合约 / 共 {added_total} 手（老仓不跟）"
+        )
+        return delta
+
+    def _arb_pairs_path(self) -> Optional[str]:
+        return os.path.join(self._config_dir(), "arb-pairs.json")
+
+    def _load_arb_pairs(self) -> List[Tuple[str, str]]:
+        """加载已识别的套利对子列表 [(腿A, 腿B), ...]（由 compare_orders.generate_arb_pairs 生成）。"""
+        path = self._arb_pairs_path()
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.print(f"[套利对子] 读取 arb-pairs.json 失败({path}): {e}")
+            return []
+        raw = data.get('pairs') if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        pairs: List[Tuple[str, str]] = []
+        for item in raw or []:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    a = str(item[0]).strip().upper()
+                    b = str(item[1]).strip().upper()
+                    if a and b and a != b:
+                        pairs.append((a, b))
+            except Exception:
+                continue
+        return pairs
+
+    def _arb_exempt_contracts(self, src_agg: Dict[Tuple[str, int], int]) -> set:
+        """返回需豁免第 2 层非主流通过滤的合约集合。
+
+        规则：对每个已识别的套利对子 (A, B)，若源持仓里 A 与 B 两腿**同时存在且方向相反**
+        （一腿多 2、另一腿空 3），则 A/B 都加入豁免集合，避免远月腿被 allow_level 误剔。
+        """
+        pairs = self._load_arb_pairs()
+        if not pairs:
+            return set()
+        dirs_by_contract: Dict[str, set] = {}
+        for (c, d) in src_agg.keys():
+            dirs_by_contract.setdefault(c, set()).add(d)
+        exempt: set = set()
+        for a, b in pairs:
+            a_dirs = dirs_by_contract.get(a, set())
+            b_dirs = dirs_by_contract.get(b, set())
+            if not a_dirs or not b_dirs:
+                continue
+            if (2 in a_dirs and 3 in b_dirs) or (3 in a_dirs and 2 in b_dirs):
+                exempt.add(a)
+                exempt.add(b)
+        if exempt:
+            self.print(f"[套利对子] 源持仓中识别到成对对子两腿（方向相反）：{sorted(exempt)}，将豁免非主流通过滤")
+        return exempt
+
     def _parse_hold_std(self) -> Dict[Tuple[str, int], int]:
         """目标持仓构造器，支持 ratio/ration 的三种模式 + 反探单过滤。
 
@@ -534,6 +675,11 @@ class PositionSyncManagerData:
                          等价于"跟单账户作为 signal_account 的对手方"。
         三种模式下 exclude 品种过滤、非标准化跳过、volume<=0 跳过、
         追加 4 层「反探单过滤」：deny_products → 主流通合约检查 + 大单豁免 → min_qty_hand → min_notional。
+
+        附加能力：
+        - 【只跟新增】(self._follow_new_only=True)：先对源持仓做「源基准相减」，只保留基准之上的新增部分；
+          首次启用时自动快照当前源持仓为基准（hold-baseline-{源账户}.json）并本轮不跟。
+        - 【套利对子】(arb-pairs.json)：两腿同时存在且方向相反时，豁免第 2 层非主流通过滤（防远月腿被误剔）。
         """
         # 清仓模式：直接空 dict，不做反探单过滤（清仓是要把所有持仓平掉，包括非主流通/黑名单品种）
         ratio = getattr(self, '_position_ratio', 1.0)
@@ -541,12 +687,13 @@ class PositionSyncManagerData:
             self.print("[模式-清仓] ration=0，目标持仓全部置 0（多平挂卖一AskPrice1、空平挂买一BidPrice1，排队挂单不急成交）")
             return {}
 
-        # 1) 先构建原始缩放后的 result（按 ratio/对冲 正常算）：代码复用原先已有实现
-        raw_result: Dict[Tuple[str, int], int] = {}
+        follow_new_only = bool(getattr(self, '_follow_new_only', False))
+
+        # 1) 先按源账户原始持仓聚合 ((合约, 源方向) -> 手数)；exclude/期权在此阶段就剔除
+        src_agg: Dict[Tuple[str, int], int] = {}
         total_original = 0
         excluded_original = 0
         excluded_option = 0
-        hedged_total = 0
         abs_ratio = abs(ratio)
 
         for i, row in enumerate(self._hold_std):
@@ -580,21 +727,31 @@ class PositionSyncManagerData:
                 self.print(f"[调试-hold] 第{i}条 {contract} 方向无法解析 '{direction_str}'")
                 continue
             total_original += volume
+            _agg_key = (contract, src_direction)
+            src_agg[_agg_key] = src_agg.get(_agg_key, 0) + volume
 
+        # 1.5) 【只跟新增】源基准相减：只保留源账户相对基准的「新增」部分（老仓不跟）。
+        #      baseline 缺失时视为「首次启用」，把当前源持仓快照为基准并持久化，本轮不跟。
+        if follow_new_only:
+            src_agg = self._apply_new_only_baseline(src_agg)
+
+        # 2) 按 ratio 缩放（正常跟单）/ 反转（对冲）得到目标持仓原始结果
+        raw_result: Dict[Tuple[str, int], int] = {}
+        hedged_total = 0
+        for (contract, src_direction), volume in src_agg.items():
+            if volume <= 0:
+                continue
             if ratio > 0:
                 direction = src_direction
-                scaled_volume = max(1, int(round(volume * ratio))) if volume > 0 else 0
+                scaled_volume = max(1, int(round(volume * ratio)))
             else:
                 direction = 3 if src_direction == 2 else 2
-                hedged_after = int(round(volume * abs_ratio)) if volume > 0 else 0
-                scaled_volume = hedged_after
-                hedged_total += hedged_after
-
+                scaled_volume = int(round(volume * abs_ratio))
+                hedged_total += scaled_volume
             if scaled_volume > 0:
-                key = (contract, direction)
-                raw_result[key] = raw_result.get(key, 0) + scaled_volume
+                raw_result[(contract, direction)] = raw_result.get((contract, direction), 0) + scaled_volume
 
-        # 2) 追加 4 层「反探单过滤」（仅对 ration != 0 生效）
+        # 3) 追加 4 层「反探单过滤」（仅对 ration != 0 生效）
         deny_products = getattr(self, '_deny_products', None) or set()
         min_qty_hand = getattr(self, '_min_qty_hand', None)
         min_notional = getattr(self, '_min_notional', None)
@@ -603,9 +760,14 @@ class PositionSyncManagerData:
         if not getattr(self, '_main_by_product_loaded', False):
             self._load_main_by_product()
 
+        # 套利对子两腿豁免集合：从 arb-pairs.json（由「所有委托」里的 SPD 对子识别而来）
+        # 中找到「两腿都在源持仓中出现且方向相反」的合约，这些合约豁免第 2 层非主流通过滤。
+        arb_exempt = self._arb_exempt_contracts(src_agg)
+
         final_result: Dict[Tuple[str, int], int] = {}
         filtered_counts = {"deny": 0, "non_main": 0, "min_qty": 0, "min_notional": 0}
         exempt_non_main = 0
+        arb_exempt_hit = 0
 
         for (contract, direction), qty in raw_result.items():
             if qty <= 0:
@@ -623,23 +785,31 @@ class PositionSyncManagerData:
                 continue
 
             # 层2：非主流通合约 → 先估算 notional，再判断是否满足大豁免
-            mainline_flag = self._contract_is_mainline(cu)
-            if mainline_flag is False:
-                notional = self._estimate_notional(cu, qty)
-                if notional >= big_notional_exemption:
-                    exempt_non_main += 1
-                    self.print(
-                        f"[非主流通-大单豁免] {contract} {'买' if direction == 2 else '卖'} {qty}手, "
-                        f"估算成交额约 {notional:,.0f} 元 >= {big_notional_exemption:,.0f} 豁免阈值，放行"
-                    )
-                else:
-                    self.print(
-                        f"[非主流通] 跳过（{contract} 不属于 allow_level={sorted(getattr(self, '_allow_contract_level', None))}），"
-                        f"且成交额 {notional:,.0f} 元 < {big_notional_exemption:,.0f} 豁免阈值: "
-                        f"{'买' if direction == 2 else '卖'} {qty}手"
-                    )
-                    filtered_counts["non_main"] += 1
-                    continue
+            #     套利对子两腿例外：命中已识别对子的两腿直接豁免，避免远月腿（如 MA702）被误剔导致对冲被打破。
+            if cu in arb_exempt:
+                arb_exempt_hit += 1
+                self.print(
+                    f"[套利对子] {contract} {'买' if direction == 2 else '卖'} {qty}手 "
+                    f"命中已识别套利对子两腿，豁免非主流通过滤"
+                )
+            else:
+                mainline_flag = self._contract_is_mainline(cu)
+                if mainline_flag is False:
+                    notional = self._estimate_notional(cu, qty)
+                    if notional >= big_notional_exemption:
+                        exempt_non_main += 1
+                        self.print(
+                            f"[非主流通-大单豁免] {contract} {'买' if direction == 2 else '卖'} {qty}手, "
+                            f"估算成交额约 {notional:,.0f} 元 >= {big_notional_exemption:,.0f} 豁免阈值，放行"
+                        )
+                    else:
+                        self.print(
+                            f"[非主流通] 跳过（{contract} 不属于 allow_level={sorted(getattr(self, '_allow_contract_level', None))}），"
+                            f"且成交额 {notional:,.0f} 元 < {big_notional_exemption:,.0f} 豁免阈值: "
+                            f"{'买' if direction == 2 else '卖'} {qty}手"
+                        )
+                        filtered_counts["non_main"] += 1
+                        continue
 
             # 层3：min_qty_hand（单合约手数太小视为探单）
             if min_qty_hand is not None and min_qty_hand > 0 and qty < min_qty_hand:
@@ -679,7 +849,7 @@ class PositionSyncManagerData:
                 f"缩放后未过滤={total_scaled_raw} 手 (ratio={ratio})"
             )
         self.print(base_mode_msg)
-        filter_applied = any(v > 0 for v in filtered_counts.values()) or exempt_non_main > 0
+        filter_applied = any(v > 0 for v in filtered_counts.values()) or exempt_non_main > 0 or arb_exempt_hit > 0
         if filter_applied:
             parts = []
             if filtered_counts["deny"]:
@@ -692,6 +862,8 @@ class PositionSyncManagerData:
                 parts.append(f"手数门槛剔除 {filtered_counts['min_qty']} 个合约")
             if filtered_counts["min_notional"]:
                 parts.append(f"成交额门槛剔除 {filtered_counts['min_notional']} 个合约")
+            if arb_exempt_hit:
+                parts.append(f"套利对子两腿豁免 {arb_exempt_hit} 个合约")
             self.print(f"[反探单过滤] {'、'.join(parts)}；最终通过合约 {len(final_result)} 个，目标手数合计: {total_final}")
         elif len(raw_result) != len(final_result) or total_scaled_raw != total_final:
             self.print(

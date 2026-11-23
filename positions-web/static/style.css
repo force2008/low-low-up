@@ -1,0 +1,143 @@
+/* 持仓数据展示 —— 浅色紧凑风，移动端横向滚动 */
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --line: #e4e7ec;
+  --text: #1f2430;
+  --muted: #8a93a4;
+  --up: #d93026;      /* 国内习惯：盈利/买入 红 */
+  --down: #0a9e4a;    /* 亏损/卖出 绿 */
+  --accent: #2b6cb0;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.title { font-size: 15px; font-weight: 600; }
+
+.meta {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  background: #f7f9fc;
+  font-size: 11px;
+}
+
+.badge.hit { color: var(--down); border-color: #bfe6cf; background: #f0fbf4; }
+.badge.miss { color: #b7791f; border-color: #f0dfae; background: #fdf8e9; }
+
+/* ---------- 表格 ---------- */
+main { padding: 12px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: auto;
+  max-height: calc(100vh - 100px);
+}
+
+table.grid {
+  width: 100%;
+  min-width: 450px;        /* 窗口比这还窄时改成横向滚动（.card 里滚） */
+  table-layout: fixed;      /* 列宽只认下面写死的 width，其余列平分剩余空间 */
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+table.grid1 {
+  min-width: 400px;        /* 窗口比这还窄时改成横向滚动（.card 里滚） */
+}
+th, td {
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;         /* 万一列比内容窄，裁掉而不是挤到隔壁列 */
+  text-align: left;
+}
+
+thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #fafbfc;
+  color: #4a5568;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+td.num, th.num { text-align: right; padding:0 2px}
+/* 只给「短列」写死宽度，没写宽度的数字列平分剩下的全部空间，所以数字列要宽就调小这些值。
+   数值按最长内容留了余量：账号 10 字符 ≈ 78px（没有持仓文件时还会多一个「–」）… */
+th.account, td.account {width: 80px}      /* 账号 */
+th.code, td.code   { width: 60px }         /* 合约ID，如 ag2702 */
+th.direction, td.direction {width: 40px}   /* 买卖 */
+th.qty, td.qty     { width: 46px }         /* 今仓，如 20.00 */
+th.pos, td.pos     { width: 52px }         /* 持仓量 */
+tbody tr:hover { background: #f7f9fc; }
+tbody tr:last-child td { border-bottom: none; }
+
+tfoot td {
+  background: #fafbfc;
+  font-weight: 600;
+  border-top: 1px solid var(--line);
+}
+
+.empty, .error {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.error { color: var(--up); }
+
+/* ---------- 数值着色 ---------- */
+.up { color: var(--up); }
+.down { color: var(--down); }
+.dim { color: var(--muted); }
+
+a.acc { color: var(--accent); text-decoration: none; font-weight: 500; }
+a.acc:hover { text-decoration: underline; }
+
+/* ---------- 窄屏 ---------- */
+@media (max-width: 640px) {
+  th, td { padding: 5px 8px; font-size: 13px; }
+  .meta { font-size: 11px; width: 100%; margin-left: 0; }
+  main { padding: 8px; }
+}

@@ -235,6 +235,20 @@ for h in logger.handlers:
     h.flush()
 # =================================================
 
+# ==================== 会话保活：把 RDP 会话切回控制台 ====================
+# 导出用 pyautogui 按「固定桌面绝对坐标」点击，一旦有人用 RDP 登录，桌面会被接管/
+# 切成分辨率不同的会话，点击全部错位。这里在每次导出前把会话交还控制台(console)。
+# 实现见 console_keepalive.py（与 account_monitor.py 共用同一份逻辑）。
+try:
+    from console_keepalive import ensure_console_session
+except ImportError as _e:
+    def ensure_console_session(logger=None, force=False):
+        (logger or logging.getLogger(__name__)).error(
+            "[会话] 未找到 console_keepalive 模块(%s)，本次跳过会话保活", _e
+        )
+        return False
+# =================================================
+
 # ==================== CTP 环境检测 ====================
 try:
     from config import config as _ctp_config
@@ -585,10 +599,10 @@ def build_target_conf(target: dict) -> dict:
 GLOBAL_DENY_PRODUCTS = {"WR", "FB", "BB", "RR", "RS", "WH", "PM", "RI","ZC","JR"}
 
 # ② 全局允许的合约级别（取 main_contracts_by_product.json 中对应 key）
-#    默认只跟主力 main + 次主力 main2；如需宽松可加 "main3"。
-#    任何非 main/main2 的合约（远月/冷门月）都视为非主流通合约，
+#    默认跟主力 main + 次主力 main2 + 次次主 main3 + main4，共 4 个级别。
+#    任何不在这 4 个级别里的合约（远月/冷门月）都视为非主流通合约，
 #    不满足大单豁免时直接剔除，避免在远月小流通池里下探单直接暴露跟单身份。
-GLOBAL_ALLOW_CONTRACT_LEVEL = {"main", "main2","main3"}
+GLOBAL_ALLOW_CONTRACT_LEVEL = {"main", "main2", "main3", "main4"}
 
 # ③ 大单豁免阈值（元）：即使是非主流通合约，单合约目标成交额 >= 该值也放行。
 #    用于防误杀：换月前大资金提前移仓到次次主、或者策略专门做跨期套利时的真实大额交易。
@@ -696,8 +710,8 @@ def _get_target_allow_contract_level(target: dict) -> set:
 
     支持字段：allow_contract_level / allow_level / contract_level。
     值可以是 list（如 ["main","main2"]）或逗号分隔字符串（如 "main,main2"）。
-    未配置时回退到全局 GLOBAL_ALLOW_CONTRACT_LEVEL = {"main","main2"}。
-    合法取值：main（主力）/ main2（次主力）/ main3（次次主）。
+    未配置时回退到全局 GLOBAL_ALLOW_CONTRACT_LEVEL = {"main","main2","main3","main4"}。
+    合法取值：main（主力）/ main2（次主力）/ main3（次次主）/ main4。
     """
     raw = None
     for key in ("allow_contract_level", "allow_level", "contract_level"):
@@ -914,6 +928,39 @@ def _get_target_allow_option(target: dict) -> bool:
     return False
 
 
+def _get_target_follow_new_only(target: dict) -> bool:
+    """获取目标账户的「只跟新增」开关。
+
+    支持字段：followNewOnly / follow_new_only（布尔、0/1、或 "1"/"true"/"on"/"yes" 字符串）。
+    未配置时回退默认 False —— 照抄源账户全部持仓（含历史老仓）。
+
+    True 时：首次启用自动把源账户当时持仓记为基准快照（hold-baseline-{源账户}.json），
+    之后只跟「超出基准的增量」，源账户老仓不跟；目标账户已镜像的老仓会被判为超额平掉。
+    重置：删除 hold-baseline-{源账户}.json 即可。
+    """
+    raw = None
+    for key in ("followNewOnly", "follow_new_only"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on", "开启", "启用"):
+        return True
+    if s in ("0", "false", "no", "off", "关闭", "禁用"):
+        return False
+    logger.warning(
+        "[follow_new_only] 目标账户 %s 的 followNewOnly=%r 无法识别，按默认 False（照抄全部持仓）处理",
+        target.get("user_id", "unknown"), raw,
+    )
+    return False
+
+
 # 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
 _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
@@ -992,18 +1039,18 @@ def _reload_account_targets_module():
 def _resolve_latest_target_config(source_account: str, user_id: str):
     """根据 (source_account, user_id) 从 account_targets.py 实时 reload 后取到最新配置。
 
-    返回 12-tuple:
+    返回 13-tuple:
       (ratio, exclude, allow_level, deny_products, min_qty_hand, min_notional,
        random_enabled, random_max_ms, passive_mode, passive_wait_seconds, allow_option,
-       matched_target)
+       follow_new_only, matched_target)
     找不到匹配条目时 -> 返回全 None，调用方沿用旧值。
     """
     targets_cfg = _reload_account_targets_module()
     if not targets_cfg or not source_account or not user_id:
-        return None, None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None, None
     target_list = targets_cfg.get(source_account) or []
     if not isinstance(target_list, (list, tuple)):
-        return None, None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None, None
     matched = None
     for t in target_list:
         if not isinstance(t, dict):
@@ -1012,7 +1059,7 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
             matched = t
             break
     if matched is None:
-        return None, None, None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None, None, None, None
     ratio = _get_target_ratio(matched)
     exclude = _get_target_exclude(matched)
     allow_level = _get_target_allow_contract_level(matched)
@@ -1022,9 +1069,10 @@ def _resolve_latest_target_config(source_account: str, user_id: str):
     rnd_enabled, rnd_max_ms = _get_random_delay_config(matched)
     passive_mode, passive_wait_sec = _get_target_passive_config(matched)
     allow_option = _get_target_allow_option(matched)
+    follow_new_only = _get_target_follow_new_only(matched)
     return (ratio, exclude, allow_level, deny, min_qty, min_not,
             rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
-            matched)
+            follow_new_only, matched)
 
 
 # ==================== 线程间通信 ====================
@@ -1083,6 +1131,15 @@ def run_sync(source_account=None):
 
         if not gen_ok:
             logger.warning("生成 %s 失败", path_basename)
+
+        # 从源账户「所有委托」CSV 识别 SPD 套利对子（如 SPD MA701&MA702），
+        # 写入 arb-pairs.json 供 PositionSyncManager 让套利两腿豁免「非主流通合约」过滤。
+        try:
+            arb_ok = compare_orders.generate_arb_pairs(account=current_account)
+            if arb_ok:
+                logger.info(">>> 已更新套利对子文件 arb-pairs.json（源账户 %s）", current_account)
+        except Exception as _arb_e:
+            logger.warning("识别套利对子失败（不影响同步）: %s", _arb_e)
 
         # 读取当前标准仓（供日志使用）
         if os.path.exists(hold_std_path):
@@ -1151,6 +1208,8 @@ def run_once() -> bool:
     logger.info("=" * 50)
     logger.info("开始执行: 导出 -> 持仓差异对比")
     logger.info(">>> 步骤 1/3: 执行自动导出...")
+    # 导出前先做一次会话保活：桌面被 RDP 抢占时，pyautogui 固定坐标会全部错位
+    ensure_console_session(logger)
     try:
         import automate_export
         success = automate_export.main()
@@ -1441,6 +1500,8 @@ def main():
 
     # 启动时先执行导出，获取最新持仓数据
     logger.info(">>> 启动时先执行导出...")
+    # 导出前先做一次会话保活：桌面被 RDP 抢占时，pyautogui 固定坐标会全部错位
+    ensure_console_session(logger)
     try:
         import automate_export
         export_ok = automate_export.main()
@@ -1477,6 +1538,13 @@ def main():
                         hold_rows = json.load(f)
                     compare_orders.send_feishu_hold_notification(hold_rows)
                     logger.info("%s 共 %d 条记录", os.path.basename(output_path), len(hold_rows))
+                # 从该源账户「所有委托」CSV 识别 SPD 套利对子（如 SPD MA701&MA702），
+                # 写入 arb-pairs.json，供 PositionSyncManager 让套利两腿豁免非主流通过滤。
+                try:
+                    if compare_orders.generate_arb_pairs(account=source_account):
+                        logger.info(">>> 已更新套利对子文件 arb-pairs.json（源账户 %s）", source_account)
+                except Exception as _arb_e:
+                    logger.warning("识别套利对子失败（不影响同步）: %s", _arb_e)
         except Exception as e:
             logger.error("生成持仓文件失败: %s", e)
 
@@ -1503,14 +1571,16 @@ def main():
                 rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
                 passive_mode, passive_wait_sec = _get_target_passive_config(target)
                 allow_option = _get_target_allow_option(target)
+                follow_new_only = _get_target_follow_new_only(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
                 logger.info(
                     "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
                     "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
-                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s)",
+                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s, follow_new_only=%s)",
                     source_account, user_id, ratio, exclude or '[]',
                     sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
                     rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
+                    follow_new_only,
                 )
             else:
                 # 回退到默认单账户模式
@@ -1526,6 +1596,7 @@ def main():
                 rnd_enabled, rnd_max_ms = RANDOM_ORDER_DELAY_ENABLED, RANDOM_ORDER_DELAY_MAX_MS
                 passive_mode, passive_wait_sec = PASSIVE_MODE_DEFAULT, PASSIVE_WAIT_SECONDS_DEFAULT
                 allow_option = False
+                follow_new_only = False
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
@@ -1553,6 +1624,7 @@ def main():
                 passive_mode=passive_mode,
                 passive_wait_seconds=passive_wait_sec,
                 allow_option=allow_option,
+                follow_new_only=follow_new_only,
                 main_by_product_path=os.path.join(
                     PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
                 ),
