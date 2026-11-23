@@ -599,10 +599,10 @@ def build_target_conf(target: dict) -> dict:
 GLOBAL_DENY_PRODUCTS = {"WR", "FB", "BB", "RR", "RS", "WH", "PM", "RI","ZC","JR"}
 
 # ② 全局允许的合约级别（取 main_contracts_by_product.json 中对应 key）
-#    默认只跟主力 main + 次主力 main2；如需宽松可加 "main3"。
-#    任何非 main/main2 的合约（远月/冷门月）都视为非主流通合约，
+#    默认跟主力 main + 次主力 main2 + 次次主 main3 + main4，共 4 个级别。
+#    任何不在这 4 个级别里的合约（远月/冷门月）都视为非主流通合约，
 #    不满足大单豁免时直接剔除，避免在远月小流通池里下探单直接暴露跟单身份。
-GLOBAL_ALLOW_CONTRACT_LEVEL = {"main", "main2","main3"}
+GLOBAL_ALLOW_CONTRACT_LEVEL = {"main", "main2", "main3", "main4"}
 
 # ③ 大单豁免阈值（元）：即使是非主流通合约，单合约目标成交额 >= 该值也放行。
 #    用于防误杀：换月前大资金提前移仓到次次主、或者策略专门做跨期套利时的真实大额交易。
@@ -710,8 +710,8 @@ def _get_target_allow_contract_level(target: dict) -> set:
 
     支持字段：allow_contract_level / allow_level / contract_level。
     值可以是 list（如 ["main","main2"]）或逗号分隔字符串（如 "main,main2"）。
-    未配置时回退到全局 GLOBAL_ALLOW_CONTRACT_LEVEL = {"main","main2"}。
-    合法取值：main（主力）/ main2（次主力）/ main3（次次主）。
+    未配置时回退到全局 GLOBAL_ALLOW_CONTRACT_LEVEL = {"main","main2","main3","main4"}。
+    合法取值：main（主力）/ main2（次主力）/ main3（次次主）/ main4。
     """
     raw = None
     for key in ("allow_contract_level", "allow_level", "contract_level"):

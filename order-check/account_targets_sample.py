@@ -46,10 +46,10 @@
 
   2) allow_contract_level / allow_level / contract_level
      语义：只跟单哪些"级别的合约"。从 main_contracts_by_product.json 的 main / main2 / main3 / main4 里取具体合约代码。
-     默认值（全局）：{"main", "main2"} —— 只跟主力 + 次主力。
+     默认值（全局）：{"main", "main2", "main3", "main4"} —— 主力+次主+次次主+第4主，共 4 级。
      例：allow_contract_level=["main"] 只跟绝对主力；
-         allow_contract_level=["main","main2","main3"] 主力+次主+次次主都跟。
-     ⇒ 关键防御：源账号在冷门月份下探单时，该合约大概率不在 main/main2 里，直接被拦掉。
+         allow_contract_level=["main","main2","main3","main4"] 4 个级别都跟（=全局默认）。
+     ⇒ 关键防御：源账号在冷门月份下探单时，该合约大概率不在 main~main4 里，直接被拦掉。
 
   3) deny / deny_products / blacklist / blacklist_products
      语义：品种级黑名单（冷门/不活跃品种，**任何情况都不开新仓**）。
