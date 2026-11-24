@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ account }} · 成交明细</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">← 账户权益总览</a>
+    <span class="title" id="account">{{ account }}</span>
+    <nav class="tabs">
+      <a class="tab" href="/position/{{ account }}">持仓明细</a>
+      <a class="tab active" href="/trades/{{ account }}">成交明细</a>
+    </nav>
+    <div class="meta" id="meta">加载中…</div>
+  </header>
+
+  <main>
+    <div class="card">
+      <table class="grid grid-trades">
+        <thead>
+          <tr>
+            <th class="t-time">成交时间</th>
+            <th class="code">合约</th>
+            <th class="direction">买卖</th>
+            <th class="ocf">开平</th>
+            <th class="num qty">成交数量</th>
+            <th class="num code">成交价格</th>
+            <th class="t-oc">投保</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="8" class="empty">正在加载…</td></tr>
+        </tbody>
+        <tfoot id="foot"></tfoot>
+      </table>
+    </div>
+  </main>
+
+  <script>window.TRADE_ACCOUNT = {{ account | tojson }};</script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script>PF.loadTrades(window.TRADE_ACCOUNT);</script>
+</body>
+</html>

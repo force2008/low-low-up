@@ -10,6 +10,10 @@
   <header class="topbar">
     <a class="brand" href="/">← 账户权益总览</a>
     <span class="title" id="account">{{ account }}</span>
+    <nav class="tabs">
+      <a class="tab active" href="/position/{{ account }}">持仓明细</a>
+      <a class="tab" href="/trades/{{ account }}">成交明细</a>
+    </nav>
     <div class="meta" id="meta">加载中…</div>
   </header>
 
