@@ -302,7 +302,14 @@ class PositionSyncManagerMarket:
         try:
             if not getattr(self, '_main_by_product_loaded', False):
                 self._load_main_by_product()
-            candidates = sorted(getattr(self, '_allowed_contracts_set', None) or [])
+            # _allowed_contracts_set 里存的是「大写」合约码，但 CTP 行情订阅是大小写敏感的
+            # （SHFE/INE/DCE/GFEX 必须小写，如 al2702）。若直接订阅大写：
+            #   1) 这些交易所的合约在行情前置侧订不上，永远收不到 tick；
+            #   2) 错误大小写会被记进 MdQuoteProvider._subscribed（按大写去重），
+            #      导致后续正确大小写的订阅全部被幂等短路，再也发不出去。
+            # 因此这里统一还原「精确大小写」后再批量订阅。
+            raw = getattr(self, '_allowed_contracts_set', None) or []
+            candidates = sorted({self._standardize_contract(c) for c in raw})
             if candidates:
                 md_provider.subscribe_many(candidates)
         except Exception as e:

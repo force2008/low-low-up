@@ -611,7 +611,12 @@ class PositionSyncManagerData:
         delta: Dict[Tuple[str, int], int] = {}
         added_total = 0
         for key, qty in src_agg.items():
-            d = int(qty) - int(baseline.get(key, 0))
+            # 键大小写归一：_load_baseline 读盘时会把合约转大写，而运行时 src_agg 的键
+            # 来自 _standardize_contract（SHFE/INE/DCE/GFEX 为小写，如 al2702）。
+            # 若此处不归一，会对 SHFE 等小写合约查表 miss，把老仓误判为「新增」。
+            c, dir_ = key
+            base_val = baseline.get((str(c).strip().upper(), int(dir_)), 0)
+            d = int(qty) - int(base_val)
             if d > 0:
                 delta[key] = d
                 added_total += d
