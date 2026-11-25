@@ -101,6 +101,20 @@
      语义：被动挂单模式下的「排队等待窗口」秒数。挂单后在此窗口内不撤单，让排队价自然成交；
           超时仍未成交则逐档向对手盘进 1 tick 重挂。
      默认：300（5 分钟），合法值 >= 10（小于 10 则兜底回默认 300 避免过短）。
+  10.1) passiveQueueMax / passive_queue_max 与 passiveTimeMax / passive_time_max
+     语义：passive【弱队改吃单】阈值（仅 passive=1 时生效）。passive 挂单在**提交时**和
+          **超时重挂时**，先预判成交前景，命中任一条件即放弃排队、**改用对价吃掉单**：
+            · passiveQueueMax：该价位盘口排队量（手）≥ 此值 → 改吃单（默认 1000）；
+               买开/买平看 BidVolume1；卖开/卖平看 AskVolume1。
+            · passiveTimeMax ：预估成交时间 = 排队量 ÷ 成交速率（手/秒）> 此值（秒）→ 改吃单（默认 30）。
+               成交速率取自行情累计成交量 Volume 的最近 60 秒滚动窗口差分；拿不到速率时只应用排队量硬阈值。
+          任一值 <= 0 表示关闭对应规则（如只想要 30 秒规则、不要 1000 手规则，就设 passiveQueueMax=0）。
+     默认：QueueMax=1000 手、TimeMax=30 秒（全局默认见 run_pipeline.py 的 PASSIVE_QUEUE_MAX / PASSIVE_TIME_MAX）。
+     说明：
+       · 命中时日志打印 [passive降级吃单][开/平/超时重挂] ... → 放弃排队，改用对价；
+       · 该策略**不影响** ratio==0 清仓模式的排队平仓，也不影响 exclude 退出平仓（各按原策略走）；
+       · 本阈值是**启动期**参数，修改后需重启 pipeline 才生效。
+
   11) allowOption / allow_option
      语义：【期权跟单开关】。源账户（如 yq1015）的期权持仓默认**不跟单**。
      默认：0 / False（屏蔽期权）——目标侧 hold-std 里的期权不开仓，实际侧的期权持仓也不参与对齐
@@ -117,7 +131,8 @@
      工作方式：
        · 基准快照：首次启用自动把源账户当时的持仓记为基准，写入 hold-baseline-{源账户}.json，
                    之后每轮都是「源当前持仓 − 基准快照」，只把超出的增量当目标；
-       · 基准粒度：**按源账户共享**（一个源账户一个基准文件，其下所有目标账户共用同一基准）；
+       · 基准粒度：默认**按源账户共享**（一个源账户一个基准文件，其下所有目标账户共用同一基准）；
+                   如需每个目标账户各自独立一份基准，见下方第 13 条 followNewOnlyPerTarget；
        · 目标侧老仓：目标最终持仓 = max(0, 源当前 − 源基准) × ratio。
                      启用那一刻，目标账户已镜像的老仓会被判为"超额"，按限价平掉，
                      最终只持有源基准之后的新增部分；
@@ -194,6 +209,12 @@
             #   · passive_wait_seconds=300：5 分钟等待窗口（默认 300，可省略）。
             # {"env_name": "online", "user_id": "ta001", "password": "xxx",
             #  "ratio": 1, "passive": 1, "passive_wait_seconds": 300},
+            #
+            # ===== 只跟新增示例（只跟源账户以后新开的仓，历史老仓不跟） =====
+            #   · followNewOnly=1：首次启用自动快照源账户当时持仓为基准，之后只跟增量；
+            #                      目标账户已镜像的老仓会被判为超额平掉。
+            # {"env_name": "online", "user_id": "ta002", "password": "xxx",
+            #  "ratio": 1, "followNewOnly": 1},
         ],
         # 最小化写法示例：只写 exclude + ratio，其余字段全走 run_pipeline.py 顶部全局默认
         "minimal_demo": [

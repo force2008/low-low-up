@@ -283,6 +283,31 @@ class PositionSyncManagerMarket:
                 result[inst] = md
         return result
 
+    def _prewarm_passive_rate_subscriptions(self):
+        """passive「弱队改吃单」用的成交速率预热订阅。
+
+        成交速率基于累计成交量 Volume 的滚动窗口；CTP 只对「已订阅」合约推 tick。
+        若某合约只在「首次需要下单」那一轮才被按需订阅，则该轮拿不到速率，
+        只剩排队量硬阈值；下一轮（~15s 后）才有速率可用。
+        这里在每轮同步开始前，把 allow_level 允许的候选合约（main~mainN，约 200~300 个）
+        批量预订阅，订阅幂等且不撤销，保证任何新开/新平单到来时都已有速率历史。
+
+        仅在 passive 模式账户生效（非 passive 无需额外订阅，避免浪费行情带宽）。
+        """
+        if not getattr(self, '_passive_mode', False):
+            return
+        md_provider = getattr(self, '_md_provider', None)
+        if md_provider is None:
+            return
+        try:
+            if not getattr(self, '_main_by_product_loaded', False):
+                self._load_main_by_product()
+            candidates = sorted(getattr(self, '_allowed_contracts_set', None) or [])
+            if candidates:
+                md_provider.subscribe_many(candidates)
+        except Exception as e:
+            self.print(f"[警告] passive 速率预热订阅异常: {e}")
+
     def query_positions(self, timeout: int = 10, retries: int = 2, blocking: bool = True) -> Optional[List[dict]]:
         """查询持仓，超时返回 None（调用者需区分"超时"和"确实无持仓"）
         blocking=False 时若已有查询在进行则返回 None，避免竞态覆盖数据

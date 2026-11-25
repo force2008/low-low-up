@@ -66,6 +66,13 @@ class PositionSyncManagerBase(CTdSpiBase):
         #                            exclude 退出平仓 / ratio==0 的全仓清仓 不受 passive 影响，仍按各自策略走。
         passive_mode: bool = False,
         passive_wait_seconds: int = 300,
+        # ---- passive「弱队改吃单」阈值（仅 passive_mode=True 时生效）----
+        # passive 排队单提交/超时重挂前预判成交前景，命中任一即放弃排队、改用对价吃单：
+        #   passive_queue_max：该价位盘口排队量（手）>= 此值 → 改吃单（默认 1000；<=0 关闭该规则）
+        #   passive_time_max ：预估成交时间 = 排队量 ÷ 成交速率（手/秒）> 此值 → 改吃单（默认 30 秒；<=0 关闭）
+        # 成交速率来自行情累计成交量的滚动窗口（拿不到时只应用排队量硬阈值）。
+        passive_queue_max: float = 1000,
+        passive_time_max: float = 30.0,
         # ---- 期权跟单开关（默认 False=屏蔽源账户的期权持仓，不跟单）----
         # False：源账户的期权持仓既不跟开、也不参与实际持仓对齐（完全交给用户手工管理）；
         # True ：目标账户配置 allowOption=1 时打开，按普通合约一样跟单期权。
@@ -182,6 +189,15 @@ class PositionSyncManagerBase(CTdSpiBase):
             self._passive_wait_seconds = 300
         if self._passive_wait_seconds < 10:
             self._passive_wait_seconds = 300
+        # passive「弱队改吃单」阈值：排队量(手) / 预估成交时间(秒)，<=0 表示关闭该条规则
+        try:
+            self._passive_queue_max: float = float(passive_queue_max)
+        except (TypeError, ValueError):
+            self._passive_queue_max = 1000.0
+        try:
+            self._passive_time_max: float = float(passive_time_max)
+        except (TypeError, ValueError):
+            self._passive_time_max = 30.0
 
         # ------------------------------------------------------------------
         # 8.1) 期权跟单开关（默认 False=屏蔽源账户期权持仓）

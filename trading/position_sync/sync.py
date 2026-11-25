@@ -57,6 +57,37 @@ def _safe_price(v, fallback=0.0) -> float:
     return float(v) if _is_valid_positive_price(v) else float(fallback)
 
 
+def _safe_volume(v) -> int:
+    """把盘口量字段安全转成非负整数手数（None/非数值/负值/脏数据一律按 0）。"""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(fv) or fv <= 0:
+        return 0
+    return int(fv)
+
+
+def _passive_queue_and_rate(md: Optional[dict], direction: str, md_provider, contract: str):
+    """返回 (排队量手数, 成交速率手/秒 或 None)。
+
+    排队量 = 本方被动挂单价位上的盘口挂单量（我们挂上去后排在队尾，前面已有这么多手）：
+      buy  → BidVolume1（挂买一排队）
+      sell → AskVolume1（挂卖一排队）
+    成交速率来自行情 API 的累计成交量滚动窗口差分（拿不到返回 None）。
+    """
+    q = 0
+    if md:
+        q = _safe_volume(md.get("BidVolume1", 0)) if direction == "buy" else _safe_volume(md.get("AskVolume1", 0))
+    rate = None
+    if md_provider is not None and contract:
+        try:
+            rate = md_provider.get_trade_rate(contract)
+        except Exception:
+            rate = None
+    return q, rate
+
+
 def _clamp_price_within_limits(price: float, md: Optional[dict]) -> float:
     """若 md 中带涨跌停价，将价格钳位在 (停板价±2tick) 之内，避免越界报单被拒。"""
     if not _is_valid_positive_price(price):
@@ -244,6 +275,53 @@ def _calc_limit_price(
 
 class PositionSyncManagerSync:
     """持仓同步管理器 - 同步逻辑部分"""
+
+    # ------------------------------------------------------------------
+    # passive「弱队改吃单」判定
+    #   passive 排队单在提交/超时重挂前，先预判成交前景：
+    #   若该价位排队太厚、或按当前成交速率预估要很久才能轮到，则放弃排队，改用对价吃单。
+    # ------------------------------------------------------------------
+    def _should_fallback_passive_to_take(self, md, direction: str, contract: str, tag: str = "报单") -> bool:
+        """判断 passive 排队单是否应放弃排队、改用 aggressive 对价吃单。
+
+        阈值（均可在 account_targets.py 按账户覆盖；<=0 表示关闭该条规则）：
+          · passive_queue_max（默认 1000 手）：该价位盘口排队量 >= 此值 → 放弃排队；
+          · passive_time_max （默认 30 秒）：预估成交时间 = 排队量 ÷ 成交速率 > 此值 → 放弃排队。
+        返回 True=改吃单，False=继续排队；命中时打印原因。
+        """
+        try:
+            qmax = float(getattr(self, '_passive_queue_max', 1000) or 0)
+        except (TypeError, ValueError):
+            qmax = 1000.0
+        try:
+            tmax = float(getattr(self, '_passive_time_max', 30.0) or 0)
+        except (TypeError, ValueError):
+            tmax = 30.0
+
+        queue, rate = _passive_queue_and_rate(
+            md, direction, getattr(self, '_md_provider', None), contract
+        )
+        reasons = []
+        # 规则 1：盘口排队量硬阈值
+        if qmax > 0 and queue >= qmax:
+            reasons.append(f"盘口排队量{queue}手≥阈值{int(qmax)}手")
+        # 规则 2：预估成交时间 = 排队量 ÷ 成交速率
+        if tmax > 0 and rate is not None and queue > 0:
+            if rate <= 0:
+                reasons.append(f"窗口内无成交(速率{rate:.1f}手/s)，预估无法成交≥阈值{tmax:.0f}s")
+            else:
+                est = queue / rate
+                if est > tmax:
+                    reasons.append(
+                        f"预估成交{est:.0f}s>阈值{tmax:.0f}s(排队{queue}手÷速率{rate:.1f}手/s)"
+                    )
+        if reasons:
+            self.print(
+                f"[passive降级吃单][{tag}] {contract} {direction}："
+                + "；".join(reasons) + " → 放弃排队，改用对价"
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # 风控公共闸口（B1+B2 + 数据一致性双端校验）
@@ -1472,6 +1550,14 @@ class PositionSyncManagerSync:
                 self.print(tag_msg)
 
         # ============================================================
+        # passive 成交速率预热订阅（仅 passive 账户）：提前订阅候选合约，攒够 tick 才能算速率
+        # ============================================================
+        try:
+            self._prewarm_passive_rate_subscriptions()
+        except Exception:
+            pass
+
+        # ============================================================
         # 第一阶段：并行查询所有行情
         # ============================================================
         self.print("[快速] 第一阶段：并行查询行情...")
@@ -1772,6 +1858,13 @@ class PositionSyncManagerSync:
                 price_tick = info.get("PriceTick", 1.0)
 
                 mode = "passive" if getattr(self, '_passive_mode', False) else "aggressive"
+                # passive 弱队改吃单：盘口排队太厚 / 预估成交太慢时，直接降级为对价吃单
+                if mode == "passive":
+                    try:
+                        if self._should_fallback_passive_to_take(md, mo["direction"], contract, tag="开"):
+                            mode = "aggressive"
+                    except Exception as _pf_e:
+                        self.print(f"[警告] {contract} passive 降级判定异常: {_pf_e}")
                 limit_price, pricing_note = _calc_limit_price(
                     direction=mo["direction"],
                     md=md,
@@ -2236,6 +2329,13 @@ class PositionSyncManagerSync:
                     is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
                     use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
                     mode = "passive" if use_passive else "aggressive"
+                    # passive 弱队改吃单（仅 passive_mode，不含 ratio==0 清仓模式）
+                    if use_passive and not is_liquidate_mode:
+                        try:
+                            if self._should_fallback_passive_to_take(md, close_direction, contract, tag="平"):
+                                mode = "aggressive"
+                        except Exception as _pf_e:
+                            self.print(f"[警告] {contract} passive 降级判定异常: {_pf_e}")
                     limit_price, pricing_note = _calc_limit_price(
                         direction=close_direction,
                         md=md,
@@ -2250,6 +2350,13 @@ class PositionSyncManagerSync:
                     is_liquidate_mode = bool(eo.get("is_liquidate_mode", False))
                     use_passive = (not is_exclude_exit) and (is_liquidate_mode or bool(getattr(self, '_passive_mode', False)))
                     mode = "passive" if use_passive else "aggressive"
+                    # passive 弱队改吃单（仅 passive_mode，不含 ratio==0 清仓模式）
+                    if use_passive and not is_liquidate_mode:
+                        try:
+                            if self._should_fallback_passive_to_take(md, close_direction, contract, tag="平"):
+                                mode = "aggressive"
+                        except Exception as _pf_e:
+                            self.print(f"[警告] {contract} passive 降级判定异常: {_pf_e}")
                     limit_price, pricing_note = _calc_limit_price(
                         direction=close_direction,
                         md=md,
