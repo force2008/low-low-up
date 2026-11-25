@@ -961,6 +961,39 @@ def _get_target_follow_new_only(target: dict) -> bool:
     return False
 
 
+def _get_target_follow_new_only_per_target(target: dict) -> bool:
+    """获取目标账户的「只跟新增」基准粒度开关。
+
+    支持字段：followNewOnlyPerTarget / follow_new_only_per_target
+    （布尔、0/1、或 "1"/"true"/"on"/"yes" 字符串）。
+    默认 False —— 基准文件按源账户共享（hold-baseline-{源账户}.json，兼容旧配置）；
+    True 时 —— 基准文件按目标账户各自独立（hold-baseline-{源账户}__{目标账户}.json），
+              新接入的目标账户从自己首轮起算，不受同源其它账户更早的基准快照影响。
+    注意：本开关在进程启动时读取（新增目标账户本身就需要重启 pipeline 才会生效）。
+    """
+    raw = None
+    for key in ("followNewOnlyPerTarget", "follow_new_only_per_target"):
+        if key in target and target[key] is not None:
+            raw = target[key]
+            break
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "on", "开启", "启用"):
+        return True
+    if s in ("0", "false", "no", "off", "关闭", "禁用"):
+        return False
+    logger.warning(
+        "[follow_new_only] 目标账户 %s 的 followNewOnlyPerTarget=%r 无法识别，按默认 False（基准按源账户共享）处理",
+        target.get("user_id", "unknown"), raw,
+    )
+    return False
+
+
 # 热加载 account_targets 的模块引用（不要用 import 多次，始终 reload 这个模块对象）
 _at_module = None  # 懒加载：在首次 _reload_account_targets 时绑定
 
@@ -1572,15 +1605,17 @@ def main():
                 passive_mode, passive_wait_sec = _get_target_passive_config(target)
                 allow_option = _get_target_allow_option(target)
                 follow_new_only = _get_target_follow_new_only(target)
+                follow_new_only_per_target = _get_target_follow_new_only_per_target(target)
                 hold_std_path = os.path.join(_CURR_DIR, f"hold-std-{source_account}.json")
                 logger.info(
                     "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
                     "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
-                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s, follow_new_only=%s)",
+                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s, follow_new_only=%s, "
+                    "follow_new_only_per_target=%s)",
                     source_account, user_id, ratio, exclude or '[]',
                     sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
                     rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
-                    follow_new_only,
+                    follow_new_only, follow_new_only_per_target,
                 )
             else:
                 # 回退到默认单账户模式
@@ -1597,6 +1632,7 @@ def main():
                 passive_mode, passive_wait_sec = PASSIVE_MODE_DEFAULT, PASSIVE_WAIT_SECONDS_DEFAULT
                 allow_option = False
                 follow_new_only = False
+                follow_new_only_per_target = False
                 hold_std_path = os.path.join(_CURR_DIR, "hold-std.json")
                 source_account = None
                 logger.info("[同步-default] 启动默认账户同步")
@@ -1625,6 +1661,7 @@ def main():
                 passive_wait_seconds=passive_wait_sec,
                 allow_option=allow_option,
                 follow_new_only=follow_new_only,
+                follow_new_only_per_target=follow_new_only_per_target,
                 main_by_product_path=os.path.join(
                     PROJECT_ROOT, "data", "contracts", "main_contracts_by_product.json",
                 ),

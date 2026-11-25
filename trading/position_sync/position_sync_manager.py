@@ -90,6 +90,9 @@ def run_position_sync(
     # 源账户标识 + 只跟新增（只跟源账户相对基准快照的新增持仓，老仓不跟）
     source_account: str = None,
     follow_new_only: bool = False,
+    # 只跟新增的基准粒度（False=按源账户共享；True=按目标账户各自独立）
+    follow_new_only_per_target: bool = False,
+    target_user_id: str = None,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
 ) -> bool:
@@ -130,6 +133,8 @@ def run_position_sync(
             skip_trading_time_check=skip_trading_time_check,
             source_account=source_account,
             follow_new_only=follow_new_only,
+            follow_new_only_per_target=follow_new_only_per_target,
+            target_user_id=target_user_id,
         )
         if logger:
             mgr.set_logger(logger)
@@ -183,6 +188,9 @@ def run_position_sync_loop(
     allow_option: bool = False,
     # 只跟新增：True=只跟源账户相对基准快照的新增持仓（老仓不跟），可被热加载覆盖
     follow_new_only: bool = False,
+    # 只跟新增的基准粒度：False=按源账户共享一份（默认，兼容旧配置）；
+    # True=按「源账户+目标账户」各自独立一份基准，新接入的目标账户从自己首轮起算。
+    follow_new_only_per_target: bool = False,
     # 7x24/simu/--force/--skip-time-check：跳过交易时段限制，非开盘时间也能提交委托
     skip_trading_time_check: bool = False,
     # 【启动时首轮同步延迟】进程起来后，等多少秒再做首次 sync_and_trade（防止CTP登录还没完成就查仓超时）
@@ -225,8 +233,9 @@ def run_position_sync_loop(
         passive_mode: 被动挂单模式开关（套利跟单账户用，True=排队价挂单，5分钟内不撤）
         passive_wait_seconds: 被动模式下的排队等待窗口秒数（默认300=5分钟）
         follow_new_only: 只跟新增开关（True=只跟源账户相对基准快照的新增持仓，老仓不跟）
+        follow_new_only_per_target: 只跟新增的基准粒度（False=按源账户共享；True=按目标账户各自独立）
         source_account: 源账号，用于热加载定位 + 「只跟新增」基准文件名
-        target_user_id: 目标账号，用于热加载定位
+        target_user_id: 目标账号，用于热加载定位 + 按目标账户独立时的基准文件名
         runtime_config_resolver: callable(source, user) -> 13-tuple
                                  (ratio, exclude, allow_level, deny, min_qty, min_notional,
                                   rnd_enabled, rnd_max_ms, passive_mode, passive_wait_seconds,
@@ -268,6 +277,7 @@ def run_position_sync_loop(
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
         _log(f"  allow_option={allow_option}（{'跟单期权' if allow_option else '默认屏蔽源账户期权持仓'}）")
         _log(f"  follow_new_only={follow_new_only}（{'只跟新增持仓，源账户老仓不跟' if follow_new_only else '默认照抄源账户全部持仓'}）")
+        _log(f"  follow_new_only_per_target={follow_new_only_per_target}（{'基准按目标账户各自独立' if follow_new_only_per_target else '基准按源账户共享'}）")
         _log(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式=True，非开盘时间仍允许对齐和提交委托）")
         try:
             _first_d_s = int(first_sync_delay_seconds or 0)
@@ -309,6 +319,8 @@ def run_position_sync_loop(
             skip_trading_time_check=skip_trading_time_check,
             source_account=source_account,
             follow_new_only=follow_new_only,
+            follow_new_only_per_target=follow_new_only_per_target,
+            target_user_id=target_user_id,
         )
         if logger:
             mgr.set_logger(logger)
