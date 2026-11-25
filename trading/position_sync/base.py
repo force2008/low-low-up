@@ -33,6 +33,45 @@ from .md_provider import MdQuoteProvider
 from utils.feishu_notifier import FeishuNotifier
 
 
+# ---------------------------------------------------------------------------
+# OrderRef 账户标签（进程内唯一）
+# ---------------------------------------------------------------------------
+# CTP OrderRef 字段为 char[13]（含结尾 NUL），可用 12 字符：PSM(3)+标签(3)+序号(6)=12。
+# 同一进程内多个目标账户各占一个 manager 实例、各自的 _order_ref_seq 都从 1 开始，
+# 不区分前缀时 OrderRef 会跨账户碰撞（如 PSM000000001 同时出现在 yq02 / fy0228 的日志里），
+# 造成排查混乱。这里为每个账户号分配一个进程内唯一、稳定、尽量可读的 3 字符标签。
+_ORDER_REF_TAG_LOCK = threading.Lock()
+_ORDER_REF_TAG_REGISTRY: Dict[str, str] = {}
+
+
+def _make_account_order_ref_tag(user_id) -> str:
+    """为账户号分配进程内唯一的 3 字符 OrderRef 标签（大写字母/数字）。
+
+    取账户号去除非字母数字后的前 3 位作为可读缩写；若已被其它账户占用，则改用
+    「2 位缩写 + 数字序号」消歧，保证同进程内不同账户的标签互不相同。
+    """
+    key = "".join(ch for ch in str(user_id or "") if ch.isalnum()).upper() or "NA"
+    with _ORDER_REF_TAG_LOCK:
+        cached = _ORDER_REF_TAG_REGISTRY.get(key)
+        if cached:
+            return cached
+        used = set(_ORDER_REF_TAG_REGISTRY.values())
+        tag = key[:3].ljust(3, "0")
+        if tag in used:
+            base2 = key[:2].ljust(2, "0")
+            for i in range(1, 10):
+                if f"{base2}{i}" not in used:
+                    tag = f"{base2}{i}"
+                    break
+            else:
+                for i in range(100, 1000):
+                    if f"{i:03d}" not in used:
+                        tag = f"{i:03d}"
+                        break
+        _ORDER_REF_TAG_REGISTRY[key] = tag
+        return tag
+
+
 class PositionSyncManagerBase(CTdSpiBase):
     """持仓同步管理器基类：包含初始化、持久化、CTP回调"""
 
@@ -358,6 +397,19 @@ class PositionSyncManagerBase(CTdSpiBase):
         print("[__init__] 准备调用 super().__init__...")
         super().__init__(conf=conf)
         print("[__init__] super().__init__ 完成，start_monitor")
+
+        # OrderRef 账户唯一前缀：CTP OrderRef 字段为 char[13]（含结尾 NUL），可用 12 字符。
+        # 同进程多目标账户各占一个 manager 实例、序号各自从 1 开始，不区分前缀会导致 OrderRef
+        # 跨账户碰撞（PSM000000001 同时出现在 yq02 / fy0228 日志里）。按登录账户号分配唯一标签：
+        #   OrderRef = "PSM" + 标签(3) + 序号(6) = 12 字符。
+        self._order_ref_tag: str = _make_account_order_ref_tag(
+            self._user_id or self._target_user_id
+        )
+        self.print(
+            f"[配置] 报单引用前缀: PSM{self._order_ref_tag}"
+            f"（OrderRef 形如 PSM{self._order_ref_tag}000001）"
+        )
+
         self.print(f"[配置] 持仓同步比例: {self._position_ratio}")
         if self._exclude_products:
             self.print(f"[配置] 排除品种（不跟单/不比对）: {sorted(self._exclude_products)}")
@@ -1123,6 +1175,15 @@ class PositionSyncManagerBase(CTdSpiBase):
 
         # 同步成交手数到文件
         if info:
+            # 维护内存委托的「剩余未成交量」：volume 在本地单生命周期内统一表示剩余量，
+            # 供撤单重挂（_cancel_and_replace）与在途超时兜底（_pending_orders_from_memory）使用。
+            # 仅在非重复回报时扣减，避免把去重丢弃的重复回报也计入。
+            if should_update_hold:
+                try:
+                    with self._order_lock:
+                        info["volume"] = max(0, int(info.get("volume", 0) or 0) - int(trade_volume or 0))
+                except Exception:
+                    pass
             session_id = getattr(pTrade, "SessionID", 0)
             self._update_order_file_status(
                 order_ref, status=None, volume_traded=trade_volume, session_id=session_id
@@ -2430,7 +2491,10 @@ class PositionSyncManagerBase(CTdSpiBase):
     def _next_order_ref(self) -> str:
         with self._order_lock:
             self._order_ref_seq += 1
-            return f"PSM{self._order_ref_seq:09d}"
+            # OrderRef 上限 12 字符：PSM(3) + 账户唯一标签(3) + 序号(6)；
+            # 序号取模保证不超 6 位（>6 位会使总长 >12，赋值 CTP char[13] 字段会抛 TypeError）。
+            tag = getattr(self, '_order_ref_tag', '') or "NA0"
+            return f"PSM{tag}{self._order_ref_seq % 1000000:06d}"
 
     # 占位实现：子类(PositionManagerUI / PositionSyncManager) 覆盖真正的撤单重挂逻辑
     def _check_and_replace_pending_orders(self):

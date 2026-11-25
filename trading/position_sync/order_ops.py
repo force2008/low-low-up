@@ -53,7 +53,11 @@ class PositionSyncManagerOrderOps:
     def _next_order_ref(self) -> str:
         with self._order_lock:
             self._order_ref_seq += 1
-            return f"PSM{self._order_ref_seq:09d}"
+            # OrderRef 上限 12 字符：PSM(3) + 账户唯一标签(3) + 序号(6)；
+            # 标签由 base.PositionSyncManagerBase.__init__ 按登录账户号分配（进程内唯一），
+            # 序号取模保证不超 6 位（>6 位会使总长 >12，赋值 CTP char[13] 字段会抛 TypeError）。
+            tag = getattr(self, '_order_ref_tag', '') or "NA0"
+            return f"PSM{tag}{self._order_ref_seq % 1000000:06d}"
 
     def _maybe_random_delay_before_submit(
         self, exact_id: str, direction: str, volume: int
@@ -727,6 +731,47 @@ class PositionSyncManagerOrderOps:
             result[key] = result.get(key, 0) + remain
         return result
 
+    def _pending_orders_from_memory(self) -> List[dict]:
+        """把内存 self._orders 中的未成交委托转换成与 CTP 委托查询结果同构的 dict 列表。
+
+        用途：柜台查单超时（融航 0268 偶发高频超时）时作为兜底数据源——本进程提交的委托
+        不受柜台超时影响，用它兜底可避免「在途开仓被漏算 → 缺额被高估 → 重复补开 → 超仓 →
+        开平仓振荡」。
+
+        volume 字段在本地单生命周期内始终表示「剩余未成交量」：
+        · _place_order 写入原始委托量；
+        · 每笔成交（OnRtnTrade）对 volume 做扣减；
+        · 从 CTP 同步进来的委托写入时即为剩余量。
+        故这里直接取 info['volume'] 作为剩余量，VolumeTraded 置 0。
+        """
+        D_BUY = str(tdapi.THOST_FTDC_D_Buy).strip()
+        D_SELL = str(tdapi.THOST_FTDC_D_Sell).strip()
+        result: List[dict] = []
+        with self._order_lock:
+            snapshot = list(self._orders.items())
+        for ref, info in snapshot:
+            try:
+                if not self._is_order_pending(info):
+                    continue
+                remain = int(info.get("volume", 0) or 0)
+                if remain <= 0:
+                    continue
+                direction = info.get("direction", "")
+                result.append({
+                    "OrderRef": ref,
+                    "OrderSysID": info.get("sys_id", ""),
+                    "ExchangeID": info.get("exchange", ""),
+                    "InstrumentID": info.get("instr", ""),
+                    "Direction": D_BUY if direction == "buy" else D_SELL,
+                    "CombOffsetFlag": str(info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)),
+                    "VolumeTotalOriginal": remain,
+                    "VolumeTraded": 0,
+                    "OrderStatus": "1",
+                })
+            except Exception:
+                continue
+        return result
+
     # ------------------------------------------------------------------
     # 自动撤单重挂监控（每 30 秒检查一次）
     # ------------------------------------------------------------------
@@ -902,7 +947,15 @@ class PositionSyncManagerOrderOps:
         contract = info.get("instr", "")
         direction = info.get("direction", "")
         offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
-        volume = info.get("volume", 0)
+        # volume 在本地单生命周期内即「剩余未成交量」（成交回报 OnRtnTrade 已扣减）：
+        # 撤单重挂按剩余量重报，避免部分成交后仍按原始委托量重挂导致超仓放大。
+        try:
+            volume = int(info.get("volume", 0) or 0)
+        except (TypeError, ValueError):
+            volume = 0
+        if volume <= 0:
+            self.print(f"[撤单重挂] {contract} 剩余未成交量<=0（原始委托已全部成交/撤销），跳过重挂")
+            return
         old_price = item["old_price"]
         new_price = item.get("new_price", old_price)
         is_passive_timeout_replace = bool(item.get("is_passive_timeout_replace", False))
