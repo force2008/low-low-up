@@ -932,6 +932,36 @@ class PositionSyncManagerOrderOps:
         # 重新获取行情 & 计算重挂价
         if is_passive_timeout_replace:
             # ------------------------------------------------------------------
+            # 先判定「弱队」：盘口排队太厚 / 预估成交太慢 → 超时后直接改对价吃单，不再逐档咬
+            # ------------------------------------------------------------------
+            _weak_take = False
+            if md:
+                try:
+                    _weak_take = bool(self._should_fallback_passive_to_take(md, direction, contract, tag="超时重挂"))
+                except Exception as _pf_e:
+                    self.print(f"[警告] {contract} passive 超时降级判定异常: {_pf_e}")
+            if _weak_take:
+                # 改对价吃单：买方向取卖一 AskPrice1，卖方向取买一 BidPrice1（兜底 LastPrice）
+                if direction == "buy":
+                    _take = md.get("AskPrice1", 0)
+                    if not _is_valid_positive_price(_take):
+                        _take = md.get("LastPrice", 0)
+                else:
+                    _take = md.get("BidPrice1", 0)
+                    if not _is_valid_positive_price(_take):
+                        _take = md.get("LastPrice", 0)
+                if _is_valid_positive_price(_take):
+                    current_price = float(_take)
+                    self.print(
+                        f"[撤单重挂-passive改对价] {contract} {direction}：排队太慢/太厚 → 直接对价 {current_price}"
+                    )
+                else:
+                    # 对价不可用：退回逐档咬盘口
+                    current_price = float(old_price) + (price_tick if direction == "buy" else -price_tick)
+                    self.print(
+                        f"[撤单重挂-passive改对价] {contract} {direction} 对价不可用 → 退回逐档兜底 {current_price}"
+                    )
+            # ------------------------------------------------------------------
             # passive 模式超时重挂：旧排队价 + 向对手盘方向进 1 tick（逐档咬盘口）
             # 计算规则：
             #   direction=buy（买方向：买开/买平）：
@@ -943,7 +973,7 @@ class PositionSyncManagerOrderOps:
             #       → 新价 = old_price - price_tick
             #       下限：不低于当前盘口买一 BidPrice1（避免一步跨到跌停/太激进），但至少要减 1 tick
             # ------------------------------------------------------------------
-            if direction == "buy":
+            elif direction == "buy":
                 suggested = float(old_price) + price_tick
                 if md and float(md.get("AskPrice1", 0) or 0) > 0:
                     cap = float(md["AskPrice1"])

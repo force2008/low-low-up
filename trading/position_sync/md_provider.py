@@ -9,6 +9,7 @@ import os
 import shutil
 import threading
 import time
+from collections import deque
 from typing import Dict, Optional
 
 import sys
@@ -21,6 +22,10 @@ from config import config
 from ctp.base_mdapi import CMdSpiBase, mdapi
 
 
+# 累计成交量历史的每个合约最大保留点数（约 5 分钟 tick，足够估算滚动窗口成交速率）
+_VOL_HIST_MAXLEN = 600
+
+
 class MdQuoteProvider(CMdSpiBase):
     """通过 CTP 行情 API 订阅并缓存最新行情快照"""
 
@@ -28,6 +33,8 @@ class MdQuoteProvider(CMdSpiBase):
         # 必须先初始化锁和缓存，因为父类初始化会触发回调
         self._quotes_lock = threading.Lock()
         self._quotes: Dict[str, dict] = {}
+        # 每合约累计成交量历史 deque[(ts, Volume)]，用于 get_trade_rate 估算实时成交速率
+        self._vol_hist: Dict[str, deque] = {}
         self._subscribed: set = set()
         self._login_event = threading.Event()
         self._login_ok = False
@@ -149,12 +156,13 @@ class MdQuoteProvider(CMdSpiBase):
             )
 
     def OnRtnDepthMarketData(self, pDepthMarketData: mdapi.CThostFtdcDepthMarketDataField):
-        """行情推送：缓存最新买卖价和最新价"""
+        """行情推送：缓存最新买卖价/量 + 累计成交量（用于估算实时成交速率）"""
         if not pDepthMarketData:
             return
         inst = (pDepthMarketData.InstrumentID or "").strip()
         if not inst:
             return
+        key = inst.upper()
         data = {
             "InstrumentID": inst,
             "LastPrice": pDepthMarketData.LastPrice,
@@ -164,9 +172,64 @@ class MdQuoteProvider(CMdSpiBase):
             "AskVolume1": pDepthMarketData.AskVolume1,
             "UpperLimitPrice": pDepthMarketData.UpperLimitPrice,
             "LowerLimitPrice": pDepthMarketData.LowerLimitPrice,
+            # 累计成交量（手）+ 交易所时间：用于 get_trade_rate 滚动窗口估算成交速率
+            "Volume": pDepthMarketData.Volume,
+            "UpdateTime": pDepthMarketData.UpdateTime,
         }
+        now = time.time()
         with self._quotes_lock:
-            self._quotes[inst.upper()] = data
+            self._quotes[key] = data
+            try:
+                vol = float(pDepthMarketData.Volume or 0)
+            except (TypeError, ValueError):
+                vol = 0.0
+            if vol > 0:
+                hist = self._vol_hist.get(key)
+                if hist is None:
+                    hist = deque(maxlen=_VOL_HIST_MAXLEN)
+                    self._vol_hist[key] = hist
+                # 日内换日 / 数据重置：累计成交量回退 → 清空历史重新累计
+                if hist and vol < hist[-1][1]:
+                    hist.clear()
+                hist.append((now, vol))
+
+    def get_trade_rate(self, instrument_id: str, window: float = 60.0, min_span: float = 5.0) -> Optional[float]:
+        """估算最近 window 秒的成交速率（手/秒）。
+
+        基于累计成交量 Volume 的滑动窗口差分：
+            rate = (窗口内最新累计量 − 窗口内最早累计量) / 时间差
+
+        返回：
+          · 正常速率（手/秒），窗口内无成交时返回 0.0；
+          · None 表示数据不足或行情陈旧（历史点 < 2、时间跨度 < min_span、最新 tick 已超 window），
+            调用方据此跳过「预估成交时间」判定，仅保留排队量硬阈值。
+        """
+        key = (instrument_id or "").strip().upper()
+        if not key:
+            return None
+        with self._quotes_lock:
+            hist = self._vol_hist.get(key)
+            if not hist or len(hist) < 2:
+                return None
+            snap = list(hist)
+        t_new, v_new = snap[-1]
+        now = time.time()
+        # 最新 tick 过于陈旧 → 无法反映当前活跃度
+        if now - t_new > window:
+            return None
+        # 找窗口内最早的点（hist 按时间升序，首个落入窗口的即为窗口内最早）
+        t_old, v_old = snap[0]
+        for t, v in snap:
+            if now - t <= window:
+                t_old, v_old = t, v
+                break
+        dt = t_new - t_old
+        if dt < min_span or dt <= 0:
+            return None
+        dv = v_new - v_old
+        if dv < 0:
+            return None
+        return dv / dt
 
     def subscribe(self, instrument_id: str):
         """订阅指定合约行情（幂等）

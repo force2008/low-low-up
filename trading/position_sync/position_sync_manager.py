@@ -85,6 +85,9 @@ def run_position_sync(
     main_by_product_path: str = None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # passive「弱队改吃单」阈值：排队量(手) / 预估成交时间(秒)，<=0 关闭对应规则
+    passive_queue_max: float = 1000,
+    passive_time_max: float = 30.0,
     # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）
     allow_option: bool = False,
     # 源账户标识 + 只跟新增（只跟源账户相对基准快照的新增持仓，老仓不跟）
@@ -110,6 +113,7 @@ def run_position_sync(
         if deny_products:
             print(f"  deny_products={sorted(deny_products)}")
         print(f"  passive_mode={passive_mode}, passive_wait_seconds={passive_wait_seconds}s")
+        print(f"  passive_queue_max={passive_queue_max}手, passive_time_max={passive_time_max}s（弱队改吃单阈值，<=0 关闭）")
         print(f"  source_account={source_account}, follow_new_only={follow_new_only}")
         print(f"  skip_trading_time_check={skip_trading_time_check}（7x24/simu/--force 模式建议=True）")
         mgr = PositionSyncManager(
@@ -129,6 +133,8 @@ def run_position_sync(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            passive_queue_max=passive_queue_max,
+            passive_time_max=passive_time_max,
             allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
             source_account=source_account,
@@ -183,6 +189,9 @@ def run_position_sync_loop(
     runtime_config_resolver=None,
     passive_mode: bool = False,
     passive_wait_seconds: int = 300,
+    # passive「弱队改吃单」阈值：排队量(手) / 预估成交时间(秒)，<=0 关闭对应规则
+    passive_queue_max: float = 1000,
+    passive_time_max: float = 30.0,
     # 期权跟单开关：默认 False=屏蔽源账户期权持仓（不跟开、也不参与实际持仓对齐）；
     # 目标账户配置 allowOption=1 时为 True，期权按普通合约跟单。
     allow_option: bool = False,
@@ -232,6 +241,8 @@ def run_position_sync_loop(
         random_delay_max_ms: 随机延迟最大毫秒数
         passive_mode: 被动挂单模式开关（套利跟单账户用，True=排队价挂单，5分钟内不撤）
         passive_wait_seconds: 被动模式下的排队等待窗口秒数（默认300=5分钟）
+        passive_queue_max: 被动模式「弱队改吃单」排队量阈值（手，默认1000；<=0 关闭该规则）
+        passive_time_max: 被动模式「弱队改吃单」预估成交时间阈值（秒，默认30；<=0 关闭该规则）
         follow_new_only: 只跟新增开关（True=只跟源账户相对基准快照的新增持仓，老仓不跟）
         follow_new_only_per_target: 只跟新增的基准粒度（False=按源账户共享；True=按目标账户各自独立）
         source_account: 源账号，用于热加载定位 + 「只跟新增」基准文件名
@@ -275,6 +286,7 @@ def run_position_sync_loop(
             _log(f"  min_notional={min_notional}")
         _log(f"  random_delay={random_delay_enabled}@{random_delay_max_ms}ms")
         _log(f"  passive_mode={passive_mode}@{passive_wait_seconds}s")
+        _log(f"  passive弱队改吃单阈值: 排队量≥{passive_queue_max}手 或 预估成交>{passive_time_max}s（<=0 关闭对应规则）")
         _log(f"  allow_option={allow_option}（{'跟单期权' if allow_option else '默认屏蔽源账户期权持仓'}）")
         _log(f"  follow_new_only={follow_new_only}（{'只跟新增持仓，源账户老仓不跟' if follow_new_only else '默认照抄源账户全部持仓'}）")
         _log(f"  follow_new_only_per_target={follow_new_only_per_target}（{'基准按目标账户各自独立' if follow_new_only_per_target else '基准按源账户共享'}）")
@@ -315,6 +327,8 @@ def run_position_sync_loop(
             main_by_product_path=main_by_product_path,
             passive_mode=passive_mode,
             passive_wait_seconds=passive_wait_seconds,
+            passive_queue_max=passive_queue_max,
+            passive_time_max=passive_time_max,
             allow_option=allow_option,
             skip_trading_time_check=skip_trading_time_check,
             source_account=source_account,

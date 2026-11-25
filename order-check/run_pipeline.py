@@ -623,6 +623,13 @@ RANDOM_ORDER_DELAY_MAX_MS = 3000  # 3 秒内均匀随机
 #        挂单后 >= 此窗口仍未成交：撤单 → 向对手盘方向进 1 tick 重新排队，逐档咬盘口。
 PASSIVE_MODE_DEFAULT = False
 PASSIVE_WAIT_SECONDS_DEFAULT = 300
+# passive「弱队改吃单」阈值（仅 passive 模式生效）：passive 挂单前预判成交前景，
+#   盘口该价位排队量 >= PASSIVE_QUEUE_MAX（手），或 预估成交时间 = 排队量 ÷ 成交速率 > PASSIVE_TIME_MAX（秒），
+#   则放弃排队、改用对价吃单（避免挂在厚队/冷门合约里长时间不成交）。
+#   成交速率来自行情累计成交量的滚动窗口；<=0 表示关闭对应规则。
+#   账号级可通过 account_targets.py 的 passiveQueueMax / passiveTimeMax 覆盖。
+PASSIVE_QUEUE_MAX = 1000
+PASSIVE_TIME_MAX = 30.0
 
 # ================================================================
 
@@ -897,6 +904,33 @@ def _get_target_passive_config(target: dict) -> Tuple[bool, int]:
                 )
             break
     return passive_mode, wait_seconds
+
+
+def _get_target_passive_weak_config(target: dict) -> Tuple[float, float]:
+    """passive「弱队改吃单」阈值 -> (queue_max, time_max)。
+
+    仅 passive 模式生效：passive 挂单提交/超时重挂前，若该价位盘口排队量 >= queue_max（手），
+    或预估成交时间（排队量 ÷ 成交速率）> time_max（秒），则放弃排队、改用对价吃单。
+    任一值 <= 0 表示关闭对应规则。
+    支持字段：passiveQueueMax / passive_queue_max、passiveTimeMax / passive_time_max；
+    未配置时回退到全局 PASSIVE_QUEUE_MAX / PASSIVE_TIME_MAX。
+    """
+    def _get_float(keys, default):
+        for key in keys:
+            if key in target and target[key] is not None:
+                try:
+                    return float(target[key])
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "[passive] 目标账户 %s 的 %s=%s 不是合法数字，使用默认 %s",
+                        target.get("user_id", "unknown"), key, target[key], default,
+                    )
+                    return default
+        return default
+
+    queue_max = _get_float(("passiveQueueMax", "passive_queue_max"), PASSIVE_QUEUE_MAX)
+    time_max = _get_float(("passiveTimeMax", "passive_time_max"), PASSIVE_TIME_MAX)
+    return queue_max, time_max
 
 
 def _get_target_allow_option(target: dict) -> bool:
@@ -1603,6 +1637,7 @@ def main():
                 min_notional = _get_target_min_notional(target)
                 rnd_enabled, rnd_max_ms = _get_random_delay_config(target)
                 passive_mode, passive_wait_sec = _get_target_passive_config(target)
+                p_weak_queue_max, p_weak_time_max = _get_target_passive_weak_config(target)
                 allow_option = _get_target_allow_option(target)
                 follow_new_only = _get_target_follow_new_only(target)
                 follow_new_only_per_target = _get_target_follow_new_only_per_target(target)
@@ -1610,11 +1645,12 @@ def main():
                 logger.info(
                     "[同步][%s -> %s] 启动目标账户同步 (ratio=%s, exclude=%s, "
                     "allow_level=%s, deny=%s, min_qty=%s, min_notional=%s, "
-                    "random_delay=%s@%sms, passive=%s@%ss, allow_option=%s, follow_new_only=%s, "
-                    "follow_new_only_per_target=%s)",
+                    "random_delay=%s@%sms, passive=%s@%ss(queueMax=%s/timeMax=%s), "
+                    "allow_option=%s, follow_new_only=%s, follow_new_only_per_target=%s)",
                     source_account, user_id, ratio, exclude or '[]',
                     sorted(allow_level), sorted(deny_products), min_qty_hand, min_notional,
-                    rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec, allow_option,
+                    rnd_enabled, rnd_max_ms, passive_mode, passive_wait_sec,
+                    p_weak_queue_max, p_weak_time_max, allow_option,
                     follow_new_only, follow_new_only_per_target,
                 )
             else:
@@ -1630,6 +1666,7 @@ def main():
                 min_notional = None
                 rnd_enabled, rnd_max_ms = RANDOM_ORDER_DELAY_ENABLED, RANDOM_ORDER_DELAY_MAX_MS
                 passive_mode, passive_wait_sec = PASSIVE_MODE_DEFAULT, PASSIVE_WAIT_SECONDS_DEFAULT
+                p_weak_queue_max, p_weak_time_max = PASSIVE_QUEUE_MAX, PASSIVE_TIME_MAX
                 allow_option = False
                 follow_new_only = False
                 follow_new_only_per_target = False
@@ -1659,6 +1696,8 @@ def main():
                 random_delay_max_ms=rnd_max_ms,
                 passive_mode=passive_mode,
                 passive_wait_seconds=passive_wait_sec,
+                passive_queue_max=p_weak_queue_max,
+                passive_time_max=p_weak_time_max,
                 allow_option=allow_option,
                 follow_new_only=follow_new_only,
                 follow_new_only_per_target=follow_new_only_per_target,
