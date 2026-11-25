@@ -950,11 +950,11 @@ class PositionSyncManagerSync:
             if _hold_changed:
                 qry_order_timeout = 6
                 qry_pos_timeout = 12
-                qry_order2_timeout = 3
+                qry_order2_timeout = 6
             else:
                 qry_order_timeout = 10
                 qry_pos_timeout = 12
-                qry_order2_timeout = 3
+                qry_order2_timeout = 6
             ctp_orders = self.query_orders(timeout=qry_order_timeout, only_pending=True, today_only=True) or []
             kept_orders = []
             cancelled_ctp = []
@@ -1198,14 +1198,27 @@ class PositionSyncManagerSync:
             # 6. 再次查询在途委托（撤销后的状态）
             #    超时兜底：用步骤2的 kept_orders 快照替代（比"空列表"更安全，避免漏判在途导致重复开仓）
             ctp_orders = self.query_orders(timeout=qry_order2_timeout, only_pending=True, today_only=True)
+            _from_memory = False
             if ctp_orders is None:
-                self.print(f"[委托] 步骤6查询超时({qry_order2_timeout}s)，用步骤2保留的 {len(kept_orders)} 条在途快照兜底")
-                ctp_orders = list(kept_orders)
+                if kept_orders:
+                    self.print(f"[委托] 步骤6查询超时({qry_order2_timeout}s)，用步骤2保留的 {len(kept_orders)} 条在途快照兜底")
+                    ctp_orders = list(kept_orders)
+                else:
+                    # 步骤2也超时/为空时，兜底若退化为空列表会让在途开仓被漏算 →
+                    # 缺额被高估 → 重复补开 → 超仓 → 开平仓振荡（yq02 MA705 事故）。
+                    # 改用内存未成交委托兜底：本进程提交的委托不受柜台查询超时影响。
+                    ctp_orders = self._pending_orders_from_memory()
+                    _from_memory = True
+                    self.print(
+                        f"[委托] 步骤6查询超时({qry_order2_timeout}s)且步骤2无快照，"
+                        f"改用内存未成交委托 {len(ctp_orders)} 条兜底"
+                    )
             else:
                 ctp_orders = ctp_orders or []
             if ctp_orders:
                 self.print(f"[委托] 撤销后剩余 CTP 在途 {len(ctp_orders)} 条")
-                self._sync_ctp_orders_to_memory(ctp_orders)
+                if not _from_memory:
+                    self._sync_ctp_orders_to_memory(ctp_orders)
             else:
                 self.print("[委托] 撤销后无在途委托")
             t_6_done = time.time()
@@ -1213,6 +1226,23 @@ class PositionSyncManagerSync:
 
             # 7. 构建在途映射
             pending_map = self._build_pending_map(ctp_orders)
+            # 兜底合并内存未成交委托：柜台查单偶发超时/返回空时，CTP 侧会漏掉在途开仓，
+            # 这里把内存视角的剩余在途量按 key 取 max 补进来（同一委托不重复计入、也不漏计）。
+            try:
+                for _mo in self._pending_orders_from_memory():
+                    _inst = str(_mo.get("InstrumentID", "")).upper()
+                    _is_open = str(_mo.get("CombOffsetFlag", "")).strip() == str(tdapi.THOST_FTDC_OF_Open).strip()
+                    _d_buy = str(_mo.get("Direction", "")).strip() == str(tdapi.THOST_FTDC_D_Buy).strip()
+                    if _is_open:
+                        _pos_dir = 2 if _d_buy else 3
+                    else:
+                        _pos_dir = 3 if _d_buy else 2
+                    _remain = int(_mo.get("VolumeTotalOriginal", 0) or 0)
+                    _k = (_inst, _pos_dir, _is_open)
+                    if _remain > pending_map.get(_k, 0):
+                        pending_map[_k] = _remain
+            except Exception as _pm_e:
+                self.print(f"[委托] 内存在途兜底合并异常: {_pm_e}")
             t_7_done = time.time()
             self.print(f"[同步耗时] 步骤7(构建在途映射): {(t_7_done - t_phase)*1000:.0f}ms"); t_phase = t_7_done
 
