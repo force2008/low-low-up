@@ -79,8 +79,15 @@ class PositionSyncManagerBase(CTdSpiBase):
         # ---- 只跟新增（默认 False=照抄源账户全部持仓）----
         # True：首次启用时自动把源账户当时持仓记为基准并持久化，之后只跟「超出基准的增量」，
         #       源账户之前的历史老仓不跟；目标账户已镜像的老仓会被判为超额并按限价平掉。
-        #       重置：删除 hold-baseline-{源账户}.json 即可。
+        #       重置：删除对应基准文件即可（见下方 follow_new_only_per_target）。
         follow_new_only: bool = False,
+        # ---- 【只跟新增】基准粒度 ----
+        # False(默认)：hold-baseline-{源账户}.json —— 按源账户共享，其下所有目标账户共用同一基准；
+        # True ：hold-baseline-{源账户}__{目标账户}.json —— 每个目标账户各自一份基准，
+        #        新接入的目标账户从「自己首轮」起算，不受同源其它账户的基准快照影响。
+        follow_new_only_per_target: bool = False,
+        # ---- 目标账户号（仅 follow_new_only_per_target=True 时用于拼接基准文件名）----
+        target_user_id: str = None,
     ):
         # ratio/ration 支持：正数跟单 / 0 清仓 / 负数对冲（任意实数合法，仅 NaN/inf 才报错）
         if position_ratio != position_ratio or position_ratio in (float("inf"), float("-inf")):
@@ -186,6 +193,9 @@ class PositionSyncManagerBase(CTdSpiBase):
         # ------------------------------------------------------------------
         self._source_account: Optional[str] = str(source_account).strip() if source_account else None
         self._follow_new_only: bool = bool(follow_new_only)
+        # 基准粒度开关 + 目标账户号：决定 hold-baseline 文件名（见 data._baseline_path）
+        self._follow_new_only_per_target: bool = bool(follow_new_only_per_target)
+        self._target_user_id: Optional[str] = str(target_user_id).strip() if target_user_id else None
 
         # ------------------------------------------------------------------
         # 9) 跳过交易时段检查（7x24/simu/--force/--skip-time-check 模式）

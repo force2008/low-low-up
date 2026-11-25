@@ -110,7 +110,7 @@
        · DCE/GFEX/CFFEX 带短横：m2601-C-3000 / jd2702-C-3500 / lh2705-P-10400 / IO2603-C-4000
        · CZCE/SHFE/INE 无短横：SR401C6000 / TA601C5000 / cu2601C68000 / rb2601P3800
      例：某个跟单账户想连期权一起跟，加 "allowOption": 1 即可（不加=不跟期权）。
-    12) followNewOnly / follow_new_only
+  12) followNewOnly / follow_new_only
      语义：【只跟新增持仓】。启用后，只跟源账户「相对基准快照的增量」，源账户的历史老仓**不跟**。
      默认：0 / False（照抄源账户全部持仓，含老仓）。
      写法：followNewOnly=1 / "1" / "true" / "yes" / "on" 均视为开启；0 / "false" / "no" / "off" 视为关闭。
@@ -123,6 +123,22 @@
                      最终只持有源基准之后的新增部分；
        · 重置：删除 hold-baseline-{源账户}.json 即可（下次同步会重新快照当前源持仓为新基准）。
      适用场景：接手一个已有多头老仓的源账户，只想跟它**以后新开的仓**，不想把历史老仓也复制过来。
+  13) followNewOnlyPerTarget / follow_new_only_per_target
+     语义：【只跟新增的基准粒度】。仅在 followNewOnly=1 时有意义。
+     默认：0 / False —— 基准**按源账户共享**（hold-baseline-{源账户}.json，
+                       同一源账户下所有目标账户共用同一份基准快照，兼容旧配置）。
+     写 true 时 —— 基准**按目标账户各自独立**（hold-baseline-{源账户}__{目标账户}.json），
+                   每个目标账户从「自己首次生效那一刻」起算基准，互不影响。
+                   适用于「同一源账户先后接入多个目标账户」的场景：新接入的账户
+                   不会被先接入账户更早的基准快照"带着跟老仓"，只跟它接入之后的新增。
+     写法：followNewOnlyPerTarget=1 / "1" / "true" / "yes" / "on" 均视为开启；0 / "false" / "no" / "off" 视为关闭。
+     注意：
+       · 本开关是**启动期**参数（与 ratio 等可热加载字段不同），修改后需重启 pipeline 才生效；
+       · 切换粒度后，旧的 hold-baseline-{源账户}.json 不会被删除，也不会迁移到新文件名；
+         若希望新粒度下重新起算，删除对应 hold-baseline-{源账户}__{目标账户}.json 即可。
+     例：同一源账户下两个目标账户，各自独立基准：
+         {"user_id": "A", "password": "...", "ration": 2, "followNewOnly": 1, "followNewOnlyPerTarget": 1},
+         {"user_id": "B", "password": "...", "ration": 2, "followNewOnly": 1, "followNewOnlyPerTarget": 1},
 
   ------------------------------------------------------------------
   【套利对子跟单】（自动识别，无需在本文件配置）

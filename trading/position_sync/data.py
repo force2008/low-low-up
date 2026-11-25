@@ -530,10 +530,21 @@ class PositionSyncManagerData:
         return PROJECT_ROOT
 
     def _baseline_path(self) -> Optional[str]:
-        """源基准文件路径：hold-baseline-{源账户}.json（按源账户共享，其所有目标账户共用同一基准）。"""
+        """源基准文件路径。
+
+        - 默认（follow_new_only_per_target=False）：hold-baseline-{源账户}.json
+          —— 按源账户共享，其下所有目标账户共用同一基准（兼容旧配置）。
+        - follow_new_only_per_target=True：hold-baseline-{源账户}__{目标账户}.json
+          —— 每个目标账户各自一份基准，新接入的账户从「自己首轮」起算，
+             不会沿用同源其它账户更早的基准快照。
+        """
         src = getattr(self, '_source_account', None)
         if not src:
             return None
+        if bool(getattr(self, '_follow_new_only_per_target', False)):
+            tgt = getattr(self, '_target_user_id', None)
+            if tgt:
+                return os.path.join(self._config_dir(), f"hold-baseline-{src}__{tgt}.json")
         return os.path.join(self._config_dir(), f"hold-baseline-{src}.json")
 
     def _load_baseline(self) -> Optional[Dict[Tuple[str, int], int]]:
@@ -583,7 +594,8 @@ class PositionSyncManagerData:
 
         - 基准文件不存在 → 视为「首次启用」：把当前源持仓快照为基准并持久化，本轮返回空（不跟）。
         - 基准文件存在 → 只保留源账户在基准"之上"的新增部分；老仓（<=基准）一律不跟。
-        重置方式：删除 {order-check}/hold-baseline-{源账户}.json 即可重新快照。
+        重置方式：删除当前生效的基准文件即可重新快照（按源账户共享时为
+        hold-baseline-{源账户}.json；按目标账户独立时为 hold-baseline-{源账户}__{目标账户}.json）。
         """
         baseline = self._load_baseline()
         if baseline is None:
