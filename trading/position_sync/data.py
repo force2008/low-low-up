@@ -594,6 +594,9 @@ class PositionSyncManagerData:
 
         - 基准文件不存在 → 视为「首次启用」：把当前源持仓快照为基准并持久化，本轮返回空（不跟）。
         - 基准文件存在 → 只保留源账户在基准"之上"的新增部分；老仓（<=基准）一律不跟。
+        - 【基准下移】源账户「完全平掉」的老仓（在当前源持仓里已不再出现的合约）会把其
+          基准归 0 并持久化。否则基准会永远停在旧值，源之后重新开出同一合约时会被误判为
+          「老仓（<=基准）」而无法跟单（如 FG703|3 平仓后重开不跟进的 bug）。
         重置方式：删除当前生效的基准文件即可重新快照（按源账户共享时为
         hold-baseline-{源账户}.json；按目标账户独立时为 hold-baseline-{源账户}__{目标账户}.json）。
         """
@@ -608,6 +611,24 @@ class PositionSyncManagerData:
                 f"之后仅跟基准之上的新增。如需重置，删除该基准文件即可。"
             )
             return {}
+
+        # 【基准下移】先把「源已完全平掉」的老仓基准归 0。
+        # 仅当源持仓非空时才做：避免瞬时读到空快照（源全部平仓/文件重写中）把整份基准
+        # 一次性清零，导致仓位随后恢复时被整体误判为「新增」而重复/超额跟单。
+        if src_agg:
+            _src_keys = {(str(c).strip().upper(), int(_d)) for (c, _d) in src_agg.keys()}
+            _ratcheted = 0
+            for _bkey in list(baseline.keys()):
+                if _bkey not in _src_keys and int(baseline.get(_bkey, 0)) != 0:
+                    baseline[_bkey] = 0
+                    _ratcheted += 1
+            if _ratcheted:
+                self._save_baseline(baseline)
+                self.print(
+                    f"[只跟新增] 源已完全平掉 {_ratcheted} 个老仓合约，基准已下移归零"
+                    f"（这些合约之后重新开出将按「新增」跟单）"
+                )
+
         delta: Dict[Tuple[str, int], int] = {}
         added_total = 0
         for key, qty in src_agg.items():
