@@ -216,12 +216,17 @@ class CTdSpiBase(tdapi.CThostFtdcTraderSpi):
         if openctp_ctp.__version__ > '6.6.7':
             print(" 后台版本信息:", pRspUserLogin.SysVersion)
 
-    def wait_login(self):
-        # 登录成功后继续
+    def wait_login(self, timeout=20):
+        # 登录成功后继续；超时抛出，避免无限静默阻塞
+        t0 = time.time()
         while True:
             time.sleep(1)
             if self.is_login:
                 break
+            if timeout and time.time() - t0 > timeout:
+                raise TimeoutError(
+                    f"交易前置登录超时({timeout}s)：请检查前置地址/网络/认证码，或该时段柜台是否允许登录"
+                )
 
     def wait_last(self):
         while True:

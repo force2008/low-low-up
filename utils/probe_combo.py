@@ -8,8 +8,14 @@
     python utils/probe_combo.py 7x24
     python utils/probe_combo.py 7x24 MA701 MA702     # 指定要关心的两腿
 """
+import os
 import sys
 import time
+
+# 将项目根目录加入模块搜索路径，支持从 utils/ 子目录直接运行
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from ctp.base_tdapi import CTdSpiBase, tdapi
 
@@ -86,8 +92,11 @@ class ComboProbe(CTdSpiBase):
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self._done:
-                break
+                return True
             time.sleep(0.5)
+        print(f"\n[超时] 等待合约查询应答 {timeout}s 无 bIsLast 应答，未打印结果。")
+        print("      可能原因：非交易时段交易所不应答 ReqQryInstrument，或该环境不返回组合合约。")
+        return False
 
 
 if __name__ == "__main__":
@@ -98,7 +107,11 @@ if __name__ == "__main__":
     from config import config as _cfg
     conf = _cfg.envs.get(env)
     print(f"环境={env} 关心两腿={legs}")
-    probe = ComboProbe(conf=conf, want_legs=legs)
+    try:
+        probe = ComboProbe(conf=conf, want_legs=legs)
+    except TimeoutError as e:
+        print("启动失败:", e)
+        sys.exit(1)
     probe.wait_done(timeout=60)
     try:
         probe._api.Release()
