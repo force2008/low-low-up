@@ -2339,12 +2339,17 @@ class PositionSyncManagerBase(CTdSpiBase):
             target = self._parse_hold_std()
 
             # 计算有效持仓 = 实际持仓 + 在途开仓委托
+            # 🧩 组合单在途（InstrumentID=组合代码）展开到两腿：开仓加、平仓减，
+            #    与 _do_sync 步骤8 口径保持一致，避免巡检误判缺额触发重复组合报单。
+            combo_legs_pending = self._expand_combo_pending_to_legs(pending_map)
             effective_actual = {}
             for key in set(actual_agg.keys()) | set(target.keys()):
                 contract, direction = key
                 a_vol = actual_agg.get(key, 0)
                 pending_open = pending_map.get((contract.upper(), direction, True), 0)
-                effective_actual[key] = a_vol + pending_open
+                combo_open = combo_legs_pending.get((contract.upper(), direction, True), 0)
+                combo_close = combo_legs_pending.get((contract.upper(), direction, False), 0)
+                effective_actual[key] = a_vol + pending_open + combo_open - combo_close
 
             # 计算差异（使用有效持仓，避免在途开仓被错误判断）
             # 同时过滤当前非交易时段的合约；_skip_trading_time_check=True（7x24/simu/--force/--skip-time-check）则整段跳过不丢合约。

@@ -44,6 +44,21 @@ def _is_valid_positive_price(v) -> bool:
     return True
 
 
+def _is_valid_combo_spread(v) -> bool:
+    """组合单价差合法性校验：**允许为负**，仅拦截 NaN/Inf/超天价。"""
+    if v is None:
+        return False
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fv):
+        return False
+    if abs(fv) >= _INVALID_PRICE_MAX_CAP:
+        return False
+    return True
+
+
 class PositionSyncManagerOrderOps:
     """持仓同步管理器 - 订单操作部分"""
 
@@ -175,8 +190,13 @@ class PositionSyncManagerOrderOps:
         limit_price: float,
         offset_flag: int,
         is_liquidate_mode: bool = False,
+        replace_count: int = 0,
     ) -> bool:
-        """通用下单方法，支持指定开平标志，返回 True/False。在最终调用 CTP 前做价格有效性兜底拦截。"""
+        """通用下单方法，支持指定开平标志，返回 True/False。在最终调用 CTP 前做价格有效性兜底拦截。
+
+        replace_count：撤单重挂透传的累计重挂次数。新单必须继承旧单计数，
+        否则每次重挂都从 0 重新计数，MAX_REPLACE_COUNT 上限将形同虚设。
+        """
         exact_id = self._standardize_contract(instrument_id)
         if exact_id.upper() in self._invalid_instruments:
             self.print(f"[跳过] {exact_id} 在无效合约列表中（1006），跳过报单")
@@ -225,7 +245,7 @@ class PositionSyncManagerOrderOps:
                 "direction": direction,
                 "offset_flag": offset_flag,
                 "submit_time": time.time(),
-                "replace_count": 0,
+                "replace_count": int(replace_count or 0),
                 "limit_price": limit_price,  # 保存委托价格，用于撤单重挂时对比价格变化
                 "pending_rejection": False,  # 标记是否收到拒绝（由回调设置）
                 "is_liquidate_mode": is_liquidate_mode,  # ratio==0 清仓模式标记：True=排队价，False=吃单价
@@ -278,6 +298,280 @@ class PositionSyncManagerOrderOps:
             f"手数：{volume} 手\n限价：{limit_price}"
         )
         return True
+
+    def _place_combo_order(
+        self,
+        combo_code: str,
+        exchange_id: str,
+        direction: str,
+        volume: int,
+        limit_price: float,
+        offset_flag: int,
+        legs: Optional[List[dict]] = None,
+        is_liquidate_mode: bool = False,
+        is_exclude_exit: bool = False,
+        replace_count: int = 0,
+    ) -> bool:
+        """提交交易所原生组合单（如 CZCE ``SPD MA701&MA702``），返回 True/False。
+
+        与普通 ``_place_order`` 的关键差异：
+          · 组合单价差（近月-远月）**允许为负**，因此绕过 ``_is_valid_positive_price``，
+            仅拦截 NaN/Inf/超天价；
+          · 组合代码不在合约表（instruments.json）里，故不做 ``_invalid_instruments`` 黑名单拦截。
+
+        语义：直接对组合代码 ``ReqOrderInsert``，由交易所原子撮合两腿，两腿等量同步成交、
+        不会瘸腿，因此不需要撤单联动/追腿。``IsSwapOrder=0``（非腿间互换），
+        ``CombOffsetFlag`` 为统一开平标志（两腿开平方向相同）。
+        """
+        exact_id = str(combo_code or "").strip()
+        if not exact_id:
+            return False
+
+        # 组合价差可为负：这里只拦 NaN/Inf/超天价，不做正价校验
+        try:
+            fp = float(limit_price)
+        except (TypeError, ValueError):
+            self.print(f"[组合价格拦截] {exact_id} 价差无效：{limit_price!r}")
+            return False
+        if (not math.isfinite(fp)) or abs(fp) >= _INVALID_PRICE_MAX_CAP:
+            self.print(f"[组合价格拦截] {exact_id} 价差无效：{limit_price!r}")
+            self._notify_async(
+                f"🛡️ 组合单价格异常拦截（未报单）\n组合：{exact_id}\n"
+                f"方向：{direction}\n手数：{volume} 手\n价差：{limit_price!r}\n原因：NaN/Inf/超上限"
+            )
+            return False
+
+        order_ref = self._next_order_ref()
+
+        req = tdapi.CThostFtdcInputOrderField()
+        req.BrokerID = self._broker_id
+        req.InvestorID = self._user_id
+        req.ExchangeID = exchange_id
+        req.InstrumentID = exact_id
+        req.OrderRef = order_ref
+        req.LimitPrice = fp
+        req.OrderPriceType = tdapi.THOST_FTDC_OPT_LimitPrice
+        req.Direction = tdapi.THOST_FTDC_D_Buy if direction == "buy" else tdapi.THOST_FTDC_D_Sell
+        req.CombOffsetFlag = offset_flag
+        req.CombHedgeFlag = tdapi.THOST_FTDC_HF_Speculation
+        req.VolumeTotalOriginal = volume
+        req.IsAutoSuspend = 0
+        req.IsSwapOrder = 0
+        req.TimeCondition = tdapi.THOST_FTDC_TC_GFD
+        req.VolumeCondition = tdapi.THOST_FTDC_VC_AV
+        req.ContingentCondition = tdapi.THOST_FTDC_CC_Immediately
+        req.ForceCloseReason = tdapi.THOST_FTDC_FCC_NotForceClose
+
+        fill_event = threading.Event()
+        order_result_event = threading.Event()
+        with self._order_lock:
+            self._orders[order_ref] = {
+                "event": fill_event,
+                "order_result_event": order_result_event,
+                "status": "submitted",
+                "sys_id": "",
+                "instr": exact_id,
+                "exchange": exchange_id,
+                "volume": volume,
+                "direction": direction,
+                "offset_flag": offset_flag,
+                "submit_time": time.time(),
+                "replace_count": int(replace_count or 0),
+                "limit_price": fp,
+                "pending_rejection": False,
+                "is_liquidate_mode": is_liquidate_mode,
+                "is_exclude_exit": bool(is_exclude_exit),
+                "is_passive_mode": bool(getattr(self, '_passive_mode', False)),
+                "passive_wait_seconds": int(getattr(self, '_passive_wait_seconds', 300) or 300),
+                # 组合单标记：撤单重挂循环改用组合价差判定（不走单腿行情）
+                "is_combo": True,
+                "combo_legs": list(legs or []),
+            }
+
+        ret = self._api.ReqOrderInsert(req, 0)
+        if ret != 0:
+            self.print(f"[错误] 组合单 {exact_id} 报单发送失败，返回值={ret}")
+            with self._order_lock:
+                self._orders[order_ref]["status"] = "send_failed"
+            order_result_event.set()
+            return False
+
+        # 等待报单确认（最多 3 秒），如收到拒绝则返回 False（调用方降级为两条单腿）
+        order_result_event.wait(timeout=3)
+        with self._order_lock:
+            info = self._orders.get(order_ref)
+            if info and info.get("pending_rejection"):
+                self.print(f"[拒绝] 组合单 {exact_id} 报单被服务器拒绝")
+                return False
+
+        offset_label = "开仓" if offset_flag == tdapi.THOST_FTDC_OF_Open else "平仓"
+        self.print(
+            f"[组合报单] {exact_id} {direction} {volume}手（{offset_label}）"
+            f"价差={fp} OrderRef={order_ref}"
+        )
+        self._notify_async(
+            f"🧩 套利组合单已提交\n组合：{exact_id}\n方向：{direction}（{offset_label}）\n"
+            f"手数：{volume} 手\n价差：{fp}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # 🧩 组合单撤单重挂（交易所原生 SPD/SP，按组合价差判定与重报）
+    # ------------------------------------------------------------------
+    def _combo_group_from_info(self, info: dict) -> Optional[dict]:
+        """从组合单订单信息重建「组」描述（供 _calc_combo_spread 复用）。
+
+        组合单落库时已保存 combo_legs 与开平/清仓/剔除退出标记，
+        此处按合约尾部年月恢复近月/远月腿序。
+        """
+        legs = info.get("combo_legs") or []
+        if len(legs) < 2:
+            return None
+        sk = {}
+        for lg in legs:
+            c = lg.get("contract")
+            if not c:
+                continue
+            k = self._combo_sort_key(c)
+            if k is not None:
+                sk[c] = k
+        if len(sk) < 2:
+            return None
+        near = min(sk, key=lambda c: sk[c])
+        far = max(sk, key=lambda c: sk[c])
+        return {
+            "near": near,
+            "far": far,
+            "legs": legs,
+            "is_open": info.get("offset_flag", tdapi.THOST_FTDC_OF_Open) == tdapi.THOST_FTDC_OF_Open,
+            "is_liquidate_mode": bool(info.get("is_liquidate_mode", False)),
+            "is_exclude_exit": bool(info.get("is_exclude_exit", False)),
+        }
+
+    def _cancel_and_replace_combo(self, item: dict, market_data_map: dict):
+        """组合单撤单重挂：按组合价差（允许为负）重新定价并重报。
+
+        · passive 超时：价差向可成交方向进 1 tick（以 aggressive 价差为上下限）；
+        · 非 passive（aggressive）：按最新盘口重算可成交价差；
+        重挂失败/无法定价只记录日志，不手动降级——下一轮 sync 会依据目标与实际持仓
+        重新识别两腿缺额并再次合成组合单，天然自愈。
+        """
+        ref = item["ref"]
+        info = item["info"]
+        combo_code = info.get("instr", "")
+        direction = info.get("direction", "")
+        offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+        try:
+            volume = int(info.get("volume", 0) or 0)
+        except (TypeError, ValueError):
+            volume = 0
+        if volume <= 0:
+            self.print(f"[组合撤单重挂] {combo_code} 剩余未成交量<=0，跳过重挂")
+            return
+        old_spread = item.get("old_spread", info.get("limit_price", 0))
+        is_passive_timeout_replace = bool(item.get("is_passive_timeout_replace", False))
+
+        group = self._combo_group_from_info(info)
+        if not group:
+            self.print(f"[组合撤单重挂] {combo_code} 无法重建组合腿信息，跳过")
+            return
+        near = group["near"]
+        exchange_id = info.get("exchange", "")
+
+        # 撤单
+        order_sys_id = info.get("sys_id", "")
+        if order_sys_id:
+            self._cancel_order_by_sysid(order_sys_id, exchange_id, combo_code)
+        else:
+            self.cancel_order(ref)
+        time.sleep(0.5)
+
+        # 价差最小变动价位 = 近月腿 PriceTick（同品种两腿一致）
+        info_obj = self._get_contract_info(near)
+        try:
+            price_tick = float(info_obj.get("PriceTick", 1.0)) if info_obj else 1.0
+        except (TypeError, ValueError):
+            price_tick = 1.0
+        if price_tick <= 0:
+            price_tick = 1.0
+
+        # 平仓相位：两腿实际持仓取 min 软闸，避免任一条腿持仓不足导致组合平失败
+        if offset_flag != tdapi.THOST_FTDC_OF_Open:
+            try:
+                leg_pos = []
+                for lg in group.get("legs", []):
+                    pos_dir = 3 if lg.get("order_dir") == "buy" else 2  # 买平=空头(3)；卖平=多头(2)
+                    leg_pos.append(int(self._get_actual_position_volume(lg["contract"], pos_dir) or 0))
+                min_pos = min(leg_pos) if leg_pos else 0
+                if min_pos <= 0:
+                    self.print(f"[组合撤单重挂] {combo_code} 两腿实际持仓不足 {leg_pos}，跳过重挂（避免瘸腿）")
+                    return
+                if min_pos < volume:
+                    self.print(f"[组合撤单重挂] {combo_code} 计划{volume}手 → 两腿持仓取min={min_pos}手")
+                    volume = min_pos
+            except Exception as _e:
+                self.print(f"[组合撤单重挂] {combo_code} 两腿持仓检查异常：{_e}，跳过重挂")
+                return
+
+        # 计算新价差（组合价差可为负：买组合=买近月+卖远月，越激进价差越大）
+        if is_passive_timeout_replace:
+            aggr_spread, aggr_note = self._calc_combo_spread(group, market_data_map, use_passive=False)
+            if direction == "buy":
+                suggested = float(old_spread) + price_tick
+                new_spread = min(suggested, float(aggr_spread)) if aggr_spread is not None else suggested
+            else:
+                suggested = float(old_spread) - price_tick
+                new_spread = max(suggested, float(aggr_spread)) if aggr_spread is not None else suggested
+            _cap_note = f"（可成交价差={aggr_spread}，{aggr_note}）" if aggr_spread is not None else ""
+            self.print(
+                f"[组合撤单重挂-passive进1tick] {combo_code} {direction}："
+                f"旧价差 {old_spread} → 向可成交方向进 1 tick @{price_tick} → 新价差 {new_spread}{_cap_note}"
+            )
+        else:
+            use_passive = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
+            new_spread, note = self._calc_combo_spread(group, market_data_map, use_passive=use_passive)
+            if new_spread is None:
+                self.print(f"[组合撤单重挂] {combo_code} 无法定价（{note}），保留原挂单等待自然成交")
+                return
+            self.print(f"[组合撤单重挂-aggressive] {combo_code} 按最新盘口重定价差 {old_spread} → {new_spread}（{note}）")
+
+        # price_tick 精度对齐（避免浮点误差）
+        if price_tick > 0:
+            decimals = 0
+            try:
+                s = f"{price_tick:.10f}".rstrip('0').rstrip('.')
+                if '.' in s:
+                    decimals = len(s.split('.')[-1])
+            except Exception:
+                decimals = 4
+            new_spread = round(round(new_spread / price_tick) * price_tick, decimals)
+
+        # 组合价差允许为负：仅拦 NaN/Inf/超天价
+        if not _is_valid_combo_spread(new_spread):
+            self.print(f"[组合撤单重挂] {combo_code} 生成新价差={new_spread!r} 非法，跳过本次撤单重挂（保留原挂单等待自然成交）")
+            return
+
+        ok = self._place_combo_order(
+            combo_code=combo_code,
+            exchange_id=exchange_id,
+            direction=direction,
+            volume=volume,
+            limit_price=new_spread,
+            offset_flag=offset_flag,
+            legs=group.get("legs"),
+            is_liquidate_mode=bool(info.get("is_liquidate_mode", False)),
+            is_exclude_exit=bool(info.get("is_exclude_exit", False)),
+            replace_count=int(info.get("replace_count", 0) or 0) + 1,
+        )
+        if ok:
+            self._notify_async(
+                f"🔄 组合单撤单重挂\n组合：{combo_code}\n方向：{direction}\n"
+                f"原价差：{old_spread}\n新价差：{new_spread}\n手数：{volume} 手\n"
+                f"模式：{'passive-进1tick' if is_passive_timeout_replace else '价差偏离修正'}"
+            )
+            self.print(f"[监控] 组合单 {combo_code} 撤单重挂 @价差{new_spread}")
+        else:
+            self.print(f"[监控] 组合单 {combo_code} 撤单重挂失败（下一轮 sync 将重新识别两腿缺额并再次合成）")
 
     def cancel_order(self, order_ref: str) -> bool:
         # 模糊匹配：尝试多种方式找到订单
@@ -731,6 +1025,58 @@ class PositionSyncManagerOrderOps:
             result[key] = result.get(key, 0) + remain
         return result
 
+    def _expand_combo_pending_to_legs(self, pending_map: Dict[Tuple[str, int, bool], int]) -> Dict[Tuple[str, int, bool], int]:
+        """把 pending_map 中以「组合代码」为 key 的在途委托展开到两腿。
+
+        组合单（交易所原生 SPD/SP）落库与 CTP 查单的 InstrumentID 都是**组合代码**
+        （形如 ``SPD MA701&MA702``），与 target / effective_actual 使用的**两腿合约** key
+        不匹配；若不展开，组合在途量对缺额/超额完全不可见，会导致每轮重复合成并重复
+        报组合单（叠加报单）。
+
+        组合代码形态 ``{SPD|SP} {近月}&{远月}``：买组合 = 买近月 + 卖远月，组合方向即
+        近月腿方向，远月腿方向相反。开/平相位由 key 的 is_open 决定，腿的方向码与
+        ``_build_pending_map`` 编码完全对称（开仓：买=2/卖=3；平仓：买平=3(空头)/卖平=2(多头)）。
+
+        返回：{(腿合约(大写), 持仓方向, is_open): 在途量}，供 effective_actual 计算：
+        开仓在途累加、平仓在途扣减，避免重复补开/重复平仓。
+        """
+        out: Dict[Tuple[str, int, bool], int] = {}
+        for key, vol in (pending_map or {}).items():
+            try:
+                if not (isinstance(key, tuple) and len(key) >= 3):
+                    continue
+                inst, pos_dir, is_open = key[0], key[1], bool(key[2])
+                v = int(vol or 0)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if v <= 0:
+                continue
+            code = str(inst or "").strip().upper()
+            if "&" not in code:
+                continue
+            # 组合代码 = "{前缀} {近月}&{远月}"：取空格后的部分
+            body = code.split(" ", 1)[-1]
+            if "&" not in body:
+                continue
+            near, far = body.split("&", 1)
+            near = near.strip()
+            far = far.strip()
+            if not near or not far or near == far:
+                continue
+            # 组合方向（由 pos_dir + 相位反推，与 _build_pending_map 对称）
+            if is_open:
+                combo_dir = "buy" if pos_dir == 2 else "sell"
+            else:
+                combo_dir = "buy" if pos_dir == 3 else "sell"
+            for leg, leg_dir in ((near, combo_dir), (far, "sell" if combo_dir == "buy" else "buy")):
+                if is_open:
+                    leg_pos = 2 if leg_dir == "buy" else 3
+                else:
+                    leg_pos = 3 if leg_dir == "buy" else 2
+                leg_key = (leg, leg_pos, is_open)
+                out[leg_key] = out.get(leg_key, 0) + v
+        return out
+
     def _pending_orders_from_memory(self) -> List[dict]:
         """把内存 self._orders 中的未成交委托转换成与 CTP 委托查询结果同构的 dict 列表。
 
@@ -777,25 +1123,31 @@ class PositionSyncManagerOrderOps:
     # ------------------------------------------------------------------
     def _check_and_replace_pending_orders(self):
         """扫描未成交委托，检查是否需要撤单重挂"""
-        # 获取所有未成交的委托
+        # 获取所有未成交的委托（组合单与非组合单分开处理）
         pending_orders = []
+        combo_orders = []
         with self._order_lock:
             for ref, info in self._orders.items():
                 if not self._is_order_pending(info):
                     continue
-                pending_orders.append((ref, info))
+                if info.get("is_combo"):
+                    # 组合单走「组合价差」专用判定（下方 _cancel_and_replace_combo）
+                    combo_orders.append((ref, info))
+                else:
+                    pending_orders.append((ref, info))
 
-        if not pending_orders:
+        if not pending_orders and not combo_orders:
             return
 
         # 先查询持仓和标准持仓，找出缺额合约
         positions = self.query_positions(timeout=10)
         if not positions:
-            self.print("[监控] 持仓查询失败，跳过检查")
-            return
-
-        self._actual_positions = positions
-        actual_agg = self._aggregate_actual_positions(positions)
+            if pending_orders:
+                self.print("[监控] 持仓查询失败，跳过检查")
+                return
+        else:
+            self._actual_positions = positions
+        actual_agg = self._aggregate_actual_positions(positions or [])
         target = self._parse_hold_std()
 
         # 计算缺额合约
@@ -939,6 +1291,78 @@ class PositionSyncManagerOrderOps:
             self.print(f"[监控] 发现 {len(cancel_list)} 个委托需要撤单重挂")
             for item in cancel_list:
                 self._cancel_and_replace(item, market_data_map)
+
+        # ------------------------------------------------------------------
+        # 🧩 组合单撤单重挂判定（按组合价差，不走单腿行情）
+        #   · passive 账户组合单：等待 passive_wait 秒，超时后价差向可成交方向进 1 tick；
+        #   · 其余（aggressive）：组合价差相对首次委托偏离 ≥2 个 tick 时撤单重报。
+        # ------------------------------------------------------------------
+        combo_cancel_list = []
+        for ref, info in combo_orders:
+            combo_code = info.get("instr", "")
+            offset_flag = info.get("offset_flag", tdapi.THOST_FTDC_OF_Open)
+            is_passive_mode = bool(info.get("is_passive_mode", False))
+            submit_ts = info.get("submit_time", 0) or 0
+            elapsed = now_ts - submit_ts if submit_ts > 0 else float('inf')
+            last_spread = info.get("limit_price", None)
+            if last_spread is None:
+                continue
+            replace_count = info.get("replace_count", 0)
+            if replace_count >= self.MAX_REPLACE_COUNT:
+                self.print(f"[监控] {combo_code} 已达到最大重挂次数 {self.MAX_REPLACE_COUNT}，跳过")
+                continue
+
+            # 分支 1：passive 账户组合单 —— 时间驱动（与单腿 passive 分支一致）
+            if is_passive_mode:
+                if elapsed < passive_wait:
+                    remain = int(max(0, passive_wait - elapsed))
+                    self.print(
+                        f"[监控-组合passive等待] {combo_code} 挂单 {int(elapsed)}s < {passive_wait}s，"
+                        f"剩余 {remain}s 不撤单继续排队 @价差{last_spread}"
+                    )
+                    continue
+                self.print(
+                    f"[监控-组合passive-超时] {combo_code} 挂单 {int(elapsed)}s >= {passive_wait}s 仍未成交，"
+                    f"撤单重挂（价差向可成交方向进 1 tick）"
+                )
+                combo_cancel_list.append({
+                    "ref": ref,
+                    "info": info,
+                    "old_spread": last_spread,
+                    "is_passive_timeout_replace": True,
+                })
+                continue
+
+            # 分支 2：非 passive（aggressive）—— 价差偏离驱动
+            group = self._combo_group_from_info(info)
+            if not group:
+                continue
+            use_passive = (offset_flag != tdapi.THOST_FTDC_OF_Open) and bool(info.get("is_liquidate_mode", False))
+            cur_spread, _note = self._calc_combo_spread(group, market_data_map, use_passive=use_passive)
+            if cur_spread is None:
+                continue
+            info_obj = self._get_contract_info(group["near"])
+            try:
+                price_tick = float(info_obj.get("PriceTick", 1.0)) if info_obj else 1.0
+            except (TypeError, ValueError):
+                price_tick = 1.0
+            if price_tick <= 0:
+                continue
+            if abs(float(cur_spread) - float(last_spread)) >= 2 * price_tick - 1e-9:
+                self.print(
+                    f"[监控-组合] {combo_code} 价差变化 {last_spread}->{cur_spread}（≥2 tick），撤单重挂"
+                )
+                combo_cancel_list.append({
+                    "ref": ref,
+                    "info": info,
+                    "old_spread": last_spread,
+                    "new_spread": cur_spread,
+                })
+
+        if combo_cancel_list:
+            self.print(f"[监控] 发现 {len(combo_cancel_list)} 个组合单需要撤单重挂")
+            for item in combo_cancel_list:
+                self._cancel_and_replace_combo(item, market_data_map)
 
     def _cancel_and_replace(self, item: dict, market_data_map: dict):
         """撤单并重挂"""
@@ -1114,6 +1538,8 @@ class PositionSyncManagerOrderOps:
                 self.print(f"[撤单重挂] {contract} 持仓变化 {volume}->{pos_vol}，调整委托量")
                 volume = pos_vol
 
+        # 重挂计数：新单必须继承「旧单计数 + 1」，否则每次重挂归零，MAX_REPLACE_COUNT 失效
+        _new_replace_count = int(info.get("replace_count", 0) or 0) + 1
         ok = self._place_order(
             exchange_id=exchange_id,
             instrument_id=contract,
@@ -1122,13 +1548,14 @@ class PositionSyncManagerOrderOps:
             limit_price=current_price,
             offset_flag=offset_flag,
             is_liquidate_mode=bool(info.get("is_liquidate_mode", False)),
+            replace_count=_new_replace_count,
         )
 
         if ok:
-            # 更新计数
+            # 更新计数（旧单已撤，仅保留最新计数便于监控显示）
             with self._order_lock:
                 if ref in self._orders:
-                    self._orders[ref]["replace_count"] = info.get("replace_count", 0) + 1
+                    self._orders[ref]["replace_count"] = _new_replace_count
 
             # 发送通知
             d = "买" if direction == "buy" else "卖"

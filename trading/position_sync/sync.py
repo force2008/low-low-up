@@ -1249,16 +1249,25 @@ class PositionSyncManagerSync:
             # 8. 计算有效持仓
             # 修复：只在开仓方向扣减在途委托，不在平仓方向扣减
             # 因为未成交的平仓委托还没减少实际持仓，不应该提前扣减
+            # 🧩 组合单在途（InstrumentID=组合代码）展开到两腿：开仓加、平仓减，
+            #    否则组合在途对两腿缺额/超额不可见，会每轮重复合成并重复报组合单。
+            combo_legs_pending = self._expand_combo_pending_to_legs(pending_map)
             effective_actual = {}
             for key in set(actual_agg.keys()) | set(target.keys()):
                 contract, direction = key
                 a_vol = actual_agg.get(key, 0)
                 pending_open = pending_map.get((contract.upper(), direction, True), 0)
-                # 不再扣减 pending_close（未成交的平仓委托不应该提前减少有效持仓）
+                combo_open = combo_legs_pending.get((contract.upper(), direction, True), 0)
+                combo_close = combo_legs_pending.get((contract.upper(), direction, False), 0)
+                # 不再扣减 pending_close（未成交的平仓委托不应该提前减少有效持仓）；
+                # 组合平仓在途需扣减，避免重复提交组合平单（组合单无法像单腿那样在提交端按合约拦截）。
                 pending_close = 0  # pending_map.get((contract.upper(), direction, False), 0)
-                effective_actual[key] = a_vol + pending_open - pending_close
-                if pending_open > 0:
-                    self.print(f"[有效持仓] {contract} {'多' if direction == 2 else '空'}: 实际{a_vol} + 在途开仓{pending_open} = {effective_actual[key]}")
+                effective_actual[key] = a_vol + pending_open + combo_open - combo_close
+                if pending_open > 0 or combo_open > 0 or combo_close > 0:
+                    self.print(
+                        f"[有效持仓] {contract} {'多' if direction == 2 else '空'}: 实际{a_vol} "
+                        f"+ 在途开仓{pending_open}(+组合开{combo_open}/-组合平{combo_close}) = {effective_actual[key]}"
+                    )
 
             # 调试：打印 pending_map 中所有开仓委托
             for pm_key, pm_vol in pending_map.items():
@@ -1451,6 +1460,323 @@ class PositionSyncManagerSync:
             traceback.print_exc()
             return False
 
+    # ------------------------------------------------------------------
+    # 🧩 套利组合单（交易所原生 SPD 标准套利，原子撮合，杜绝瘸腿）
+    # ------------------------------------------------------------------
+    def _combo_sort_key(self, contract: str) -> Optional[int]:
+        """解析合约尾部数字为「年*12+月」近似排序键，用于区分近月/远月。无法解析返回 None。"""
+        s = str(contract or "").strip().upper()
+        if not s:
+            return None
+        tail = ""
+        for ch in reversed(s):
+            if ch.isdigit():
+                tail = ch + tail
+            else:
+                break
+        if len(tail) < 3:
+            return None
+        try:
+            year = int(tail[:-2])
+            month = int(tail[-2:])
+        except ValueError:
+            return None
+        if month < 1 or month > 12:
+            return None
+        return year * 12 + month
+
+    def _extract_combo_groups(self, missing_orders: list, excess_orders: list) -> list:
+        """自动识别可合成为「交易所原生跨期套利组合单」的两腿（不依赖 arb-pairs.json）。
+
+        只有以下 3 家交易所上市了交易所原生组合合约（跨期套利）：
+          · 郑商所 CZCE -> "SPD 近月&远月"（跨期前缀 SPD）
+          · 大商所 DCE  -> "SP 近月&远月"（跨期前缀 SP）
+          · 广期所 GFEX -> "SP 近月&远月"（跨期前缀 SP）
+        上期所/能源中心/中金所没有原生组合合约（第三方软件自定义组合会瘸腿），故不参与。
+
+        识别条件（同一相位内）：
+          · 交易所属于上述 3 家
+          · 同一品种（合约代码去掉尾部数字后相同）
+          · 方向相反、数量相等、交割月份不同（构成跨期价差）
+
+        满足则把这两腿从对应列表中移除，生成一条组合单描述；其余保持单腿原样。
+        腿序：近月=第一腿，远月=第二腿；买组合=买近月+卖远月（组合方向取近月腿方向）。
+        返回组合单描述列表。
+        """
+        # 支持原生组合合约的交易所 -> 跨期套利前缀
+        combo_prefix = {"CZCE": "SPD", "DCE": "SP", "GFEX": "SP"}
+        groups: list = []
+        remove = {"open": set(), "close": set()}
+
+        def _order_dir(order: dict, is_open: bool) -> Optional[str]:
+            d = order.get("direction")
+            if is_open:
+                return d if d in ("buy", "sell") else None
+            try:
+                pd = int(d)
+            except (TypeError, ValueError):
+                return None
+            # CTP PosiDirection：2=多头(卖平)，3=空头(买平)
+            if pd == 2:
+                return "sell"
+            if pd == 3:
+                return "buy"
+            return None
+
+        def _try_phase(orders, is_open):
+            rs = remove["open" if is_open else "close"]
+            # 按 (交易所, 品种) 归组
+            buckets = {}
+            for i, o in enumerate(orders):
+                # 组合代码须用柜台实际大小写（DCE/GFEX 小写、CZCE 大写）
+                c = self._standardize_contract(o.get("contract", ""))
+                if not c:
+                    continue
+                ex = str(self._get_contract_info(c).get("ExchangeID", "")).upper() or self._guess_exchange(c)
+                if ex not in combo_prefix:
+                    continue
+                prod = self._product_from_contract_upper(c.upper())
+                if not prod:
+                    continue
+                buckets.setdefault((ex, prod), []).append((i, c, o))
+
+            for (ex, _prod), items in buckets.items():
+                # 计算各合约的近/远月排序键（无法解析的腿跳过）
+                sk = {}
+                for _i, c, _o in items:
+                    k = self._combo_sort_key(c)
+                    if k is not None:
+                        sk[c] = k
+                used_contracts = set()
+                for x in range(len(items)):
+                    ix, cx, ox = items[x]
+                    if ix in rs or cx in used_contracts:
+                        continue
+                    dx = _order_dir(ox, is_open)
+                    if not dx or cx not in sk:
+                        continue
+                    try:
+                        vx = int(ox.get("volume", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if vx <= 0:
+                        continue
+                    # 找一条等量、方向相反、不同月份的同品种腿配对
+                    for y in range(len(items)):
+                        if y == x:
+                            continue
+                        iy, cy, oy = items[y]
+                        if iy in rs or cy in used_contracts or cy == cx or cy not in sk:
+                            continue
+                        dy = _order_dir(oy, is_open)
+                        if not dy or dy == dx or sk[cy] == sk[cx]:
+                            continue
+                        try:
+                            vy = int(oy.get("volume", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if vy != vx:
+                            continue
+                        near, far = (cx, cy) if sk[cx] < sk[cy] else (cy, cx)
+                        near_dir = dx if near == cx else dy
+                        rs.add(ix)
+                        rs.add(iy)
+                        used_contracts.add(cx)
+                        used_contracts.add(cy)
+                        groups.append({
+                            "combo_code": f"{combo_prefix[ex]} {near}&{far}",
+                            "exchange": ex,
+                            # 买组合 = 买第一腿(近月)+卖第二腿(远月)：组合方向取近月腿方向
+                            "direction": near_dir,
+                            "volume": vx,
+                            "is_open": is_open,
+                            "near": near,
+                            "far": far,
+                            "legs": [
+                                {"contract": cx, "order_dir": dx, "volume": vx, "orig": ox},
+                                {"contract": cy, "order_dir": dy, "volume": vy, "orig": oy},
+                            ],
+                            "is_liquidate_mode": bool(ox.get("is_liquidate_mode", False) or oy.get("is_liquidate_mode", False)),
+                            "is_exclude_exit": bool(ox.get("is_exclude_exit", False) or oy.get("is_exclude_exit", False)),
+                        })
+                        break
+
+        _try_phase(missing_orders, True)
+        _try_phase(excess_orders, False)
+
+        if remove["open"]:
+            missing_orders[:] = [o for i, o in enumerate(missing_orders) if i not in remove["open"]]
+        if remove["close"]:
+            excess_orders[:] = [o for i, o in enumerate(excess_orders) if i not in remove["close"]]
+
+        if groups:
+            self.print(
+                f"[套利组合单] 识别到 {len(groups)} 个可合成原生跨期套利组合单的两腿："
+                + ", ".join(f"{g['combo_code']}({g['direction']}×{g['volume']}{'开' if g['is_open'] else '平'})" for g in groups)
+            )
+        return groups
+
+    def _calc_combo_spread(self, group: dict, market_data_map: dict,
+                           use_passive: Optional[bool] = None) -> Tuple[Optional[float], str]:
+        """计算组合单价差（近月价 - 远月价）。价差允许为负。返回 (spread, note)。
+
+        use_passive：
+          · None（默认）= 按开/平相位与账户 passive 配置自动决定（首次定价用）；
+          · True/False   = 强制按被动排队价 / 主动对价取价（撤单重挂再定价用）。
+        """
+        near = group["near"]
+        far = group["far"]
+        legs = group.get("legs", [])
+        is_open = bool(group.get("is_open"))
+
+        def _leg_dir(c):
+            for lg in legs:
+                if lg["contract"] == c:
+                    return lg["order_dir"]
+            return None
+
+        def _md(c):
+            md = market_data_map.get(c)
+            if md:
+                return md
+            try:
+                return self.query_market_data(c, timeout=3, max_retries=1)
+            except Exception:
+                return None
+
+        md_near = _md(near)
+        md_far = _md(far)
+        if not md_near or not md_far:
+            return None, "近月/远月行情缺失"
+
+        if use_passive is None:
+            if is_open:
+                use_passive = bool(getattr(self, '_passive_mode', False))
+            else:
+                # 与单腿平仓口径保持一致：排除退出(exclude_exit)强制 aggressive，
+                # 其余在「清仓模式(is_liquidate_mode) 或 passive 账户」时走 passive。
+                use_passive = ((not bool(group.get("is_exclude_exit")))
+                               and (bool(group.get("is_liquidate_mode"))
+                                    or bool(getattr(self, '_passive_mode', False))))
+
+        def _px(md, order_dir):
+            if order_dir == "buy":
+                p = md.get("BidPrice1") if use_passive else md.get("AskPrice1")
+                if not _is_valid_positive_price(p):
+                    p = md.get("LastPrice")
+            else:
+                p = md.get("AskPrice1") if use_passive else md.get("BidPrice1")
+                if not _is_valid_positive_price(p):
+                    p = md.get("LastPrice")
+            return p
+
+        near_px = _px(md_near, _leg_dir(near))
+        far_px = _px(md_far, _leg_dir(far))
+        if not _is_valid_positive_price(near_px) or not _is_valid_positive_price(far_px):
+            return None, f"腿价无效(近={near_px!r}, 远={far_px!r})"
+        spread = float(near_px) - float(far_px)
+        return spread, f"近{near}@{near_px} - 远{far}@{far_px} = {spread:.4f}"
+
+    def _restore_combo_legs(self, group: dict, missing_orders: list, excess_orders: list):
+        """组合单被拒/失败时，把两腿还原为原单腿单（交回对应提交路径）。"""
+        target = missing_orders if group.get("is_open") else excess_orders
+        if target is None:
+            return
+        for lg in group.get("legs", []):
+            orig = lg.get("orig")
+            if isinstance(orig, dict):
+                target.append(dict(orig))
+            else:
+                target.append({
+                    "contract": lg["contract"],
+                    "direction": lg["order_dir"],
+                    "volume": int(lg["volume"]),
+                })
+
+    def _submit_combo_serial(self, groups: list, market_data_map: dict,
+                             missing_orders: list = None, excess_orders: list = None) -> list:
+        """串行提交组合单。被拒/失败/无法定价时把两腿还原为单腿单。
+
+        返回成功提交的组合单记录列表 [{"contract","direction","volume","price"}, ...]。
+        """
+        records: list = []
+        if not groups:
+            return records
+
+        # 平仓相位：提交前刷新一次持仓（软闸取两腿持仓 min 用）
+        if any(not g.get("is_open") for g in groups):
+            try:
+                _lp = self.query_positions(timeout=5)
+                if _lp:
+                    self._actual_positions = _lp
+            except Exception:
+                pass
+
+        for cg in groups:
+            combo_code = cg["combo_code"]
+            direction = cg["direction"]
+            try:
+                volume = int(cg["volume"])
+            except (TypeError, ValueError):
+                volume = 0
+            if volume <= 0:
+                continue
+            is_open = bool(cg.get("is_open"))
+            offset_flag = tdapi.THOST_FTDC_OF_Open if is_open else tdapi.THOST_FTDC_OF_Close
+
+            # 平仓相位：两腿实际持仓取 min 软闸，避免任一条腿持仓不足导致组合平失败
+            if not is_open:
+                try:
+                    leg_pos = []
+                    for lg in cg.get("legs", []):
+                        pos_dir = 3 if lg["order_dir"] == "buy" else 2  # 买平=空头持仓(3)；卖平=多头持仓(2)
+                        leg_pos.append(int(self._get_actual_position_volume(lg["contract"], pos_dir) or 0))
+                    min_pos = min(leg_pos) if leg_pos else 0
+                    if min_pos <= 0:
+                        self.print(f"[组合平跳过] {combo_code} 两腿实际持仓不足 {leg_pos}，跳过（避免瘸腿）")
+                        continue
+                    if min_pos < volume:
+                        self.print(f"[组合平软闸🛡️] {combo_code} 计划{volume}手 → 两腿持仓取min={min_pos}手")
+                        volume = min_pos
+                except Exception as _e:
+                    self.print(f"[组合平跳过] {combo_code} 两腿持仓检查异常：{_e}，跳过")
+                    continue
+
+            spread, note = self._calc_combo_spread(cg, market_data_map)
+            if spread is None:
+                self.print(f"[组合单跳过] {combo_code} 无法定价（{note}）→ 降级为两条单腿")
+                self._restore_combo_legs(cg, missing_orders, excess_orders)
+                continue
+
+            ok = self._place_combo_order(
+                combo_code=combo_code,
+                exchange_id=cg["exchange"],
+                direction=direction,
+                volume=volume,
+                limit_price=spread,
+                offset_flag=offset_flag,
+                legs=cg.get("legs"),
+                is_liquidate_mode=bool(cg.get("is_liquidate_mode", False)),
+                is_exclude_exit=bool(cg.get("is_exclude_exit", False)),
+            )
+            if ok:
+                self.print(f"[组合报单] {combo_code} 提交成功 价差={spread:.4f}（{note}）")
+                records.append({
+                    "contract": combo_code,
+                    "direction": direction,
+                    "volume": volume,
+                    "price": spread,
+                })
+            else:
+                self.print(f"[组合单降级] {combo_code} 报单被拒/失败 → 降级为两条单腿重新提交")
+                try:
+                    self._notify_async(f"⚠️ 套利组合单被拒绝，已降级为两条单腿\n组合：{combo_code}")
+                except Exception:
+                    pass
+                self._restore_combo_legs(cg, missing_orders, excess_orders)
+            time.sleep(0.2)
+        return records
+
     def _fast_sync(self, missing_orders: list, excess_orders: list, ctp_orders: list, target: dict = None, actual_agg: dict = None, pending_map: dict = None, cancelled_ctp: list = None, hold_mtime: float = 0, non_trading_contracts=None, effective_actual: dict = None, cooling_contracts=None) -> bool:
         """快速同步：并行查询 + 批量提交"""
         if target is None:
@@ -1580,6 +1906,19 @@ class PositionSyncManagerSync:
                 self.print(tag_msg)
 
         # ============================================================
+        # 🧩 套利组合单预提取（交易所原生跨期套利组合，原子撮合，杜绝瘸腿）
+        #   自动识别同相位内「同交易所/同品种、方向相反、数量相等、月份不同」的两腿
+        #   （仅 CZCE/DCE/GFEX 有原生组合合约），合成为一条组合单；
+        #   被柜台拒绝时再降级还原为两条单腿。
+        # ============================================================
+        combo_groups = []
+        try:
+            combo_groups = self._extract_combo_groups(missing_orders, excess_orders)
+        except Exception as _ce:
+            self.print(f"[套利组合单] 预提取异常，本次跳过组合单合成：{_ce}")
+            combo_groups = []
+
+        # ============================================================
         # passive 成交速率预热订阅（仅 passive 账户）：提前订阅候选合约，攒够 tick 才能算速率
         # ============================================================
         try:
@@ -1592,6 +1931,13 @@ class PositionSyncManagerSync:
         # ============================================================
         self.print("[快速] 第一阶段：并行查询行情...")
         all_contracts = set([mo["contract"] for mo in missing_orders] + [eo["contract"] for eo in excess_orders])
+        # 组合单两腿也纳入行情查询范围（组合价差需两腿行情定价）
+        for _cg in combo_groups:
+            for _lg in _cg.get("legs", []):
+                try:
+                    all_contracts.add(_lg["contract"])
+                except Exception:
+                    pass
         market_data_map = {}
         md_lock = threading.Lock()
 
@@ -1946,6 +2292,19 @@ class PositionSyncManagerSync:
 
                 # 串行执行，每笔间隔 0.2 秒（与 PositionManagerUI.py 一致）
                 time.sleep(0.2)
+
+        # ============================================================
+        # 🧩 组合单提交（开仓相位）：被拒/失败则还原为两条单腿，
+        #    随后由 _submit_open_serial 兜底提交。
+        # ============================================================
+        _open_combos = [g for g in combo_groups if g.get("is_open")]
+        if _open_combos:
+            self.print(f"[快速] 组合单阶段：提交 {len(_open_combos)} 个开仓组合单...")
+            _open_combo_recs = self._submit_combo_serial(_open_combos, market_data_map, missing_orders, excess_orders)
+            if _open_combo_recs:
+                open_orders.extend(_open_combo_recs)
+                submitted_open[0] += len(_open_combo_recs)
+            self.print(f"[快速] 开仓组合单完成: 提交 {len(_open_combo_recs)}/{len(_open_combos)}")
 
         if missing_orders:
             self.print(f"[快速] 第二阶段：串行提交 {len(missing_orders)} 个开仓委托...")
@@ -2520,6 +2879,19 @@ class PositionSyncManagerSync:
                     })
                 else:
                     self.print(f"[平] {contract} 无需平仓（diff={diff}），跳过记录")
+
+        # ============================================================
+        # 🧩 组合单提交（平仓相位）：被拒/失败则还原为两条单腿，
+        #    随后由 _submit_close_serial 兜底提交。
+        # ============================================================
+        _close_combos = [g for g in combo_groups if not g.get("is_open")]
+        if _close_combos:
+            self.print(f"[快速] 组合单阶段：提交 {len(_close_combos)} 个平仓组合单...")
+            _close_combo_recs = self._submit_combo_serial(_close_combos, market_data_map, missing_orders, excess_orders)
+            if _close_combo_recs:
+                close_orders.extend(_close_combo_recs)
+                submitted_close[0] += len(_close_combo_recs)
+            self.print(f"[快速] 平仓组合单完成: 提交 {len(_close_combo_recs)}/{len(_close_combos)}")
 
         if excess_orders:
             self.print(f"[快速] 第三阶段：串行提交 {len(excess_orders)} 个平仓委托...")
